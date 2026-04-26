@@ -336,7 +336,7 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Modern Hopfield polluted license-plate character evaluation")
-    parser.add_argument("--pollution", default="mixed", choices=["all", "mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
+    parser.add_argument("--pollution", default="all", choices=["all", "mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
     parser.add_argument("--samples-per-level", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--cnn-epochs", type=int, default=5)
@@ -395,7 +395,7 @@ if __name__ == "__main__":
         device,
     )
 
-    pollution_types = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "mixed"]
+    pollution_types = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
     if args.pollution != "all":
         pollution_types = [args.pollution]
 

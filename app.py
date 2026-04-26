@@ -16,23 +16,18 @@ def is_kaggle_runtime():
 
 
 def default_cache_path():
-    if is_kaggle_runtime():
-        cache_dir = "/kaggle/working/mchn_cache"
-    else:
-        cache_dir = os.path.join(os.getcwd(), "data")
+    cache_dir = "/kaggle/working/mchn_cache" if is_kaggle_runtime() else os.path.join(os.getcwd(), "data")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, "template_cache_32x64.pt")
 
 
 def build_template_masks(loader, num_templates, device):
     chinese_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
+    alnum_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     if loader.chinese_indices:
         chinese_mask[loader.chinese_indices] = True
-
-    alnum_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     if loader.alnum_indices:
         alnum_mask[loader.alnum_indices] = True
-
     return chinese_mask, alnum_mask
 
 
@@ -53,8 +48,8 @@ def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, tem
         count = int(class_mask.sum().item())
         if count == 0:
             scores.append(scaled.new_full((scaled.shape[0],), -1e9))
-            continue
-        scores.append(torch.logsumexp(scaled[:, class_mask], dim=-1) - torch.log(scaled.new_tensor(float(count))))
+        else:
+            scores.append(torch.logsumexp(scaled[:, class_mask], dim=-1) - torch.log(scaled.new_tensor(float(count))))
     return torch.stack(scores, dim=-1)
 
 
@@ -70,13 +65,7 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
     first_retrieved = None
     for model in models:
         retrieved, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
-        scores = class_free_energy_scores(
-            sim_scores,
-            template_labels,
-            beta=model.beta,
-            num_classes=num_classes,
-            template_mask=template_mask,
-        )
+        scores = class_free_energy_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
         log_probs = torch.log_softmax(scores, dim=-1)
         fused = log_probs if fused is None else fused + log_probs
         if first_sim is None:
@@ -87,11 +76,7 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
 
 print("Loading MCHN memory and OpenCV LPR pipeline...")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-loader = TemplateLoader(
-    data_roots=["./data/chars2", "./data/charsChinese"],
-    img_size=(32, 64),
-    cache_path=default_cache_path(),
-)
+loader = TemplateLoader(["./data/chars2", "./data/charsChinese"], img_size=(32, 64), cache_path=default_cache_path())
 if loader.memory_matrix.shape[0] == 0:
     raise RuntimeError("Template memory is empty. Please check ./data/chars2 and ./data/charsChinese.")
 
@@ -110,13 +95,9 @@ def predict_analysis(image):
         return "请先上传图片。", None, pd.DataFrame(), []
 
     img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    enhanced = pipeline.enhancer.dehaze(img_bgr)
-    plate_img = pipeline.segmenter.locate_plate(enhanced)
-
+    plate_img, chars = pipeline.process_image(img_bgr)
     if plate_img is None:
-        return "无法定位车牌。", cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
-
-    chars = pipeline.segmenter.segment_characters(plate_img)
+        return "无法定位车牌。", None, pd.DataFrame(), []
     if not chars:
         return "字符切割失败。", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
 
@@ -131,11 +112,7 @@ def predict_analysis(image):
 
         with torch.no_grad():
             class_scores, sim_scores, retrieved = ensemble_scores(
-                mchn_models,
-                tensor,
-                template_labels,
-                len(loader.idx_to_label),
-                template_mask=current_mask,
+                mchn_models, tensor, template_labels, len(loader.idx_to_label), template_mask=current_mask
             )
 
         class_idx = int(torch.argmax(class_scores, dim=-1).item())
@@ -177,19 +154,12 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
         with gr.Column(scale=1):
             txt_out = gr.Textbox(label="总体识别结果")
             img_out = gr.Image(label="车牌定位与透视矫正")
-            char_gallery = gr.Gallery(
-                label="字符切割结果",
-                show_label=True,
-                columns=7,
-                height=120,
-                object_fit="contain",
-            )
+            char_gallery = gr.Gallery(label="字符切割结果", show_label=True, columns=7, height=120, object_fit="contain")
 
     df_out = gr.Dataframe(
         headers=["位置", "类型", "识别", "类别置信度", "模板相似度", "重构相似度"],
         label="逐字符识别分析",
     )
-
     btn.click(predict_analysis, img_in, [txt_out, img_out, df_out, char_gallery])
 
 
