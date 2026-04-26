@@ -170,12 +170,17 @@ def build_affine_query_variants(q):
 
 
 def predict_affine_robust_hopfield(models, q, template_labels, num_classes):
+    base_scores, _ = ensemble_hopfield_scores(models, q, template_labels, num_classes)
+    base_probs = torch.softmax(base_scores, dim=-1)
+    base_conf, base_pred = torch.max(base_probs, dim=-1)
+
     q_variants, variants_per_sample = build_affine_query_variants(q)
     q_variants = q_variants.to(q.device)
     scores, _ = ensemble_hopfield_scores(models, q_variants, template_labels, num_classes)
     scores = scores.view(q.shape[0], variants_per_sample, num_classes)
-    best_scores = scores.max(dim=1).values
-    return torch.argmax(best_scores, dim=-1)
+    pooled_scores = torch.logsumexp(scores, dim=1) - torch.log(scores.new_tensor(float(variants_per_sample)))
+    pooled_pred = torch.argmax(pooled_scores, dim=-1)
+    return torch.where(base_conf >= 0.72, base_pred, pooled_pred)
 
 
 def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples, batch_size, seed):

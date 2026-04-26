@@ -248,23 +248,32 @@ class PlateSegmenter:
         plate_img = self._tighten_plate_crop(self._deskew_plate(cv2.resize(plate_img, (self.PLATE_W, self.PLATE_H))))
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-        binary = self._make_character_mask(plate_img, gray)
+        binary = self._prepare_character_binary(self._make_character_mask(plate_img, gray))
 
-        binary[:12, :] = 0
-        binary[108:, :] = 0
-        binary[:, :10] = 0
-        binary[:, 390:] = 0
-        binary = cv2.medianBlur(binary, 3)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
-
+        candidates = []
         contour_boxes = self._find_contour_boxes(binary)
-        if self._has_valid_plate_layout(contour_boxes):
-            return [self._crop_char(binary, box) for box in contour_boxes]
+        if contour_boxes:
+            candidates.append(("contour", contour_boxes, [self._crop_char(binary, box) for box in contour_boxes]))
+
         projection_boxes = self._segment_boxes_by_projection(binary)
-        if self._has_valid_plate_layout(projection_boxes):
-            return [self._crop_char(binary, box) for box in projection_boxes]
-        return self._segment_by_fixed_slots(gray, binary, char_count=7)
+        if projection_boxes:
+            candidates.append(("projection", projection_boxes, [self._crop_char(binary, box) for box in projection_boxes]))
+
+        fixed_chars = self._segment_by_fixed_slots(gray, binary, char_count=7)
+        if fixed_chars:
+            candidates.append(("fixed", [], fixed_chars))
+
+        if not candidates:
+            return []
+
+        best_score = -1.0
+        best_chars = []
+        for _, boxes, chars in candidates:
+            score = self._segmentation_score(boxes, chars)
+            if score > best_score:
+                best_score = score
+                best_chars = chars
+        return best_chars
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -282,8 +291,8 @@ class PlateSegmenter:
         x, y, w, h = cv2.boundingRect(cnt)
         if w / max(1, h) < 2.0:
             return plate_img
-        pad_x = int(0.04 * w)
-        pad_y = int(0.18 * h)
+        pad_x = int(0.025 * w)
+        pad_y = int(0.08 * h)
         x1 = max(0, x - pad_x)
         y1 = max(0, y - pad_y)
         x2 = min(cls.PLATE_W, x + w + pad_x)
@@ -302,16 +311,31 @@ class PlateSegmenter:
         color_ratio = float(np.mean(plate_color[12:108, 12:388] > 0))
 
         if color_ratio > 0.25:
-            white = cv2.inRange(hsv, np.array([0, 0, 70]), np.array([180, 155, 255]))
-            adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 19, -3)
-            bright = cv2.inRange(gray, max(55, int(np.percentile(gray, 55))), 255)
+            plate_color = cv2.morphologyEx(plate_color, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 5)))
+            plate_color = cv2.erode(plate_color, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)), iterations=1)
+            white = cv2.inRange(hsv, np.array([0, 0, 95]), np.array([180, 130, 255]))
+            adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, -4)
+            bright = cv2.inRange(gray, max(70, int(np.percentile(gray[plate_color > 0], 58))), 255)
             binary = cv2.bitwise_and(cv2.bitwise_or(white, adaptive), bright)
+            binary = cv2.bitwise_and(binary, plate_color)
         else:
             _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             border = np.concatenate([binary[0, :], binary[-1, :], binary[:, 0], binary[:, -1]])
             if float(np.mean(border > 0)) > 0.55:
                 binary = cv2.bitwise_not(binary)
 
+        return binary
+
+    @staticmethod
+    def _prepare_character_binary(binary):
+        binary = binary.copy()
+        binary[:15, :] = 0
+        binary[106:, :] = 0
+        binary[:, :14] = 0
+        binary[:, 386:] = 0
+        binary = cv2.medianBlur(binary, 3)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
         return binary
 
     def _find_contour_boxes(self, binary):
@@ -322,11 +346,41 @@ class PlateSegmenter:
             x, y, w, h = cv2.boundingRect(cnt)
             ratio = w / max(1, h)
             area = w * h
-            if 32 <= h <= 100 and 5 <= w <= 62 and 0.05 <= ratio <= 0.95 and area >= 160:
+            if x < 16 or x + w > self.PLATE_W - 14:
+                continue
+            if y < 14 or y + h > self.PLATE_H - 8:
+                continue
+            if w <= 7 and h >= 45:
+                continue
+            if h <= 18 and w <= 18:
+                continue
+            if 30 <= h <= 96 and 6 <= w <= 70 and 0.07 <= ratio <= 1.15 and area >= 170:
                 boxes.append((x, y, w, h))
         if len(boxes) > 7:
-            boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)[:7]
+            boxes = self._choose_best_seven_boxes(boxes)
         return sorted(boxes, key=lambda b: b[0])
+
+    @staticmethod
+    def _choose_best_seven_boxes(boxes):
+        boxes = sorted(boxes, key=lambda b: b[0])
+        if len(boxes) <= 7:
+            return boxes
+        best = boxes[:7]
+        best_score = -1.0
+        for start in range(0, len(boxes) - 6):
+            candidate = boxes[start : start + 7]
+            centers = np.array([x + w / 2.0 for x, _, w, _ in candidate], dtype=np.float32)
+            gaps = np.diff(centers)
+            heights = np.array([h for _, _, _, h in candidate], dtype=np.float32)
+            span = centers[-1] - centers[0]
+            gap_score = 1.0 - min(float(np.std(gaps)) / max(float(np.mean(gaps)), 1.0), 1.0)
+            height_score = 1.0 - min(float(np.std(heights)) / max(float(np.mean(heights)), 1.0), 1.0)
+            span_score = 1.0 - min(abs(span - 300.0) / 170.0, 1.0)
+            score = 0.45 * gap_score + 0.35 * height_score + 0.20 * span_score
+            if score > best_score:
+                best_score = score
+                best = candidate
+        return best
 
     @staticmethod
     def _has_valid_plate_layout(boxes):
@@ -342,6 +396,40 @@ class PlateSegmenter:
         if np.min(heights) < 0.45 * np.median(heights):
             return False
         return True
+
+    @staticmethod
+    def _segmentation_score(boxes, chars):
+        if not chars:
+            return 0.0
+        count_score = 1.0 - min(abs(len(chars) - 7) / 7.0, 1.0)
+        if len(chars) == 7:
+            count_score += 0.40
+
+        ink_scores = []
+        border_penalties = []
+        for char_img in chars[:7]:
+            if char_img is None or char_img.size == 0:
+                continue
+            foreground = char_img > 0
+            ink = float(np.mean(foreground))
+            ink_scores.append(1.0 - min(abs(ink - 0.24) / 0.30, 1.0))
+            border = np.concatenate([foreground[0, :], foreground[-1, :], foreground[:, 0], foreground[:, -1]])
+            border_penalties.append(float(np.mean(border)))
+        ink_score = float(np.mean(ink_scores)) if ink_scores else 0.0
+        border_score = 1.0 - min(float(np.mean(border_penalties)) / 0.22, 1.0) if border_penalties else 0.0
+
+        layout_score = 0.0
+        if boxes and len(boxes) == 7:
+            centers = np.array([x + w / 2.0 for x, _, w, _ in boxes], dtype=np.float32)
+            gaps = np.diff(centers)
+            heights = np.array([h for _, _, _, h in boxes], dtype=np.float32)
+            span = centers[-1] - centers[0]
+            layout_score = (
+                0.40 * (1.0 - min(float(np.std(gaps)) / max(float(np.mean(gaps)), 1.0), 1.0))
+                + 0.35 * (1.0 - min(float(np.std(heights)) / max(float(np.mean(heights)), 1.0), 1.0))
+                + 0.25 * (1.0 - min(abs(span - 300.0) / 170.0, 1.0))
+            )
+        return 0.38 * count_score + 0.24 * ink_score + 0.20 * border_score + 0.18 * layout_score
 
     def _segment_boxes_by_projection(self, binary, char_count=7):
         work = binary.copy()

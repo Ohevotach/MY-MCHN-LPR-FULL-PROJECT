@@ -239,16 +239,29 @@ pil_transform = transforms.Compose(
 
 
 def recognize_tensor(tensor, template_mask=None):
-    q = affine_char_variants(tensor).to(device)
+    base_q = tensor.view(1, -1).to(device) if tensor.dim() != 2 else tensor.to(device)
     with torch.no_grad():
+        base_scores, base_sim, base_retrieved = ensemble_scores(
+            mchn_models, base_q, template_labels, len(loader.idx_to_label), template_mask=template_mask
+        )
+        base_probs = torch.softmax(base_scores[0], dim=-1)
+        base_conf, base_class = torch.max(base_probs, dim=-1)
+        if float(base_conf.item()) >= 0.72:
+            class_idx = int(base_class.item())
+            best_template_idx = select_best_template_in_class(base_sim, template_labels, class_idx)
+            template_sim = F.cosine_similarity(base_q, memory[best_template_idx].view(1, -1)).item()
+            recon_sim = F.cosine_similarity(base_q, base_retrieved[0:1]).item()
+            return class_idx, best_template_idx, float(base_conf.item()), template_sim, recon_sim
+
+        q = affine_char_variants(tensor).to(device)
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
-    flat_idx = int(torch.argmax(class_scores).item())
-    variant_idx = flat_idx // class_scores.shape[1]
-    class_idx = flat_idx % class_scores.shape[1]
+    pooled_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
+    class_idx = int(torch.argmax(pooled_scores).item())
+    variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)
-    prob = torch.softmax(class_scores[variant_idx], dim=-1)[class_idx].item()
+    prob = torch.softmax(pooled_scores, dim=-1)[class_idx].item()
     best_q = q[variant_idx : variant_idx + 1]
     template_sim = F.cosine_similarity(best_q, memory[best_template_idx].view(1, -1)).item()
     recon_sim = F.cosine_similarity(best_q, retrieved[variant_idx : variant_idx + 1]).item()
