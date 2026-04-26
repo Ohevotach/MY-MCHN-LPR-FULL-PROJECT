@@ -199,14 +199,23 @@ class TemplateLoader:
 
 
 class PollutedCharDataset(Dataset):
-    def __init__(self, template_loader, virtual_size=5000, pollution_type="mixed", severity=0.5, seed=None):
+    def __init__(
+        self,
+        template_loader,
+        virtual_size=5000,
+        pollution_type="mixed",
+        severity=0.5,
+        seed=None,
+        sample_indices=None,
+    ):
         self.M, self.L, self.idx_to_label = template_loader.get_memory_matrix()
         self.virtual_size = virtual_size
         self.pollution_type = pollution_type
-        self.severity = float(max(0.0, min(1.0, severity)))
+        self.severity = severity
         self.img_h = template_loader.img_size[1]
         self.img_w = template_loader.img_size[0]
         self.rng = random.Random(seed)
+        self.sample_indices = list(sample_indices) if sample_indices is not None else None
 
     def __len__(self):
         return self.virtual_size
@@ -214,63 +223,73 @@ class PollutedCharDataset(Dataset):
     def __getitem__(self, idx):
         if self.M.shape[0] == 0:
             raise RuntimeError("Template memory is empty. Check data_roots.")
-        target_idx = self.rng.randint(0, self.M.shape[0] - 1)
+        if self.sample_indices:
+            target_idx = self.rng.choice(self.sample_indices)
+        else:
+            target_idx = self.rng.randint(0, self.M.shape[0] - 1)
         clean_q = self.M[target_idx].clone()
         clean_img = clean_q.view(1, self.img_h, self.img_w)
         polluted_img = self._pollute(clean_img)
         return polluted_img.clamp(0.0, 1.0).view(-1), clean_q, self.L[target_idx]
 
+    def _severity_value(self):
+        if isinstance(self.severity, (tuple, list)):
+            low, high = float(self.severity[0]), float(self.severity[1])
+            return max(0.0, min(1.0, self.rng.uniform(low, high)))
+        return max(0.0, min(1.0, float(self.severity)))
+
     def _pollute(self, img):
+        severity = self._severity_value()
         if self.pollution_type == "mixed":
             choices = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
-            count = 1 if self.severity < 0.35 else 2 if self.severity < 0.7 else 3
+            count = 1 if severity < 0.35 else 2 if severity < 0.7 else 3
             out = img.clone()
             for name in self.rng.sample(choices, count):
-                out = self._apply_one(out, name)
+                out = self._apply_one(out, name, severity)
             return out
-        return self._apply_one(img.clone(), self.pollution_type)
+        return self._apply_one(img.clone(), self.pollution_type, severity)
 
-    def _apply_one(self, img, pollution):
+    def _apply_one(self, img, pollution, severity):
         if pollution == "none":
             return img
         if pollution == "mask":
-            return self._random_mask(img)
+            return self._random_mask(img, severity)
         if pollution == "noise":
-            sigma = 0.03 + 0.30 * self.severity
+            sigma = 0.03 + 0.30 * severity
             return img + torch.randn_like(img) * sigma
         if pollution == "salt_pepper":
-            prob = 0.01 + 0.22 * self.severity
+            prob = 0.01 + 0.22 * severity
             rnd = torch.rand_like(img)
             out = img.clone()
             out[rnd < prob / 2] = 0.0
             out[(rnd >= prob / 2) & (rnd < prob)] = 1.0
             return out
         if pollution == "blur":
-            kernel = int(3 + 6 * self.severity)
+            kernel = int(3 + 6 * severity)
             kernel = kernel + 1 if kernel % 2 == 0 else kernel
             return TF.gaussian_blur(img, kernel_size=[kernel, kernel])
         if pollution == "fog":
-            fog = 0.15 + 0.45 * self.severity
+            fog = 0.15 + 0.45 * severity
             return img * (1.0 - fog) + fog
         if pollution == "dirt":
-            return self._random_dirt(img)
+            return self._random_dirt(img, severity)
         if pollution == "affine":
-            angle = self.rng.uniform(-10, 10) * self.severity
+            angle = self.rng.uniform(-10, 10) * severity
             translate = [
-                int(self.rng.uniform(-3, 3) * self.severity),
-                int(self.rng.uniform(-3, 3) * self.severity),
+                int(self.rng.uniform(-3, 3) * severity),
+                int(self.rng.uniform(-3, 3) * severity),
             ]
-            scale = 1.0 + self.rng.uniform(-0.12, 0.12) * self.severity
-            shear = self.rng.uniform(-6, 6) * self.severity
+            scale = 1.0 + self.rng.uniform(-0.12, 0.12) * severity
+            shear = self.rng.uniform(-6, 6) * severity
             return TF.affine(img, angle=angle, translate=translate, scale=scale, shear=[shear, 0.0])
         raise ValueError(f"Unsupported pollution_type: {pollution}")
 
-    def _random_mask(self, img):
+    def _random_mask(self, img, severity):
         out = img.clone()
-        block_count = 1 + int(3 * self.severity)
+        block_count = 1 + int(3 * severity)
         for _ in range(block_count):
-            max_h = max(2, int(self.img_h * (0.10 + 0.28 * self.severity)))
-            max_w = max(2, int(self.img_w * (0.10 + 0.35 * self.severity)))
+            max_h = max(2, int(self.img_h * (0.10 + 0.28 * severity)))
+            max_w = max(2, int(self.img_w * (0.10 + 0.35 * severity)))
             h = self.rng.randint(2, max_h)
             w = self.rng.randint(2, max_w)
             y = self.rng.randint(0, max(0, self.img_h - h))
@@ -278,18 +297,18 @@ class PollutedCharDataset(Dataset):
             out[:, y : y + h, x : x + w] = 0.0 if self.rng.random() < 0.7 else 1.0
         return out
 
-    def _random_dirt(self, img):
+    def _random_dirt(self, img, severity):
         out = img.clone()
         yy, xx = torch.meshgrid(
             torch.arange(self.img_h, dtype=torch.float32),
             torch.arange(self.img_w, dtype=torch.float32),
             indexing="ij",
         )
-        spot_count = 1 + int(4 * self.severity)
+        spot_count = 1 + int(4 * severity)
         for _ in range(spot_count):
             cx = self.rng.uniform(0, self.img_w - 1)
             cy = self.rng.uniform(0, self.img_h - 1)
-            radius = self.rng.uniform(2, 4 + 10 * self.severity)
+            radius = self.rng.uniform(2, 4 + 10 * severity)
             mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius**2
             out[:, mask] = self.rng.uniform(0.0, 0.35)
         return out
