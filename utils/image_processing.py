@@ -41,6 +41,106 @@ class ImageEnhancer:
         return np.clip(recovered * 255, 0, 255).astype("uint8")
 
 
+class PlateDetector:
+    """Optional model-based plate detector with OpenCV fallback.
+
+    Set PLATE_DETECTOR_WEIGHTS to a local YOLO/ONNX license-plate detector.
+    The project still runs without the detector package or weights.
+    """
+
+    def __init__(self, weights_path=None, conf=0.35):
+        self.weights_path = weights_path or os.environ.get("PLATE_DETECTOR_WEIGHTS")
+        self.conf = float(os.environ.get("PLATE_DETECTOR_CONF", conf))
+        self.backend = None
+        self.model = None
+        if self.weights_path and os.path.exists(self.weights_path):
+            self._load_model(self.weights_path)
+
+    def _load_model(self, weights_path):
+        ext = os.path.splitext(weights_path)[1].lower()
+        if ext == ".onnx":
+            try:
+                self.model = cv2.dnn.readNetFromONNX(weights_path)
+                self.backend = "onnx"
+            except Exception as exc:
+                print(f"Warning: failed to load ONNX plate detector: {exc}")
+            return
+
+        try:
+            from ultralytics import YOLO
+
+            self.model = YOLO(weights_path)
+            self.backend = "ultralytics"
+        except Exception as exc:
+            print(f"Warning: failed to load YOLO plate detector: {exc}")
+
+    def detect(self, img):
+        if self.model is None:
+            return []
+        if self.backend == "ultralytics":
+            return self._detect_ultralytics(img)
+        if self.backend == "onnx":
+            return self._detect_onnx(img)
+        return []
+
+    def _detect_ultralytics(self, img):
+        try:
+            results = self.model.predict(img, conf=self.conf, verbose=False)
+        except Exception as exc:
+            print(f"Warning: YOLO plate detection failed: {exc}")
+            return []
+
+        detections = []
+        h, w = img.shape[:2]
+        for result in results:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                conf = float(box.conf.item())
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                detections.append((conf, self._clip_box((x1, y1, x2, y2), w, h)))
+        return detections
+
+    def _detect_onnx(self, img):
+        # Supports common YOLO-style ONNX outputs. If a model uses a different
+        # export shape, detection simply falls back to the OpenCV pipeline.
+        h, w = img.shape[:2]
+        input_size = int(os.environ.get("PLATE_DETECTOR_INPUT", "640"))
+        blob = cv2.dnn.blobFromImage(img, 1 / 255.0, (input_size, input_size), swapRB=True, crop=False)
+        try:
+            self.model.setInput(blob)
+            output = self.model.forward()
+        except Exception as exc:
+            print(f"Warning: ONNX plate detection failed: {exc}")
+            return []
+
+        pred = np.squeeze(output)
+        if pred.ndim != 2:
+            return []
+        if pred.shape[0] < pred.shape[1] and pred.shape[0] in (5, 6, 84):
+            pred = pred.T
+
+        detections = []
+        for row in pred:
+            if row.shape[0] < 5:
+                continue
+            cx, cy, bw, bh = row[:4]
+            score = float(row[4]) if row.shape[0] == 5 else float(row[4] * np.max(row[5:]))
+            if score < self.conf:
+                continue
+            x1 = int((cx - bw / 2) * w / input_size)
+            y1 = int((cy - bh / 2) * h / input_size)
+            x2 = int((cx + bw / 2) * w / input_size)
+            y2 = int((cy + bh / 2) * h / input_size)
+            detections.append((score, self._clip_box((x1, y1, x2, y2), w, h)))
+        return detections
+
+    @staticmethod
+    def _clip_box(box, width, height):
+        x1, y1, x2, y2 = box
+        return max(0, x1), max(0, y1), min(width, x2), min(height, y2)
+
+
 class PlateSegmenter:
     PLATE_W = 400
     PLATE_H = 120
@@ -263,6 +363,10 @@ class PlateSegmenter:
         binary = self._prepare_character_binary(self._make_character_mask(plate_img, gray))
 
         candidates = []
+        geometric_chars, geometric_boxes = self._segment_by_plate_geometry(plate_img, gray, binary)
+        if geometric_chars:
+            candidates.append(("geometry", geometric_boxes, geometric_chars))
+
         contour_boxes = self._find_contour_boxes(binary)
         if contour_boxes:
             candidates.append(("contour", contour_boxes, [self._crop_char(binary, box) for box in contour_boxes]))
@@ -286,6 +390,86 @@ class PlateSegmenter:
                 best_score = score
                 best_chars = chars
         return best_chars
+
+    def _segment_by_plate_geometry(self, plate_img, gray, binary):
+        roi = self._estimate_plate_text_roi(plate_img, binary)
+        if roi is None:
+            return [], []
+        left, top, right, bottom = roi
+        width = right - left
+        height = bottom - top
+        if width < 220 or height < 42:
+            return [], []
+
+        # Chinese plates have a wider province character, a letter, a separator,
+        # then five alphanumeric characters. These ratios are intentionally broad.
+        ratios = np.array([1.10, 0.95, 0.22, 0.95, 0.95, 0.95, 0.95, 0.95], dtype=np.float32)
+        unit = width / float(ratios.sum())
+        x = float(left)
+        boxes = []
+        for i, ratio in enumerate(ratios):
+            slot_w = unit * float(ratio)
+            if i == 2:
+                x += slot_w
+                continue
+            pad = int(max(2, slot_w * 0.10))
+            x1 = int(round(x + pad))
+            x2 = int(round(x + slot_w - pad))
+            y1 = int(round(top + 0.04 * height))
+            y2 = int(round(bottom - 0.04 * height))
+            boxes.append((max(0, x1), max(0, y1), max(4, x2 - x1), max(8, y2 - y1)))
+            x += slot_w
+
+        chars = [self._crop_slot_char(gray, binary, box) for box in boxes]
+        return chars, boxes
+
+    @classmethod
+    def _estimate_plate_text_roi(cls, plate_img, binary):
+        hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([90, 35, 35]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 30, 35]), np.array([95, 255, 255]))
+        color_mask = cv2.bitwise_or(blue, green)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (17, 5)))
+
+        rows = np.where((color_mask > 0).sum(axis=1) > 0.22 * cls.PLATE_W)[0]
+        cols = np.where((color_mask > 0).sum(axis=0) > 0.18 * cls.PLATE_H)[0]
+        if len(rows) < 20 or len(cols) < 120:
+            rows = np.where((binary > 0).sum(axis=1) > 2)[0]
+            cols = np.where((binary > 0).sum(axis=0) > 1)[0]
+        if len(rows) < 20 or len(cols) < 120:
+            return None
+
+        left = max(10, int(cols[0]) + 5)
+        right = min(cls.PLATE_W - 10, int(cols[-1]) - 5)
+        top = max(14, int(rows[0]) + 8)
+        bottom = min(cls.PLATE_H - 8, int(rows[-1]) - 6)
+
+        char_rows = np.where((binary[:, left:right] > 0).sum(axis=1) > 3)[0]
+        if len(char_rows) >= 20:
+            top = max(top, int(char_rows[0]) - 4)
+            bottom = min(bottom, int(char_rows[-1]) + 5)
+        return left, top, right, bottom
+
+    @staticmethod
+    def _crop_slot_char(gray, binary, box):
+        x, y, w, h = box
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(binary.shape[1], x + w), min(binary.shape[0], y + h)
+        slot_binary = binary[y1:y2, x1:x2]
+        if slot_binary.size == 0:
+            return np.zeros((64, 32), dtype=np.uint8)
+
+        if int(np.count_nonzero(slot_binary)) < 10:
+            slot_gray = gray[y1:y2, x1:x2]
+            if slot_gray.size == 0:
+                return np.zeros((64, 32), dtype=np.uint8)
+            slot_gray = cv2.GaussianBlur(slot_gray, (3, 3), 0)
+            _, slot_binary = cv2.threshold(slot_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if np.mean(slot_binary > 0) > 0.55:
+                slot_binary = cv2.bitwise_not(slot_binary)
+
+        slot_binary = PlateSegmenter._remove_char_border_fragments(slot_binary)
+        return PlateSegmenter._resize_char_canvas(slot_binary)
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -618,9 +802,14 @@ class PlateSegmenter:
 
 
 class LPRPipeline:
-    def __init__(self, use_synthetic_pollution=False):
+    def __init__(self, use_synthetic_pollution=False, detector_weights=None, char_detector_weights=None):
         self.enhancer = ImageEnhancer()
         self.segmenter = PlateSegmenter()
+        self.detector = PlateDetector(detector_weights)
+        self.char_detector = PlateDetector(
+            char_detector_weights or os.environ.get("CHAR_DETECTOR_WEIGHTS"),
+            conf=float(os.environ.get("CHAR_DETECTOR_CONF", "0.25")),
+        )
         self.use_synthetic_pollution = use_synthetic_pollution
 
     def process_image(self, img_path):
@@ -642,12 +831,34 @@ class LPRPipeline:
         if filename_plate is not None:
             candidates.append(("ccpd_filename", filename_plate))
 
+        for score, box in self.detector.detect(img):
+            plate_img = self._crop_detector_box(img, box)
+            if plate_img is not None:
+                candidates.append((f"detector_{score:.2f}", plate_img))
+
         for variant_name, variant_img in self._preprocess_variants(img):
             plate_img = self.segmenter.locate_plate(variant_img)
             if plate_img is not None:
                 candidates.append((variant_name, plate_img))
 
         return self._select_best_plate_result(candidates)
+
+    def _crop_detector_box(self, img, box):
+        x1, y1, x2, y2 = box
+        h, w = img.shape[:2]
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 10 or bh <= 6:
+            return None
+        pad_x = int(0.04 * bw)
+        pad_y = int(0.12 * bh)
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(w, x2 + pad_x)
+        y2 = min(h, y2 + pad_y)
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        return cv2.resize(crop, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
 
     def _preprocess_variants(self, img):
         variants = [("original", img)]
@@ -674,7 +885,7 @@ class LPRPipeline:
         best_plate = None
         best_chars = []
         for _, plate_img in candidates:
-            chars = self.segmenter.segment_characters(plate_img)
+            chars = self._detect_or_segment_chars(plate_img)
             score = self._plate_result_score(plate_img, chars)
             if score > best_score:
                 best_score = score
@@ -702,6 +913,24 @@ class LPRPipeline:
             ink_scores.append(1.0 - min(abs(ink_ratio - 0.22) / 0.35, 1.0))
         ink_score = float(np.mean(ink_scores)) if ink_scores else 0.0
         return 0.45 * quality + 0.40 * count_score + 0.15 * ink_score
+
+    def _detect_or_segment_chars(self, plate_img):
+        detections = self.char_detector.detect(plate_img)
+        if len(detections) >= 5:
+            chars = []
+            for _, box in sorted(detections, key=lambda item: item[1][0])[:7]:
+                x1, y1, x2, y2 = box
+                crop = plate_img[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                if np.mean(binary > 0) > 0.55:
+                    binary = cv2.bitwise_not(binary)
+                chars.append(PlateSegmenter._resize_char_canvas(binary))
+            if len(chars) >= 5:
+                return chars
+        return self.segmenter.segment_characters(plate_img)
 
     @staticmethod
     def _locate_from_ccpd_filename(img, path):

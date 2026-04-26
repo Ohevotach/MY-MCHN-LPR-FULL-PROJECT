@@ -6,3 +6,4 @@ Pillow
 matplotlib
 tqdm
 gradio
+ultralytics

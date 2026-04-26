@@ -36,6 +36,7 @@ def zh(text):
         "polluted": "\u6c61\u67d3\u540e\u5b57\u7b26",
         "matched": "\u5339\u914d\u8bb0\u5fc6\u6a21\u677f",
         "char_result": "\u5355\u5b57\u7b26\u8bc6\u522b\u7ed3\u679c",
+        "detector_hint": "\u53ef\u9009\uff1a\u8bbe\u7f6e PLATE_DETECTOR_WEIGHTS \u4e3a\u672c\u5730 YOLO/ONNX \u8f66\u724c\u68c0\u6d4b\u6743\u91cd\u540e\uff0c\u7cfb\u7edf\u4f1a\u4f18\u5148\u4f7f\u7528\u6a21\u578b\u5b9a\u4f4d\u3002",
     }
     return texts[text]
 
@@ -419,6 +420,7 @@ def run_single_char_test(class_label, sample_rel_path, pollution_type, severity,
 with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
     gr.Markdown("# " + zh("title"))
     with gr.Tab(zh("plate_tab")):
+        gr.Markdown(zh("detector_hint"))
         with gr.Row():
             with gr.Column(scale=1):
                 img_in = gr.Image(label=zh("upload_plate"), type="numpy")

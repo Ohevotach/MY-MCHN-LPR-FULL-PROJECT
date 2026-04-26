@@ -1,0 +1,9 @@
+# YOLO dataset config for license-plate detection.
+# Replace paths with your prepared dataset folders.
+path: ./dataset/yolo_plate
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: license_plate
