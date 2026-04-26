@@ -51,8 +51,8 @@ class PlateSegmenter:
             return None
 
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        blue_mask = cv2.inRange(hsv, np.array([95, 45, 35]), np.array([135, 255, 255]))
-        green_mask = cv2.inRange(hsv, np.array([35, 35, 35]), np.array([90, 255, 255]))
+        blue_mask = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
+        green_mask = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
         mask = cv2.bitwise_or(blue_mask, green_mask)
 
         close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 5))
@@ -88,15 +88,13 @@ class PlateSegmenter:
             aspect_score = 1.0 - min(abs(aspect - 3.4) / 3.4, 1.0)
             y_center = (y + bh / 2) / max(1, h_img)
             y_score = 1.0 - min(abs(y_center - 0.68) / 0.68, 0.85)
-            warped = self._warp_rect(img, rect)
-            if warped is None:
-                continue
-            quality = self._plate_quality_score(warped)
-            if quality < 0.18:
-                continue
             size_penalty = max(0.0, area_ratio - 0.035) * 8.0
-            score = quality * 4.0 + aspect_score * 1.5 + fill * 0.8 + y_score * 0.8 - size_penalty
-            candidates.append((score, rect, (x, y, bw, bh), warped))
+            for candidate_img, mode_bias in self._candidate_plate_images(img, rect, (x, y, bw, bh)):
+                quality = self._plate_quality_score(candidate_img)
+                if quality < 0.12:
+                    continue
+                score = quality * 4.0 + aspect_score * 1.5 + fill * 0.8 + y_score * 0.8 + mode_bias - size_penalty
+                candidates.append((score, rect, (x, y, bw, bh), candidate_img))
 
         if not candidates:
             return None
@@ -113,6 +111,33 @@ class PlateSegmenter:
         crop = img[y1:y2, x1:x2]
         if crop.size == 0:
             return None
+        return cv2.resize(crop, (self.PLATE_W, self.PLATE_H))
+
+    def _candidate_plate_images(self, img, rect, bbox):
+        candidates = []
+        warped = self._warp_rect(img, rect)
+        if warped is not None:
+            candidates.append((warped, 0.10))
+
+        crop = self._crop_bbox_candidate(img, bbox)
+        if crop is not None:
+            candidates.append((crop, 0.0))
+
+        return candidates
+
+    def _crop_bbox_candidate(self, img, bbox):
+        x, y, w, h = bbox
+        h_img, w_img = img.shape[:2]
+        pad_x = int(0.22 * w)
+        pad_y = int(0.75 * h)
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(w_img, x + w + pad_x)
+        y2 = min(h_img, y + h + pad_y)
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        crop = self._deskew_plate(crop)
         return cv2.resize(crop, (self.PLATE_W, self.PLATE_H))
 
     @staticmethod
@@ -135,13 +160,13 @@ class PlateSegmenter:
     @staticmethod
     def _plate_quality_score(plate_img):
         hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
-        blue = cv2.inRange(hsv, np.array([95, 45, 35]), np.array([135, 255, 255]))
-        green = cv2.inRange(hsv, np.array([35, 35, 35]), np.array([90, 255, 255]))
+        blue = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
         color_mask = cv2.bitwise_or(blue, green)
         roi = color_mask[12:108, 12:388]
         color_ratio = float(np.mean(roi > 0))
 
-        white = cv2.inRange(hsv, np.array([0, 0, 115]), np.array([180, 95, 255]))
+        white = cv2.inRange(hsv, np.array([0, 0, 75]), np.array([180, 145, 255]))
         white_roi = white[18:104, 18:382]
         white_ratio = float(np.mean(white_roi > 0))
 
@@ -154,12 +179,42 @@ class PlateSegmenter:
         edge_score = min(edge_ratio / 0.12, 1.0)
         return 0.55 * color_score + 0.25 * white_score + 0.20 * edge_score
 
+    @staticmethod
+    def _deskew_plate(plate_img):
+        hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
+        mask = cv2.bitwise_or(blue, green)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)), iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return plate_img
+        cnt = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(cnt) < 40:
+            return plate_img
+        rect = cv2.minAreaRect(cnt)
+        angle = rect[2]
+        rw, rh = rect[1]
+        if rw <= 1 or rh <= 1:
+            return plate_img
+        if rw < rh:
+            angle += 90.0
+        if angle > 45.0:
+            angle -= 90.0
+        if angle < -45.0:
+            angle += 90.0
+        if abs(angle) < 2.0 or abs(angle) > 25.0:
+            return plate_img
+        h, w = plate_img.shape[:2]
+        matrix = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+        return cv2.warpAffine(plate_img, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
     def segment_characters(self, plate_img):
         """Segment a rectified plate into 7 character crops."""
         if plate_img is None:
             return []
 
-        plate_img = cv2.resize(plate_img, (self.PLATE_W, self.PLATE_H))
+        plate_img = self._deskew_plate(cv2.resize(plate_img, (self.PLATE_W, self.PLATE_H)))
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = self._make_character_mask(plate_img, gray)
@@ -180,15 +235,16 @@ class PlateSegmenter:
     @staticmethod
     def _make_character_mask(plate_img, gray):
         hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
-        blue = cv2.inRange(hsv, np.array([95, 45, 35]), np.array([135, 255, 255]))
-        green = cv2.inRange(hsv, np.array([35, 35, 35]), np.array([90, 255, 255]))
+        blue = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
         plate_color = cv2.bitwise_or(blue, green)
         color_ratio = float(np.mean(plate_color[12:108, 12:388] > 0))
 
         if color_ratio > 0.25:
-            white = cv2.inRange(hsv, np.array([0, 0, 120]), np.array([180, 105, 255]))
-            bright = cv2.inRange(gray, 125, 255)
-            binary = cv2.bitwise_and(white, bright)
+            white = cv2.inRange(hsv, np.array([0, 0, 70]), np.array([180, 155, 255]))
+            adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 19, -3)
+            bright = cv2.inRange(gray, max(55, int(np.percentile(gray, 55))), 255)
+            binary = cv2.bitwise_and(cv2.bitwise_or(white, adaptive), bright)
         else:
             _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             border = np.concatenate([binary[0, :], binary[-1, :], binary[:, 0], binary[:, -1]])
@@ -254,8 +310,26 @@ class PlateSegmenter:
                 y2 = min(108, int(rows[-1]) + 3)
             else:
                 y1, y2 = 18, 104
-            chars.append(self._crop_char(binary, (x1, y1, max(4, x2 - x1), y2 - y1)))
+            char_mask = binary.copy()
+            if int(np.count_nonzero(char_mask[y1:y2, max(0, x1) : min(self.PLATE_W, x2)])) < 12:
+                char_mask = self._local_slot_mask(gray, x1, x2, y1, y2)
+                x1, x2 = 0, char_mask.shape[1]
+                y1, y2 = 0, char_mask.shape[0]
+            chars.append(self._crop_char(char_mask, (x1, y1, max(4, x2 - x1), y2 - y1)))
         return chars
+
+    @staticmethod
+    def _local_slot_mask(gray, x1, x2, y1, y2):
+        slot = gray[max(0, y1) : min(gray.shape[0], y2), max(0, x1) : min(gray.shape[1], x2)]
+        if slot.size == 0:
+            return np.zeros((64, 32), dtype=np.uint8)
+        slot = cv2.GaussianBlur(slot, (3, 3), 0)
+        block = max(11, min(31, (min(slot.shape[:2]) // 2) * 2 + 1))
+        adaptive = cv2.adaptiveThreshold(slot, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, -2)
+        if np.mean(adaptive > 0) > 0.55:
+            adaptive = cv2.bitwise_not(adaptive)
+        adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+        return adaptive
 
     @staticmethod
     def _crop_char(binary, box):
