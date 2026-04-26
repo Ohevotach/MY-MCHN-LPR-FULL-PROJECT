@@ -67,12 +67,20 @@ def build_stratified_split(labels, train_ratio=0.7, seed=2026):
     return train_indices, test_indices
 
 
-def class_free_energy_scores(sim_scores, template_labels, beta, num_classes):
+def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
     labels = template_labels.to(sim_scores.device)
     scaled = beta * sim_scores
+    if template_mask is not None:
+        mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        scaled = scaled.masked_fill(~mask, -1e9)
+
     scores = []
     for class_idx in range(num_classes):
         class_mask = labels == class_idx
+        if template_mask is not None and template_mask.dim() == 1:
+            class_mask = class_mask & template_mask.to(labels.device)
         count = int(class_mask.sum().item())
         if count == 0:
             scores.append(scaled.new_full((scaled.shape[0],), -1e9))
@@ -317,6 +325,17 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
     pipeline = LPRPipeline(use_synthetic_pollution=False)
     mchn = ModernHopfieldNetwork(loader.memory_matrix.to(device), beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device)
     template_labels = loader.labels.to(device)
+    chinese_mask = torch.zeros(loader.memory_matrix.shape[0], dtype=torch.bool, device=device)
+    alnum_mask = torch.zeros(loader.memory_matrix.shape[0], dtype=torch.bool, device=device)
+    letter_mask = torch.zeros(loader.memory_matrix.shape[0], dtype=torch.bool, device=device)
+    if loader.chinese_indices:
+        chinese_mask[loader.chinese_indices] = True
+    if loader.alnum_indices:
+        alnum_mask[loader.alnum_indices] = True
+    for idx, label_idx in enumerate(loader.labels.tolist()):
+        label = loader.idx_to_label[int(label_idx)]
+        if len(label) == 1 and "A" <= label <= "Z":
+            letter_mask[idx] = True
 
     for img_name in [f for f in os.listdir(test_dir) if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))][:max_images]:
         img_path = os.path.join(test_dir, img_name)
@@ -327,9 +346,11 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
         result = ""
         for char_img in chars_img_list:
             char_tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32, device=device).view(1, -1) / 255.0
+            position = len(result)
+            template_mask = chinese_mask if position == 0 else letter_mask if position == 1 and bool(letter_mask.any().item()) else alnum_mask
             with torch.no_grad():
-                _, _, sim_scores = mchn(char_tensor, return_similarity=True)
-                scores = class_free_energy_scores(sim_scores, template_labels, mchn.beta, len(loader.idx_to_label))
+                _, _, sim_scores = mchn(char_tensor, template_mask=template_mask, return_similarity=True)
+                scores = class_free_energy_scores(sim_scores, template_labels, mchn.beta, len(loader.idx_to_label), template_mask=template_mask)
             result += loader.idx_to_label[int(torch.argmax(scores, dim=-1))]
         print(f"{img_name}: {result}")
 

@@ -45,7 +45,7 @@ def is_kaggle_runtime():
 
 
 def default_cache_path():
-    cache_dir = "/kaggle/working/mchn_cache" if is_kaggle_runtime() else os.path.join(os.getcwd(), "data")
+    cache_dir = "/kaggle/working/mchn_cache" if is_kaggle_runtime() else os.path.join(os.getcwd(), "results", "cache")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, "template_cache_32x64.pt")
 
@@ -53,11 +53,19 @@ def default_cache_path():
 def build_template_masks(loader, num_templates, device):
     chinese_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     alnum_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
+    letter_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
+    digit_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     if loader.chinese_indices:
         chinese_mask[loader.chinese_indices] = True
     if loader.alnum_indices:
         alnum_mask[loader.alnum_indices] = True
-    return chinese_mask, alnum_mask
+    for idx, label_idx in enumerate(loader.labels.tolist()):
+        label = loader.idx_to_label[int(label_idx)]
+        if len(label) == 1 and "A" <= label <= "Z":
+            letter_mask[idx] = True
+        elif label.isdigit() and len(label) == 1:
+            digit_mask[idx] = True
+    return chinese_mask, alnum_mask, letter_mask, digit_mask
 
 
 def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
@@ -140,7 +148,7 @@ mchn_models = [
 ]
 pipeline = LPRPipeline()
 template_labels = loader.labels.to(device)
-chinese_mask, alnum_mask = build_template_masks(loader, memory.shape[0], device)
+chinese_mask, alnum_mask, letter_mask, digit_mask = build_template_masks(loader, memory.shape[0], device)
 pollution_choices = ["none", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "mixed"]
 full_car_samples = collect_full_car_samples()
 
@@ -174,6 +182,14 @@ def recognize_tensor(tensor, template_mask=None):
     return class_idx, best_template_idx, prob, template_sim, recon_sim
 
 
+def plate_position_mask(position):
+    if position == 0:
+        return chinese_mask
+    if position == 1 and bool(letter_mask.any().item()):
+        return letter_mask
+    return alnum_mask
+
+
 def predict_plate(image):
     if image is None:
         return "\u8bf7\u5148\u4e0a\u4f20\u56fe\u7247\u3002", None, pd.DataFrame(), []
@@ -192,7 +208,7 @@ def predict_plate(image):
     for i, char_img in enumerate(chars):
         tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32) / 255.0
         tensor = tensor.view(1, -1)
-        current_mask = chinese_mask if i == 0 else alnum_mask
+        current_mask = plate_position_mask(i)
         class_idx, best_template_idx, prob, template_sim, recon_sim = recognize_tensor(tensor, current_mask)
         char = loader.idx_to_label[class_idx]
         plate_text += char
@@ -236,7 +252,7 @@ def predict_plate_from_sample(sample_rel_path):
     gallery = [cv2.cvtColor(c, cv2.COLOR_GRAY2RGB) for c in chars]
     for i, char_img in enumerate(chars):
         tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32) / 255.0
-        current_mask = chinese_mask if i == 0 else alnum_mask
+        current_mask = plate_position_mask(i)
         class_idx, best_template_idx, prob, template_sim, recon_sim = recognize_tensor(tensor.view(1, -1), current_mask)
         char = loader.idx_to_label[class_idx]
         plate_text += char
