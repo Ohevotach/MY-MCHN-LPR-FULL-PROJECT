@@ -10,7 +10,7 @@ class ModernHopfieldNetwork(nn.Module):
         z = softmax(beta * q @ M.T) @ M
     """
 
-    def __init__(self, memory_matrix, beta=40.0, metric="dot", normalize=True, feature_mode="centered"):
+    def __init__(self, memory_matrix, beta=40.0, metric="dot", normalize=True, feature_mode="binary"):
         super().__init__()
         if memory_matrix.dim() != 2:
             raise ValueError("memory_matrix must have shape [num_templates, feature_dim].")
@@ -29,6 +29,16 @@ class ModernHopfieldNetwork(nn.Module):
             return x - x.mean(dim=-1, keepdim=True)
         if self.feature_mode == "bipolar":
             return x * 2.0 - 1.0
+        if self.feature_mode == "binary":
+            mean = x.mean(dim=-1, keepdim=True)
+            std = x.std(dim=-1, keepdim=True).clamp_min(1e-6)
+            threshold = mean + 0.15 * std
+            return (x > threshold).float() * 2.0 - 1.0
+        if self.feature_mode == "binary_centered":
+            mean = x.mean(dim=-1, keepdim=True)
+            std = x.std(dim=-1, keepdim=True).clamp_min(1e-6)
+            binary = (x > mean + 0.15 * std).float()
+            return binary - binary.mean(dim=-1, keepdim=True)
         raise ValueError(f"Unsupported feature_mode: {self.feature_mode}")
 
     def _memory_for_similarity(self):
@@ -55,7 +65,7 @@ class ModernHopfieldNetwork(nn.Module):
             return -torch.cdist(q_sim, m_sim, p=2.0)
         raise ValueError(f"Unsupported metric: {self.metric}")
 
-    def forward(self, q, template_mask=None, return_attention=False):
+    def forward(self, q, template_mask=None, return_attention=False, return_similarity=False):
         if q.dim() == 1:
             q = q.unsqueeze(0)
 
@@ -70,8 +80,12 @@ class ModernHopfieldNetwork(nn.Module):
         retrieved = torch.matmul(attention_weights, self.M)
         predicted_indices = torch.argmax(attention_weights, dim=-1)
 
+        if return_attention and return_similarity:
+            return retrieved, predicted_indices, attention_weights, sim_scores
         if return_attention:
             return retrieved, predicted_indices, attention_weights
+        if return_similarity:
+            return retrieved, predicted_indices, sim_scores
         return retrieved, predicted_indices
 
 

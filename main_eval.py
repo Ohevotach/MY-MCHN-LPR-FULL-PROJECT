@@ -24,20 +24,73 @@ def aggregate_attention_by_class(attention_weights, template_labels, num_classes
     return class_scores
 
 
-def build_position_masks(loader, memory_labels, device):
-    chinese_mask = torch.zeros(len(memory_labels), dtype=torch.bool, device=device)
-    alnum_mask = torch.zeros(len(memory_labels), dtype=torch.bool, device=device)
-    for i, class_idx in enumerate(memory_labels.tolist()):
-        label = loader.idx_to_label[int(class_idx)]
-        if len(label) == 1 and "\u4e00" <= label <= "\u9fff":
-            chinese_mask[i] = True
-        else:
-            alnum_mask[i] = True
+def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
+    labels = template_labels.to(sim_scores.device)
+    scaled = beta * sim_scores
+    if template_mask is not None:
+        mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        scaled = scaled.masked_fill(~mask, -1e9)
+
+    scores = []
+    for class_idx in range(num_classes):
+        class_mask = labels == class_idx
+        if template_mask is not None and template_mask.dim() == 1:
+            class_mask = class_mask & template_mask.to(labels.device)
+        count = int(class_mask.sum().item())
+        if count == 0:
+            scores.append(scaled.new_full((scaled.shape[0],), -1e9))
+            continue
+        class_score = torch.logsumexp(scaled[:, class_mask], dim=-1) - torch.log(
+            scaled.new_tensor(float(count))
+        )
+        scores.append(class_score)
+    return torch.stack(scores, dim=-1)
+
+
+def select_best_template_in_class(sim_scores, template_labels, pred_classes):
+    labels = template_labels.to(sim_scores.device)
+    selected = []
+    for row, class_idx in zip(sim_scores, pred_classes):
+        mask = labels == int(class_idx)
+        masked = row.masked_fill(~mask, -1e9)
+        selected.append(torch.argmax(masked))
+    return torch.stack(selected)
+
+
+def ensemble_class_scores(models, q, template_labels, num_classes, template_mask=None):
+    fused = None
+    primary_sim = None
+    for model in models:
+        _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
+        scores = class_free_energy_scores(
+            sim_scores,
+            template_labels,
+            beta=model.beta,
+            num_classes=num_classes,
+            template_mask=template_mask,
+        )
+        log_probs = torch.log_softmax(scores, dim=-1)
+        fused = log_probs if fused is None else fused + log_probs
+        if primary_sim is None:
+            primary_sim = sim_scores
+    return fused, primary_sim
+
+
+def build_template_masks(loader, num_templates, device):
+    chinese_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
+    if loader.chinese_indices:
+        chinese_mask[loader.chinese_indices] = True
+
+    alnum_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
+    if loader.alnum_indices:
+        alnum_mask[loader.alnum_indices] = True
 
     return chinese_mask, alnum_mask
 
 
-def run_reconstruction_demo(mchn, dataset, visualizer, device, class_memory, batch_size=5):
+def run_reconstruction_demo(models, dataset, visualizer, device, class_memory, batch_size=5):
     print("\n" + "=" * 50)
     print("Task 1: generating MCHN reconstruction demo...")
 
@@ -46,11 +99,16 @@ def run_reconstruction_demo(mchn, dataset, visualizer, device, class_memory, bat
     polluted_q = polluted_q.to(device)
 
     with torch.no_grad():
-        _, _, weights = mchn(polluted_q, return_attention=True)
         template_labels = dataset.L.to(device)
-        class_scores = aggregate_attention_by_class(weights, template_labels, len(dataset.idx_to_label))
+        class_scores, sim_scores = ensemble_class_scores(
+            models,
+            polluted_q,
+            template_labels,
+            num_classes=len(dataset.idx_to_label),
+        )
         pred_classes = torch.argmax(class_scores, dim=-1).detach().cpu()
-        reconstructed_z = class_memory[pred_classes].detach().cpu()
+        best_template_indices = select_best_template_in_class(sim_scores, template_labels, pred_classes.to(device))
+        reconstructed_z = models[0].M[best_template_indices].detach().cpu()
 
     labels_str = [dataset.idx_to_label[int(idx)] for idx in labels_idx]
 
@@ -63,17 +121,18 @@ def run_reconstruction_demo(mchn, dataset, visualizer, device, class_memory, bat
     )
 
 
-def evaluate_one_setting(model, template_labels, num_classes, dataloader, device):
+def evaluate_one_setting(models, template_labels, num_classes, dataloader, device):
     correct = 0
     total = 0
     template_labels = template_labels.to(device)
+    if not isinstance(models, (list, tuple)):
+        models = [models]
 
     with torch.no_grad():
         for q, _, labels in dataloader:
             q = q.to(device)
             labels = labels.to(device)
-            _, _, weights = model(q, return_attention=True)
-            class_scores = aggregate_attention_by_class(weights, template_labels, num_classes)
+            class_scores, _ = ensemble_class_scores(models, q, template_labels, num_classes)
             pred_classes = torch.argmax(class_scores, dim=-1)
             correct += (pred_classes == labels).sum().item()
             total += labels.size(0)
@@ -92,7 +151,9 @@ def run_robustness_evaluation(loader, visualizer, device, pollution_type, sample
     memory = loader.memory_matrix.to(device)
     template_labels = loader.labels
     num_classes = len(loader.idx_to_label)
-    mchn = ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device)
+    mchn_binary = ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device)
+    mchn_centered = ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device)
+    mchn_models = [mchn_binary, mchn_centered]
     baseline = ModernHopfieldNetwork(memory, beta=10.0, metric="euclidean", normalize=False, feature_mode="raw").to(device)
 
     for sev in severities:
@@ -106,9 +167,9 @@ def run_robustness_evaluation(loader, visualizer, device, pollution_type, sample
         )
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-        acc_mchn.append(evaluate_one_setting(mchn, template_labels, num_classes, test_loader, device))
+        acc_mchn.append(evaluate_one_setting(mchn_models, template_labels, num_classes, test_loader, device))
         acc_baseline.append(evaluate_one_setting(baseline, template_labels, num_classes, test_loader, device))
-        print(f"  MCHN centered-dot: {acc_mchn[-1]:.2f}% | Euclidean baseline: {acc_baseline[-1]:.2f}%")
+        print(f"  MCHN multi-view: {acc_mchn[-1]:.2f}% | Euclidean baseline: {acc_baseline[-1]:.2f}%")
 
     visualizer.plot_robustness_curve(
         severities,
@@ -128,9 +189,15 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
         return
 
     pipeline = LPRPipeline(use_synthetic_pollution=False)
-    memory, memory_labels = build_class_memory(loader, reduce="medoid")
-    mchn = ModernHopfieldNetwork(memory.to(device), beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device)
-    chinese_mask, alnum_mask = build_position_masks(loader, memory_labels, device)
+    mchn = ModernHopfieldNetwork(
+        loader.memory_matrix.to(device),
+        beta=60.0,
+        metric="dot",
+        normalize=True,
+        feature_mode="binary",
+    ).to(device)
+    template_labels = loader.labels.to(device)
+    chinese_mask, alnum_mask = build_template_masks(loader, mchn.num_templates, device)
 
     test_files = [
         os.path.join(test_dir, f)
@@ -155,12 +222,18 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
 
             current_mask = chinese_mask if i == 0 else alnum_mask
             with torch.no_grad():
-                _, pred_idx, weights = mchn(char_tensor, template_mask=current_mask, return_attention=True)
+                _, _, sim_scores = mchn(char_tensor, template_mask=current_mask, return_similarity=True)
+                class_scores = class_free_energy_scores(
+                    sim_scores,
+                    template_labels,
+                    beta=mchn.beta,
+                    num_classes=len(loader.idx_to_label),
+                    template_mask=current_mask,
+                )
 
-            memory_idx = pred_idx.item()
-            class_idx = int(memory_labels[memory_idx])
+            class_idx = int(torch.argmax(class_scores, dim=-1).item())
             plate_result += loader.idx_to_label[class_idx]
-            confidences.append(weights[0, memory_idx].item())
+            confidences.append(torch.softmax(class_scores, dim=-1)[0, class_idx].item())
 
         conf_text = ", ".join(f"{c:.3f}" for c in confidences)
         print(f"  MCHN result: {plate_result} | chars={len(chars_img_list)} | attention={conf_text}")
@@ -197,19 +270,28 @@ if __name__ == "__main__":
         loader,
         virtual_size=10,
         pollution_type=args.pollution,
-        severity=0.6,
+        severity=0.4,
         seed=2026,
     )
     class_memory, _ = build_class_memory(loader, reduce="medoid")
-    demo_model = ModernHopfieldNetwork(
-        loader.memory_matrix.to(device),
-        beta=80.0,
-        metric="dot",
-        normalize=True,
-        feature_mode="centered",
-    ).to(device)
+    demo_models = [
+        ModernHopfieldNetwork(
+            loader.memory_matrix.to(device),
+            beta=60.0,
+            metric="dot",
+            normalize=True,
+            feature_mode="binary",
+        ).to(device),
+        ModernHopfieldNetwork(
+            loader.memory_matrix.to(device),
+            beta=80.0,
+            metric="dot",
+            normalize=True,
+            feature_mode="centered",
+        ).to(device),
+    ]
 
-    run_reconstruction_demo(demo_model, demo_dataset, visualizer, device, class_memory)
+    run_reconstruction_demo(demo_models, demo_dataset, visualizer, device, class_memory)
     run_robustness_evaluation(
         loader,
         visualizer,

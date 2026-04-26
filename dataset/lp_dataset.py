@@ -19,43 +19,42 @@ class TemplateLoader:
         self.label_to_idx = {}
         self.idx_to_label = {}
         self.template_paths = []
-
         self.chinese_indices = []
         self.alnum_indices = []
 
         self.pinyin_map = {
-            "zh_jing": "京",
-            "zh_jin": "津",
-            "zh_ji": "冀",
-            "zh_jin1": "晋",
-            "zh_meng": "蒙",
-            "zh_liao": "辽",
-            "zh_ji1": "吉",
-            "zh_hei": "黑",
-            "zh_hu": "沪",
-            "zh_su": "苏",
-            "zh_zhe": "浙",
-            "zh_wan": "皖",
-            "zh_min": "闽",
-            "zh_gan": "赣",
-            "zh_lu": "鲁",
-            "zh_yu": "豫",
-            "zh_e": "鄂",
-            "zh_xiang": "湘",
-            "zh_yue": "粤",
-            "zh_gui1": "桂",
-            "zh_qiong": "琼",
-            "zh_yu1": "渝",
-            "zh_chuan": "川",
-            "zh_gui": "贵",
-            "zh_yun": "云",
-            "zh_zang": "藏",
-            "zh_shan": "陕",
-            "zh_gan1": "甘",
-            "zh_qing": "青",
-            "zh_ning": "宁",
-            "zh_xin": "新",
-            "zh_sx": "晋",
+            "zh_jing": "\u4eac",
+            "zh_jin": "\u6d25",
+            "zh_ji": "\u5180",
+            "zh_jin1": "\u664b",
+            "zh_meng": "\u8499",
+            "zh_liao": "\u8fbd",
+            "zh_ji1": "\u5409",
+            "zh_hei": "\u9ed1",
+            "zh_hu": "\u6caa",
+            "zh_su": "\u82cf",
+            "zh_zhe": "\u6d59",
+            "zh_wan": "\u7696",
+            "zh_min": "\u95fd",
+            "zh_gan": "\u8d63",
+            "zh_lu": "\u9c81",
+            "zh_yu": "\u8c6b",
+            "zh_e": "\u9102",
+            "zh_xiang": "\u6e58",
+            "zh_yue": "\u7ca4",
+            "zh_gui1": "\u6842",
+            "zh_qiong": "\u743c",
+            "zh_yu1": "\u6e1d",
+            "zh_chuan": "\u5ddd",
+            "zh_gui": "\u8d35",
+            "zh_yun": "\u4e91",
+            "zh_zang": "\u85cf",
+            "zh_shan": "\u9655",
+            "zh_gan1": "\u7518",
+            "zh_qing": "\u9752",
+            "zh_ning": "\u5b81",
+            "zh_xin": "\u65b0",
+            "zh_sx": "\u664b",
         }
 
         self.valid_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
@@ -76,11 +75,7 @@ class TemplateLoader:
             self._save_cache()
 
     def _build_cache_signature(self):
-        signature = {
-            "img_size": tuple(self.img_size),
-            "label_map_version": 2,
-            "roots": [],
-        }
+        signature = {"img_size": tuple(self.img_size), "label_map_version": 3, "roots": []}
         for root_dir in self.data_roots:
             root_info = {"root": os.path.abspath(root_dir), "file_count": 0, "latest_mtime": 0.0}
             if os.path.exists(root_dir):
@@ -117,11 +112,7 @@ class TemplateLoader:
         self.template_paths = cache.get("template_paths", [])
         self.chinese_indices = cache.get("chinese_indices", [])
         self.alnum_indices = cache.get("alnum_indices", [])
-        print(
-            "Loaded template cache: "
-            f"{self.memory_matrix.shape[0]} templates, "
-            f"{len(self.idx_to_label)} classes."
-        )
+        print(f"Loaded template cache: {self.memory_matrix.shape[0]} templates, {len(self.idx_to_label)} classes.")
         return True
 
     def _save_cache(self):
@@ -147,7 +138,6 @@ class TemplateLoader:
     def _load_all_templates(self):
         print("Building MCHN memory matrix...")
         current_idx = 0
-
         for root_dir in self.data_roots:
             if not os.path.exists(root_dir):
                 print(f"Warning: data root not found: {root_dir}")
@@ -167,7 +157,6 @@ class TemplateLoader:
                 for file_name in sorted(os.listdir(class_path)):
                     if not file_name.lower().endswith(self.valid_extensions):
                         continue
-
                     img_path = os.path.join(class_path, file_name)
                     try:
                         with Image.open(img_path) as img:
@@ -179,7 +168,6 @@ class TemplateLoader:
                     self.templates.append(tensor_img.view(-1))
                     self.labels.append(self.label_to_idx[display_label])
                     self.template_paths.append(img_path)
-
                     template_idx = len(self.templates) - 1
                     if self._is_chinese_label(display_label):
                         self.chinese_indices.append(template_idx)
@@ -211,14 +199,7 @@ class TemplateLoader:
 
 
 class PollutedCharDataset(Dataset):
-    def __init__(
-        self,
-        template_loader,
-        virtual_size=5000,
-        pollution_type="mixed",
-        severity=0.5,
-        seed=None,
-    ):
+    def __init__(self, template_loader, virtual_size=5000, pollution_type="mixed", severity=0.5, seed=None):
         self.M, self.L, self.idx_to_label = template_loader.get_memory_matrix()
         self.virtual_size = virtual_size
         self.pollution_type = pollution_type
@@ -233,24 +214,21 @@ class PollutedCharDataset(Dataset):
     def __getitem__(self, idx):
         if self.M.shape[0] == 0:
             raise RuntimeError("Template memory is empty. Check data_roots.")
-
         target_idx = self.rng.randint(0, self.M.shape[0] - 1)
         clean_q = self.M[target_idx].clone()
         clean_img = clean_q.view(1, self.img_h, self.img_w)
         polluted_img = self._pollute(clean_img)
-        polluted_q = polluted_img.clamp(0.0, 1.0).view(-1)
-        return polluted_q, clean_q, self.L[target_idx]
+        return polluted_img.clamp(0.0, 1.0).view(-1), clean_q, self.L[target_idx]
 
     def _pollute(self, img):
-        pollution = self.pollution_type
-        if pollution == "mixed":
+        if self.pollution_type == "mixed":
             choices = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
             count = 1 if self.severity < 0.35 else 2 if self.severity < 0.7 else 3
             out = img.clone()
             for name in self.rng.sample(choices, count):
                 out = self._apply_one(out, name)
             return out
-        return self._apply_one(img.clone(), pollution)
+        return self._apply_one(img.clone(), self.pollution_type)
 
     def _apply_one(self, img, pollution):
         if pollution == "none":
@@ -258,47 +236,46 @@ class PollutedCharDataset(Dataset):
         if pollution == "mask":
             return self._random_mask(img)
         if pollution == "noise":
-            sigma = 0.05 + 0.45 * self.severity
+            sigma = 0.03 + 0.30 * self.severity
             return img + torch.randn_like(img) * sigma
         if pollution == "salt_pepper":
-            prob = 0.02 + 0.35 * self.severity
+            prob = 0.01 + 0.22 * self.severity
             rnd = torch.rand_like(img)
             out = img.clone()
             out[rnd < prob / 2] = 0.0
             out[(rnd >= prob / 2) & (rnd < prob)] = 1.0
             return out
         if pollution == "blur":
-            kernel = int(3 + 8 * self.severity)
+            kernel = int(3 + 6 * self.severity)
             kernel = kernel + 1 if kernel % 2 == 0 else kernel
             return TF.gaussian_blur(img, kernel_size=[kernel, kernel])
         if pollution == "fog":
-            fog = 0.25 + 0.6 * self.severity
+            fog = 0.15 + 0.45 * self.severity
             return img * (1.0 - fog) + fog
         if pollution == "dirt":
             return self._random_dirt(img)
         if pollution == "affine":
-            angle = self.rng.uniform(-12, 12) * self.severity
+            angle = self.rng.uniform(-10, 10) * self.severity
             translate = [
-                int(self.rng.uniform(-4, 4) * self.severity),
-                int(self.rng.uniform(-4, 4) * self.severity),
+                int(self.rng.uniform(-3, 3) * self.severity),
+                int(self.rng.uniform(-3, 3) * self.severity),
             ]
-            scale = 1.0 + self.rng.uniform(-0.18, 0.18) * self.severity
-            shear = self.rng.uniform(-8, 8) * self.severity
+            scale = 1.0 + self.rng.uniform(-0.12, 0.12) * self.severity
+            shear = self.rng.uniform(-6, 6) * self.severity
             return TF.affine(img, angle=angle, translate=translate, scale=scale, shear=[shear, 0.0])
         raise ValueError(f"Unsupported pollution_type: {pollution}")
 
     def _random_mask(self, img):
         out = img.clone()
-        block_count = 1 + int(4 * self.severity)
+        block_count = 1 + int(3 * self.severity)
         for _ in range(block_count):
-            max_h = max(2, int(self.img_h * (0.12 + 0.35 * self.severity)))
-            max_w = max(2, int(self.img_w * (0.12 + 0.45 * self.severity)))
+            max_h = max(2, int(self.img_h * (0.10 + 0.28 * self.severity)))
+            max_w = max(2, int(self.img_w * (0.10 + 0.35 * self.severity)))
             h = self.rng.randint(2, max_h)
             w = self.rng.randint(2, max_w)
             y = self.rng.randint(0, max(0, self.img_h - h))
             x = self.rng.randint(0, max(0, self.img_w - w))
-            value = 0.0 if self.rng.random() < 0.7 else 1.0
-            out[:, y : y + h, x : x + w] = value
+            out[:, y : y + h, x : x + w] = 0.0 if self.rng.random() < 0.7 else 1.0
         return out
 
     def _random_dirt(self, img):
@@ -308,14 +285,13 @@ class PollutedCharDataset(Dataset):
             torch.arange(self.img_w, dtype=torch.float32),
             indexing="ij",
         )
-        spot_count = 1 + int(5 * self.severity)
+        spot_count = 1 + int(4 * self.severity)
         for _ in range(spot_count):
             cx = self.rng.uniform(0, self.img_w - 1)
             cy = self.rng.uniform(0, self.img_h - 1)
-            radius = self.rng.uniform(2, 4 + 12 * self.severity)
+            radius = self.rng.uniform(2, 4 + 10 * self.severity)
             mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius**2
-            value = self.rng.uniform(0.0, 0.35)
-            out[:, mask] = value
+            out[:, mask] = self.rng.uniform(0.0, 0.35)
         return out
 
 

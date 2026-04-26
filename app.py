@@ -1,17 +1,17 @@
 import os
 
 import cv2
+import gradio as gr
 import pandas as pd
 import torch
 import torch.nn.functional as F
 
-import gradio as gr
 from dataset.lp_dataset import TemplateLoader
 from models.mchn import ModernHopfieldNetwork
 from utils.image_processing import LPRPipeline
 
 
-def build_position_masks(loader, num_templates, device):
+def build_template_masks(loader, num_templates, device):
     chinese_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     if loader.chinese_indices:
         chinese_mask[loader.chinese_indices] = True
@@ -23,11 +23,35 @@ def build_position_masks(loader, num_templates, device):
     return chinese_mask, alnum_mask
 
 
-def aggregate_attention_by_class(attention_weights, template_labels, num_classes):
-    class_scores = attention_weights.new_zeros((attention_weights.shape[0], num_classes))
-    label_index = template_labels.to(attention_weights.device).view(1, -1).expand(attention_weights.shape[0], -1)
-    class_scores.scatter_add_(1, label_index, attention_weights)
-    return class_scores
+def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
+    labels = template_labels.to(sim_scores.device)
+    scaled = beta * sim_scores
+    if template_mask is not None:
+        mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        scaled = scaled.masked_fill(~mask, -1e9)
+
+    scores = []
+    for class_idx in range(num_classes):
+        class_mask = labels == class_idx
+        if template_mask is not None and template_mask.dim() == 1:
+            class_mask = class_mask & template_mask.to(labels.device)
+        count = int(class_mask.sum().item())
+        if count == 0:
+            scores.append(scaled.new_full((scaled.shape[0],), -1e9))
+            continue
+        scores.append(
+            torch.logsumexp(scaled[:, class_mask], dim=-1)
+            - torch.log(scaled.new_tensor(float(count)))
+        )
+    return torch.stack(scores, dim=-1)
+
+
+def select_best_template_in_class(sim_scores, template_labels, class_idx):
+    labels = template_labels.to(sim_scores.device)
+    mask = labels == int(class_idx)
+    return torch.argmax(sim_scores[0].masked_fill(~mask, -1e9)).item()
 
 
 print("Loading MCHN memory and OpenCV LPR pipeline...")
@@ -38,6 +62,13 @@ if loader.memory_matrix.shape[0] == 0:
 
 mchn = ModernHopfieldNetwork(
     loader.memory_matrix.to(device),
+    beta=60.0,
+    metric="dot",
+    normalize=True,
+    feature_mode="binary",
+).to(device)
+mchn_centered = ModernHopfieldNetwork(
+    loader.memory_matrix.to(device),
     beta=80.0,
     metric="dot",
     normalize=True,
@@ -45,7 +76,7 @@ mchn = ModernHopfieldNetwork(
 ).to(device)
 pipeline = LPRPipeline()
 template_labels = loader.labels.to(device)
-chinese_mask, alnum_mask = build_position_masks(loader, mchn.num_templates, device)
+chinese_mask, alnum_mask = build_template_masks(loader, mchn.num_templates, device)
 
 
 def predict_analysis(image):
@@ -73,23 +104,41 @@ def predict_analysis(image):
         current_mask = chinese_mask if i == 0 else alnum_mask
 
         with torch.no_grad():
-            retrieved, pred_idx, weights = mchn(tensor, template_mask=current_mask, return_attention=True)
+            retrieved, _, sim_scores = mchn(tensor, template_mask=current_mask, return_similarity=True)
+            class_scores_binary = class_free_energy_scores(
+                sim_scores,
+                template_labels,
+                beta=mchn.beta,
+                num_classes=len(loader.idx_to_label),
+                template_mask=current_mask,
+            )
+            _, _, sim_scores_centered = mchn_centered(tensor, template_mask=current_mask, return_similarity=True)
+            class_scores_centered = class_free_energy_scores(
+                sim_scores_centered,
+                template_labels,
+                beta=mchn_centered.beta,
+                num_classes=len(loader.idx_to_label),
+                template_mask=current_mask,
+            )
+            class_scores = torch.log_softmax(class_scores_binary, dim=-1) + torch.log_softmax(
+                class_scores_centered, dim=-1
+            )
 
-        class_scores = aggregate_attention_by_class(weights, template_labels, len(loader.idx_to_label))
         class_idx = int(torch.argmax(class_scores, dim=-1).item())
         char = loader.idx_to_label[class_idx]
         plate_text += char
+        best_template_idx = select_best_template_in_class(sim_scores, template_labels, class_idx)
 
-        attention_conf = class_scores[0, class_idx].item()
-        recon_sim = F.cosine_similarity(tensor, retrieved).item()
+        prob = torch.softmax(class_scores, dim=-1)[0, class_idx].item()
+        recon_sim = F.cosine_similarity(tensor, loader.memory_matrix[best_template_idx].to(device).view(1, -1)).item()
         char_type = "汉字" if "\u4e00" <= char <= "\u9fff" else ("数字" if char.isdigit() else "字母")
         rows.append(
             {
                 "位置": f"第{i + 1}位",
                 "类型": char_type,
                 "识别": char,
-                "注意力置信度": f"{attention_conf * 100:.2f}%",
-                "重构相似度": f"{recon_sim * 100:.2f}%",
+                "类别置信度": f"{prob * 100:.2f}%",
+                "模板相似度": f"{recon_sim * 100:.2f}%",
             }
         )
 
@@ -122,7 +171,7 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
             )
 
     df_out = gr.Dataframe(
-        headers=["位置", "类型", "识别", "注意力置信度", "重构相似度"],
+        headers=["位置", "类型", "识别", "类别置信度", "模板相似度"],
         label="逐字符识别分析",
     )
 
