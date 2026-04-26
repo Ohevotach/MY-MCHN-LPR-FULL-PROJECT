@@ -50,6 +50,14 @@ class SimpleCNN(nn.Module):
         return self.classifier(self.features(x))
 
 
+def build_hopfield_ensemble(memory, device):
+    return [
+        ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
+        ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
+        ModernHopfieldNetwork(memory, beta=55.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
+    ]
+
+
 def build_stratified_split(labels, train_ratio=0.7, seed=2026):
     rng = random.Random(seed)
     train_indices = []
@@ -91,12 +99,12 @@ def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, tem
     return torch.stack(scores, dim=-1)
 
 
-def ensemble_hopfield_scores(models, q, template_labels, num_classes):
+def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_mask=None):
     fused = None
     primary_sim = None
     for model in models:
-        _, _, sim_scores = model(q, return_similarity=True)
-        scores = class_free_energy_scores(sim_scores, template_labels, beta=model.beta, num_classes=num_classes)
+        _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
+        scores = class_free_energy_scores(sim_scores, template_labels, beta=model.beta, num_classes=num_classes, template_mask=template_mask)
         log_probs = torch.log_softmax(scores, dim=-1)
         fused = log_probs if fused is None else fused + log_probs
         if primary_sim is None:
@@ -270,10 +278,7 @@ def run_robustness_evaluation(
     prototypes, prototype_labels = build_class_memory_from_tensors(train_memory, train_labels)
     num_classes = len(loader.idx_to_label)
 
-    hopfield_models = [
-        ModernHopfieldNetwork(train_memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
-        ModernHopfieldNetwork(train_memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
-    ]
+    hopfield_models = build_hopfield_ensemble(train_memory, device)
 
     def make_methods():
         return {
@@ -384,7 +389,7 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
         return
 
     pipeline = LPRPipeline(use_synthetic_pollution=False)
-    mchn = ModernHopfieldNetwork(loader.memory_matrix.to(device), beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device)
+    mchn_models = build_hopfield_ensemble(loader.memory_matrix.to(device), device)
     template_labels = loader.labels.to(device)
     chinese_mask = torch.zeros(loader.memory_matrix.shape[0], dtype=torch.bool, device=device)
     alnum_mask = torch.zeros(loader.memory_matrix.shape[0], dtype=torch.bool, device=device)
@@ -410,8 +415,13 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
             position = len(result)
             template_mask = chinese_mask if position == 0 else letter_mask if position == 1 and bool(letter_mask.any().item()) else alnum_mask
             with torch.no_grad():
-                _, _, sim_scores = mchn(char_tensor, template_mask=template_mask, return_similarity=True)
-                scores = class_free_energy_scores(sim_scores, template_labels, mchn.beta, len(loader.idx_to_label), template_mask=template_mask)
+                scores, _ = ensemble_hopfield_scores(
+                    mchn_models,
+                    char_tensor,
+                    template_labels,
+                    len(loader.idx_to_label),
+                    template_mask=template_mask,
+                )
             result += loader.idx_to_label[int(torch.argmax(scores, dim=-1))]
         print(f"{img_name}: {result}")
 
@@ -466,10 +476,7 @@ if __name__ == "__main__":
 
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    demo_models = [
-        ModernHopfieldNetwork(train_memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
-        ModernHopfieldNetwork(train_memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
-    ]
+    demo_models = build_hopfield_ensemble(train_memory, device)
     run_reconstruction_demo(
         {"hopfield": demo_models, "train_memory": train_memory, "train_labels": train_labels},
         loader,

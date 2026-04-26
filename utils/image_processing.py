@@ -492,13 +492,71 @@ class LPRPipeline:
             img = ArtificialPolluter.add_synthetic_fog(img, severity=0.6)
             img = ArtificialPolluter.add_synthetic_dirt(img, num_spots=10)
 
-        plate_img = self._locate_from_ccpd_filename(img, source_path) if source_path else None
-        if plate_img is None:
-            plate_img = self.segmenter.locate_plate(img)
-        if plate_img is None:
-            plate_img = self.segmenter.locate_plate(self.enhancer.dehaze(img))
-        chars = self.segmenter.segment_characters(plate_img)
-        return plate_img, chars
+        candidates = []
+        filename_plate = self._locate_from_ccpd_filename(img, source_path) if source_path else None
+        if filename_plate is not None:
+            candidates.append(("ccpd_filename", filename_plate))
+
+        for variant_name, variant_img in self._preprocess_variants(img):
+            plate_img = self.segmenter.locate_plate(variant_img)
+            if plate_img is not None:
+                candidates.append((variant_name, plate_img))
+
+        return self._select_best_plate_result(candidates)
+
+    def _preprocess_variants(self, img):
+        variants = [("original", img)]
+        try:
+            variants.append(("dehazed", self.enhancer.dehaze(img)))
+        except Exception:
+            pass
+
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        contrast = cv2.merge([clahe.apply(l_channel), a_channel, b_channel])
+        variants.append(("clahe", cv2.cvtColor(contrast, cv2.COLOR_LAB2BGR)))
+
+        denoised = cv2.bilateralFilter(img, d=5, sigmaColor=45, sigmaSpace=45)
+        variants.append(("bilateral", denoised))
+        return variants
+
+    def _select_best_plate_result(self, candidates):
+        if not candidates:
+            return None, []
+
+        best_score = -1.0
+        best_plate = None
+        best_chars = []
+        for _, plate_img in candidates:
+            chars = self.segmenter.segment_characters(plate_img)
+            score = self._plate_result_score(plate_img, chars)
+            if score > best_score:
+                best_score = score
+                best_plate = plate_img
+                best_chars = chars
+        return best_plate, best_chars
+
+    @staticmethod
+    def _plate_result_score(plate_img, chars):
+        try:
+            quality = PlateSegmenter._plate_quality_score(plate_img)
+        except Exception:
+            quality = 0.0
+
+        char_count = len(chars)
+        count_score = 1.0 - min(abs(char_count - 7) / 7.0, 1.0)
+        if char_count == 7:
+            count_score += 0.35
+
+        ink_scores = []
+        for char_img in chars[:7]:
+            if char_img is None or char_img.size == 0:
+                continue
+            ink_ratio = float(np.mean(char_img > 0))
+            ink_scores.append(1.0 - min(abs(ink_ratio - 0.22) / 0.35, 1.0))
+        ink_score = float(np.mean(ink_scores)) if ink_scores else 0.0
+        return 0.45 * quality + 0.40 * count_score + 0.15 * ink_score
 
     @staticmethod
     def _locate_from_ccpd_filename(img, path):

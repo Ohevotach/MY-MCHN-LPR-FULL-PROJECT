@@ -90,6 +90,14 @@ def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, tem
     return torch.stack(scores, dim=-1)
 
 
+def build_hopfield_ensemble(memory, device):
+    return [
+        ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
+        ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
+        ModernHopfieldNetwork(memory, beta=55.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
+    ]
+
+
 def select_best_template_in_class(sim_scores, template_labels, class_idx):
     labels = template_labels.to(sim_scores.device)
     mask = labels == int(class_idx)
@@ -207,10 +215,7 @@ if loader.memory_matrix.shape[0] == 0:
     raise RuntimeError("Template memory is empty. Please check ./data/chars2 and ./data/charsChinese.")
 
 memory = loader.memory_matrix.to(device)
-mchn_models = [
-    ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
-    ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
-]
+mchn_models = build_hopfield_ensemble(memory, device)
 pipeline = LPRPipeline()
 template_labels = loader.labels.to(device)
 chinese_mask, alnum_mask, letter_mask, digit_mask = build_template_masks(loader, memory.shape[0], device)

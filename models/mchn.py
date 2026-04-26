@@ -10,7 +10,15 @@ class ModernHopfieldNetwork(nn.Module):
         z = softmax(beta * q @ M.T) @ M
     """
 
-    def __init__(self, memory_matrix, beta=40.0, metric="dot", normalize=True, feature_mode="binary"):
+    def __init__(
+        self,
+        memory_matrix,
+        beta=40.0,
+        metric="dot",
+        normalize=True,
+        feature_mode="binary",
+        image_shape=(64, 32),
+    ):
         super().__init__()
         if memory_matrix.dim() != 2:
             raise ValueError("memory_matrix must have shape [num_templates, feature_dim].")
@@ -19,6 +27,7 @@ class ModernHopfieldNetwork(nn.Module):
         self.metric = metric
         self.normalize = normalize
         self.feature_mode = feature_mode
+        self.image_shape = tuple(image_shape)
         self.num_templates = memory_matrix.shape[0]
 
     def _feature_transform(self, x):
@@ -39,7 +48,60 @@ class ModernHopfieldNetwork(nn.Module):
             std = x.std(dim=-1, keepdim=True).clamp_min(1e-6)
             binary = (x > mean + 0.15 * std).float()
             return binary - binary.mean(dim=-1, keepdim=True)
+        if self.feature_mode in {"shape", "hybrid", "hybrid_shape"}:
+            return self._shape_feature_transform(x)
         raise ValueError(f"Unsupported feature_mode: {self.feature_mode}")
+
+    def _shape_feature_transform(self, x):
+        """Build pollution-tolerant features from a 64x32 character image.
+
+        The original pixel vector is brittle under dirt, missing strokes and
+        small affine changes. This representation keeps coarse appearance while
+        adding row/column stroke projections and Sobel edge summaries.
+        """
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        img_h, img_w = self.image_shape
+        expected_dim = img_h * img_w
+        if x.shape[-1] != expected_dim:
+            return x
+
+        img = x.view(-1, 1, img_h, img_w).float()
+        mean = img.flatten(1).mean(dim=-1, keepdim=True).view(-1, 1, 1, 1)
+        std = img.flatten(1).std(dim=-1, keepdim=True).clamp_min(1e-6).view(-1, 1, 1, 1)
+        binary = (img > mean + 0.15 * std).float()
+        centered = (img - mean) / std
+
+        pooled_binary = F.avg_pool2d(binary, kernel_size=(4, 4), stride=(4, 4)).flatten(1)
+        pooled_centered = F.avg_pool2d(centered, kernel_size=(4, 4), stride=(4, 4)).flatten(1)
+        row_projection = binary.mean(dim=3).flatten(1)
+        col_projection = binary.mean(dim=2).flatten(1)
+
+        sobel_x = binary.new_tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).view(1, 1, 3, 3)
+        sobel_y = binary.new_tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).view(1, 1, 3, 3)
+        grad_x = F.conv2d(binary, sobel_x, padding=1).abs()
+        grad_y = F.conv2d(binary, sobel_y, padding=1).abs()
+        edge_features = torch.cat(
+            [
+                F.avg_pool2d(grad_x, kernel_size=(8, 4), stride=(8, 4)).flatten(1),
+                F.avg_pool2d(grad_y, kernel_size=(8, 4), stride=(8, 4)).flatten(1),
+            ],
+            dim=-1,
+        )
+
+        ink = binary.flatten(1).mean(dim=-1, keepdim=True)
+        return torch.cat(
+            [
+                pooled_binary,
+                0.5 * pooled_centered,
+                row_projection,
+                col_projection,
+                0.35 * edge_features,
+                ink,
+            ],
+            dim=-1,
+        )
 
     def _memory_for_similarity(self):
         memory = self._feature_transform(self.M)
