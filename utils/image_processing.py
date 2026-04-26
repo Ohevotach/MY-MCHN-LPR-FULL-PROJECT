@@ -216,7 +216,8 @@ class PlateSegmenter:
         candidates.sort(key=lambda item: item[0], reverse=True)
         _, rect, bbox, warped = candidates[0]
         if warped is not None:
-            return warped
+            refined = self._refine_plate_region(warped)
+            return refined if refined is not None else warped
 
         x, y, w, h = bbox
         pad_x, pad_y = int(0.08 * w), int(0.22 * h)
@@ -225,7 +226,9 @@ class PlateSegmenter:
         crop = img[y1:y2, x1:x2]
         if crop.size == 0:
             return None
-        return cv2.resize(crop, (self.PLATE_W, self.PLATE_H))
+        resized = cv2.resize(crop, (self.PLATE_W, self.PLATE_H))
+        refined = self._refine_plate_region(resized)
+        return refined if refined is not None else resized
 
     def _candidate_plate_images(self, img, rect, bbox):
         candidates = []
@@ -278,6 +281,52 @@ class PlateSegmenter:
         green = cv2.inRange(hsv, np.array([32, 30, 35]), np.array([95, 255, 255]))
         color_mask = cv2.bitwise_or(blue, green)
         return float(np.mean(color_mask[14:106, 16:384] > 0))
+
+    @classmethod
+    def _refine_plate_region(cls, plate_img):
+        if plate_img is None or plate_img.size == 0:
+            return None
+        plate_img = cv2.resize(plate_img, (cls.PLATE_W, cls.PLATE_H))
+        hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([90, 30, 25]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 28, 25]), np.array([95, 255, 255]))
+        mask = cv2.bitwise_or(blue, green)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (21, 7)))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)))
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        best = None
+        best_score = -1.0
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w < 150 or h < 28:
+                continue
+            aspect = w / max(1, h)
+            if not (2.2 <= aspect <= 6.2):
+                continue
+            area_ratio = cv2.contourArea(cnt) / max(1.0, cls.PLATE_W * cls.PLATE_H)
+            fill = cv2.contourArea(cnt) / max(1.0, w * h)
+            score = area_ratio * 2.0 + fill + (1.0 - min(abs(aspect - 3.4) / 3.4, 1.0))
+            if score > best_score:
+                best_score = score
+                best = (x, y, w, h)
+        if best is None:
+            return None
+
+        x, y, w, h = best
+        pad_x = int(0.03 * w)
+        pad_y = int(0.10 * h)
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(cls.PLATE_W, x + w + pad_x)
+        y2 = min(cls.PLATE_H, y + h + pad_y)
+        crop = plate_img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        return cv2.resize(crop, (cls.PLATE_W, cls.PLATE_H))
 
     @staticmethod
     def _plate_quality_score(plate_img):
@@ -477,8 +526,10 @@ class PlateSegmenter:
             green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
             plate_color = cv2.bitwise_or(blue, green)
             if np.mean(plate_color > 0) > 0.15:
-                white = cv2.inRange(hsv, np.array([0, 0, 80]), np.array([180, 160, 255]))
-                binary = cv2.bitwise_and(white, cv2.dilate(plate_color, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))))
+                white = cv2.inRange(hsv, np.array([0, 0, 75]), np.array([180, 170, 255]))
+                adaptive = cv2.adaptiveThreshold(slot_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, -4)
+                binary = cv2.bitwise_or(white, adaptive)
+                binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
                 if np.count_nonzero(binary) >= 8:
                     return binary
 
@@ -873,7 +924,9 @@ class LPRPipeline:
         crop = img[y1:y2, x1:x2]
         if crop.size == 0:
             return None
-        return cv2.resize(crop, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+        resized = cv2.resize(crop, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+        refined = PlateSegmenter._refine_plate_region(resized)
+        return refined if refined is not None else resized
 
     def _preprocess_variants(self, img):
         variants = [("original", img)]
@@ -900,8 +953,16 @@ class LPRPipeline:
         best_plate = None
         best_chars = []
         for _, plate_img in candidates:
+            refined = PlateSegmenter._refine_plate_region(plate_img)
+            if refined is not None:
+                plate_img = refined
+            color_ratio = PlateSegmenter._plate_color_ratio(plate_img)
+            if color_ratio < 0.18:
+                continue
             chars = self._detect_or_segment_chars(plate_img)
             score = self._plate_result_score(plate_img, chars)
+            if score < 0.18:
+                continue
             if score > best_score:
                 best_score = score
                 best_plate = plate_img
