@@ -1,4 +1,5 @@
 import argparse
+import re
 import random
 import shutil
 from pathlib import Path
@@ -11,17 +12,11 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 def parse_ccpd_box(path):
     stem = Path(path).stem
-    parts = stem.split("-")
-    if len(parts) < 4:
-        return None
-    points = []
-    try:
-        for token in parts[3].split("_"):
-            x_str, y_str = token.split("&")
-            points.append((float(x_str), float(y_str)))
-    except Exception:
-        return None
-    if len(points) != 4:
+    points = [
+        (float(x), float(y))
+        for x, y in re.findall(r"(\d+(?:\.\d+)?)[&xX](\d+(?:\.\d+)?)", stem)
+    ]
+    if len(points) < 2:
         return None
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
@@ -48,7 +43,7 @@ def collect_images(src):
 
 def main():
     parser = argparse.ArgumentParser(description="Convert CCPD-style filenames to YOLO plate detection labels.")
-    parser.add_argument("--src", required=True, help="Source image directory. You can pass ./data/full_cars.")
+    parser.add_argument("--src", required=True, help="Source image directory, e.g. ./data/full_cars/ccpd_base.")
     parser.add_argument("--out", default="./dataset/yolo_plate")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=2026)
@@ -64,15 +59,14 @@ def main():
     print(f"Found image files: {len(all_images)}")
     print(f"Found CCPD-labeled files: {len(files)}")
     if all_images and not files:
-        print("No CCPD corner labels were parsed from filenames.")
+        print("No plate coordinate pairs were parsed from filenames.")
         print("Example filenames:")
         for sample in all_images[:5]:
             print(f"  - {sample.name}")
-        print("Expected filename contains a field like: x1&y1_x2&y2_x3&y3_x4&y4")
+        print("Expected coordinate pairs like: 293&441_482&543 or 293x441_482x543")
     if not files and not args.allow_empty:
         raise SystemExit(
-            "No labeled images to convert. Use --src ./data/full_cars if you pointed at an empty subset, "
-            "or label your images in YOLO format manually if filenames do not contain CCPD corner points."
+            "No labeled images to convert. Check --src and make sure filenames contain coordinate pairs."
         )
 
     random.Random(args.seed).shuffle(files)
