@@ -19,11 +19,13 @@ class cx cy w h
 0 0.512 0.733 0.312 0.098
 ```
 
-If your full-car images use CCPD-style filenames with four plate corner points, convert them with:
+If your full-car images use CCPD-style filenames with four plate corner points, convert them with the whole `full_cars` folder:
 
 ```powershell
-python scripts\ccpd_to_yolo_plate.py --src .\data\full_cars\ccpd_base --out .\dataset\yolo_plate
+python scripts\ccpd_to_yolo_plate.py --src .\data\full_cars --out .\dataset\yolo_plate
 ```
+
+If it says `Found CCPD-labeled files: 0`, your folder is empty or the filenames do not contain CCPD corner labels. In that case you need manually labeled YOLO files under `dataset/yolo_plate/images/...` and `dataset/yolo_plate/labels/...`.
 
 Then train:
 

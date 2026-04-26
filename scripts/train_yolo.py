@@ -1,5 +1,8 @@
 import argparse
 import os
+from pathlib import Path
+
+import yaml
 
 
 def parse_args():
@@ -27,6 +30,7 @@ def main():
         raise FileNotFoundError(f"Model checkpoint not found: {args.model}")
     if not os.path.exists(args.data):
         raise FileNotFoundError(f"Dataset yaml not found: {args.data}")
+    check_yolo_dataset(args.data)
 
     model = YOLO(args.model)
     train_kwargs = {
@@ -41,6 +45,35 @@ def main():
     if args.device is not None:
         train_kwargs["device"] = args.device
     model.train(**train_kwargs)
+
+
+def check_yolo_dataset(yaml_path):
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    root = Path(data.get("path", "."))
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    train_dir = root / data.get("train", "")
+    val_dir = root / data.get("val", "")
+    train_images = list_images(train_dir)
+    val_images = list_images(val_dir)
+    print(f"Dataset root: {root}")
+    print(f"Train images: {len(train_images)} ({train_dir})")
+    print(f"Val images: {len(val_images)} ({val_dir})")
+    if not train_images:
+        raise SystemExit(
+            "YOLO train set is empty. Run ccpd_to_yolo_plate.py with --src ./data/full_cars, "
+            "or check configs/plate_detection.yaml path."
+        )
+    if not val_images:
+        raise SystemExit("YOLO val set is empty. Add validation images or lower --val-ratio conversion settings.")
+
+
+def list_images(path):
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    if not path.exists():
+        return []
+    return [p for p in path.rglob("*") if p.suffix.lower() in exts]
 
 
 if __name__ == "__main__":

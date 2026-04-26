@@ -1,5 +1,4 @@
 import argparse
-import os
 import random
 import shutil
 from pathlib import Path
@@ -41,19 +40,43 @@ def write_yolo_label(label_path, box, width, height):
         f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
 
 
+def collect_images(src):
+    if not src.exists():
+        raise FileNotFoundError(f"Source directory not found: {src}")
+    return [p for p in src.rglob("*") if p.suffix.lower() in IMG_EXTS]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert CCPD-style filenames to YOLO plate detection labels.")
-    parser.add_argument("--src", required=True, help="Source image directory. Filenames must contain CCPD corner points.")
+    parser.add_argument("--src", required=True, help="Source image directory. You can pass ./data/full_cars.")
     parser.add_argument("--out", default="./dataset/yolo_plate")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--allow-empty", action="store_true", help="Create folders even if no CCPD labels are found.")
     args = parser.parse_args()
 
     src = Path(args.src)
     out = Path(args.out)
-    files = [p for p in src.rglob("*") if p.suffix.lower() in IMG_EXTS and parse_ccpd_box(p) is not None]
+    all_images = collect_images(src)
+    files = [p for p in all_images if parse_ccpd_box(p) is not None]
+
+    print(f"Source: {src}")
+    print(f"Found image files: {len(all_images)}")
+    print(f"Found CCPD-labeled files: {len(files)}")
+    if all_images and not files:
+        print("No CCPD corner labels were parsed from filenames.")
+        print("Example filenames:")
+        for sample in all_images[:5]:
+            print(f"  - {sample.name}")
+        print("Expected filename contains a field like: x1&y1_x2&y2_x3&y3_x4&y4")
+    if not files and not args.allow_empty:
+        raise SystemExit(
+            "No labeled images to convert. Use --src ./data/full_cars if you pointed at an empty subset, "
+            "or label your images in YOLO format manually if filenames do not contain CCPD corner points."
+        )
+
     random.Random(args.seed).shuffle(files)
-    val_count = int(round(len(files) * args.val_ratio))
+    val_count = max(1, int(round(len(files) * args.val_ratio))) if len(files) > 1 else 0
     splits = {"val": files[:val_count], "train": files[val_count:]}
 
     for split, split_files in splits.items():
@@ -71,6 +94,7 @@ def main():
             write_yolo_label(label_dir / f"{src_path.stem}.txt", parse_ccpd_box(src_path), w, h)
 
     print(f"Converted {len(files)} images to {out}")
+    print(f"Train images: {len(splits['train'])}, val images: {len(splits['val'])}")
 
 
 if __name__ == "__main__":

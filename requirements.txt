@@ -7,3 +7,4 @@ matplotlib
 tqdm
 gradio
 ultralytics
+PyYAML
