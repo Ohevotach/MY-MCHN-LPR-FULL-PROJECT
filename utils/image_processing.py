@@ -1,3 +1,5 @@
+import os
+
 import cv2
 import numpy as np
 import random
@@ -217,8 +219,10 @@ class LPRPipeline:
     def process_image(self, img_path):
         if isinstance(img_path, str):
             img = cv2.imread(img_path)
+            source_path = img_path
         else:
             img = img_path
+            source_path = None
         if img is None:
             return None, []
 
@@ -226,8 +230,41 @@ class LPRPipeline:
             img = ArtificialPolluter.add_synthetic_fog(img, severity=0.6)
             img = ArtificialPolluter.add_synthetic_dirt(img, num_spots=10)
 
-        plate_img = self.segmenter.locate_plate(img)
+        plate_img = self._locate_from_ccpd_filename(img, source_path) if source_path else None
+        if plate_img is None:
+            plate_img = self.segmenter.locate_plate(img)
         if plate_img is None:
             plate_img = self.segmenter.locate_plate(self.enhancer.dehaze(img))
         chars = self.segmenter.segment_characters(plate_img)
         return plate_img, chars
+
+    @staticmethod
+    def _locate_from_ccpd_filename(img, path):
+        if not path:
+            return None
+        stem = os.path.splitext(os.path.basename(path))[0]
+        parts = stem.split("-")
+        if len(parts) < 4:
+            return None
+        try:
+            point_tokens = parts[3].split("_")
+            points = []
+            for token in point_tokens:
+                x_str, y_str = token.split("&")
+                points.append([float(x_str), float(y_str)])
+            if len(points) != 4:
+                return None
+        except Exception:
+            return None
+
+        pts = np.array(points, dtype="float32")
+        ordered = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        ordered[0] = pts[np.argmin(s)]
+        ordered[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        ordered[1] = pts[np.argmin(diff)]
+        ordered[3] = pts[np.argmax(diff)]
+        dst = np.array([[0, 0], [399, 0], [399, 119], [0, 119]], dtype="float32")
+        matrix = cv2.getPerspectiveTransform(ordered, dst)
+        return cv2.warpPerspective(img, matrix, (400, 120))

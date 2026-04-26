@@ -337,3 +337,87 @@ def build_class_memory(template_loader, reduce="mean"):
         class_labels.append(label)
 
     return torch.stack(class_vectors), torch.tensor(class_labels, dtype=torch.long)
+
+
+class CharPolluter:
+    def __init__(self, img_h=64, img_w=32, seed=None):
+        self.img_h = img_h
+        self.img_w = img_w
+        self.rng = random.Random(seed)
+
+    def pollute(self, img, pollution_type="none", severity=0.5):
+        severity = max(0.0, min(1.0, float(severity)))
+        if img.dim() == 2:
+            img = img.unsqueeze(0)
+        if pollution_type == "mixed":
+            choices = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
+            count = 1 if severity < 0.35 else 2 if severity < 0.7 else 3
+            out = img.clone()
+            for name in self.rng.sample(choices, count):
+                out = self._apply_one(out, name, severity)
+            return out.clamp(0.0, 1.0)
+        return self._apply_one(img.clone(), pollution_type, severity).clamp(0.0, 1.0)
+
+    def _apply_one(self, img, pollution, severity):
+        if pollution == "none":
+            return img
+        if pollution == "mask":
+            return self._random_mask(img, severity)
+        if pollution == "noise":
+            sigma = 0.03 + 0.30 * severity
+            return img + torch.randn_like(img) * sigma
+        if pollution == "salt_pepper":
+            prob = 0.01 + 0.22 * severity
+            rnd = torch.rand_like(img)
+            out = img.clone()
+            out[rnd < prob / 2] = 0.0
+            out[(rnd >= prob / 2) & (rnd < prob)] = 1.0
+            return out
+        if pollution == "blur":
+            kernel = int(3 + 6 * severity)
+            kernel = kernel + 1 if kernel % 2 == 0 else kernel
+            return TF.gaussian_blur(img, kernel_size=[kernel, kernel])
+        if pollution == "fog":
+            fog = 0.15 + 0.45 * severity
+            return img * (1.0 - fog) + fog
+        if pollution == "dirt":
+            return self._random_dirt(img, severity)
+        if pollution == "affine":
+            angle = self.rng.uniform(-10, 10) * severity
+            translate = [
+                int(self.rng.uniform(-3, 3) * severity),
+                int(self.rng.uniform(-3, 3) * severity),
+            ]
+            scale = 1.0 + self.rng.uniform(-0.12, 0.12) * severity
+            shear = self.rng.uniform(-6, 6) * severity
+            return TF.affine(img, angle=angle, translate=translate, scale=scale, shear=[shear, 0.0])
+        raise ValueError(f"Unsupported pollution_type: {pollution}")
+
+    def _random_mask(self, img, severity):
+        out = img.clone()
+        block_count = 1 + int(3 * severity)
+        for _ in range(block_count):
+            max_h = max(2, int(self.img_h * (0.10 + 0.28 * severity)))
+            max_w = max(2, int(self.img_w * (0.10 + 0.35 * severity)))
+            h = self.rng.randint(2, max_h)
+            w = self.rng.randint(2, max_w)
+            y = self.rng.randint(0, max(0, self.img_h - h))
+            x = self.rng.randint(0, max(0, self.img_w - w))
+            out[:, y : y + h, x : x + w] = 0.0 if self.rng.random() < 0.7 else 1.0
+        return out
+
+    def _random_dirt(self, img, severity):
+        out = img.clone()
+        yy, xx = torch.meshgrid(
+            torch.arange(self.img_h, dtype=torch.float32),
+            torch.arange(self.img_w, dtype=torch.float32),
+            indexing="ij",
+        )
+        spot_count = 1 + int(4 * severity)
+        for _ in range(spot_count):
+            cx = self.rng.uniform(0, self.img_w - 1)
+            cy = self.rng.uniform(0, self.img_h - 1)
+            radius = self.rng.uniform(2, 4 + 10 * severity)
+            mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius**2
+            out[:, mask] = self.rng.uniform(0.0, 0.35)
+        return out
