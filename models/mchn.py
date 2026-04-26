@@ -1,66 +1,75 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class ModernHopfieldNetwork(nn.Module):
+    """Continuous modern Hopfield retrieval layer.
+
+    For the default dot metric, the update is equivalent to scaled attention:
+        z = softmax(beta * q @ M.T) @ M
     """
-    现代连续 Hopfield 网络 (MCHN) 核心实现。
-    """
-    def __init__(self, memory_matrix, beta=100.0, metric='manhattan'):
-        super(ModernHopfieldNetwork, self).__init__()
-        self.register_buffer('M', memory_matrix)
-        self.beta = beta
+
+    def __init__(self, memory_matrix, beta=25.0, metric="dot", normalize=True):
+        super().__init__()
+        if memory_matrix.dim() != 2:
+            raise ValueError("memory_matrix must have shape [num_templates, feature_dim].")
+        self.register_buffer("M", memory_matrix.float())
+        self.beta = float(beta)
         self.metric = metric
+        self.normalize = normalize
         self.num_templates = memory_matrix.shape[0]
 
-    def _compute_similarity(self, q):
-        if self.metric == 'manhattan':
-            distances = torch.cdist(q, self.M, p=1.0)
-            sim_scores = -distances
-        elif self.metric == 'euclidean':
-            distances = torch.cdist(q, self.M, p=2.0)
-            sim_scores = -distances
-        elif self.metric == 'dot':
-            sim_scores = torch.matmul(q, self.M.t())
-        else:
-            raise ValueError(f"不支持的距离度量: {self.metric}")
-        return sim_scores
+    def _memory_for_similarity(self):
+        if self.normalize and self.metric == "dot":
+            return F.normalize(self.M, p=2, dim=-1)
+        return self.M
 
-    def _separation(self, sim_scores):
-        attention_weights = F.softmax(self.beta * sim_scores, dim=-1)
-        return attention_weights
+    def _query_for_similarity(self, q):
+        q = q.float()
+        if self.normalize and self.metric == "dot":
+            return F.normalize(q, p=2, dim=-1)
+        return q
 
-    def forward(self, q, template_mask=None):
-        """
-        Args:
-            q: 查询向量
-            template_mask (torch.BoolTensor, optional): 先验注意力掩码，True为有效，False为屏蔽。
-        """
-        # 1. 计算所有模板的相似度
-        sim_scores = self._compute_similarity(q)
-        
-        # 🌟 核心修复：施加位置掩码，把不允许搜索的模板相似度强行拉到 -1e9
+    def compute_similarity(self, q):
+        q_sim = self._query_for_similarity(q)
+        m_sim = self._memory_for_similarity()
+
+        if self.metric == "dot":
+            return torch.matmul(q_sim, m_sim.t())
+        if self.metric == "manhattan":
+            return -torch.cdist(q_sim, m_sim, p=1.0)
+        if self.metric == "euclidean":
+            return -torch.cdist(q_sim, m_sim, p=2.0)
+        raise ValueError(f"Unsupported metric: {self.metric}")
+
+    def forward(self, q, template_mask=None, return_attention=False):
+        if q.dim() == 1:
+            q = q.unsqueeze(0)
+
+        sim_scores = self.compute_similarity(q)
         if template_mask is not None:
-            sim_scores = sim_scores.masked_fill(~template_mask, -1e9)
-            
-        # 2. 通过 Softmax 分离注意力
-        attention_weights = self._separation(sim_scores)
-        
-        # 3. 投影重构
-        z = torch.matmul(attention_weights, self.M)
-        
-        # 4. 获取预测结果
+            mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            sim_scores = sim_scores.masked_fill(~mask, -1e9)
+
+        attention_weights = F.softmax(self.beta * sim_scores, dim=-1)
+        retrieved = torch.matmul(attention_weights, self.M)
         predicted_indices = torch.argmax(attention_weights, dim=-1)
-        
-        return z, predicted_indices
+
+        if return_attention:
+            return retrieved, predicted_indices, attention_weights
+        return retrieved, predicted_indices
+
 
 if __name__ == "__main__":
-    print("🚀 开始测试现代 Hopfield 网络 (MCHN) 核心模块...")
-    num_classes, feature_dim, batch_size = 34, 2048, 128
-    dummy_memory = torch.rand((num_classes, feature_dim))
-    mchn = ModernHopfieldNetwork(memory_matrix=dummy_memory, beta=100.0, metric='manhattan')
-    dummy_q = torch.rand((batch_size, feature_dim))
+    num_templates, feature_dim, batch_size = 34, 2048, 8
+    memory = torch.rand((num_templates, feature_dim))
+    model = ModernHopfieldNetwork(memory_matrix=memory, beta=25.0, metric="dot")
+    query = torch.rand((batch_size, feature_dim))
     with torch.no_grad():
-        reconstructed_z, preds = mchn(dummy_q)
-    print("✨ MCHN 前向传播测试完美通过！")
+        reconstructed, preds, weights = model(query, return_attention=True)
+    print("reconstructed:", tuple(reconstructed.shape))
+    print("preds:", tuple(preds.shape))
+    print("weights:", tuple(weights.shape))

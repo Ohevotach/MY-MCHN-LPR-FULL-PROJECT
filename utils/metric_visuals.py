@@ -1,7 +1,10 @@
-import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import os
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 
 class MetricVisualizer:
@@ -36,7 +39,6 @@ class MetricVisualizer:
 
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
-        plt.show() # 🌟 新增：在 Kaggle 单元格直接显示
         plt.close()
 
     def plot_robustness_curve(self, severities, accuracies, baseline_acc=None, pollution_type="Masking", filename="robustness_curve.png"):
@@ -49,5 +51,4 @@ class MetricVisualizer:
         plt.xlabel("Severity Ratio"), plt.ylabel("Accuracy (%)")
         plt.legend(), plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
-        plt.show() # 🌟 新增：在 Kaggle 单元格直接显示
         plt.close()
