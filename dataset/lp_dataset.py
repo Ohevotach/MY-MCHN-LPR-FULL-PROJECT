@@ -2,10 +2,47 @@ import os
 import random
 
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import Dataset
+
+
+def normalize_char_tensor(tensor_img, img_size=(32, 64)):
+    """Normalize a character image to white foreground on black background."""
+    if tensor_img.dim() == 2:
+        tensor_img = tensor_img.unsqueeze(0)
+    img_h, img_w = img_size[1], img_size[0]
+    x = tensor_img.float().clamp(0.0, 1.0)
+    if tuple(x.shape[-2:]) != (img_h, img_w):
+        x = F.interpolate(x.unsqueeze(0), size=(img_h, img_w), mode="nearest").squeeze(0)
+
+    threshold = x.mean() + 0.10 * x.std().clamp_min(1e-6)
+    binary = (x > threshold).float()
+    border = torch.cat([binary[:, 0, :].flatten(), binary[:, -1, :].flatten(), binary[:, :, 0].flatten(), binary[:, :, -1].flatten()])
+    if border.mean() > 0.45:
+        binary = 1.0 - binary
+
+    ys, xs = torch.where(binary[0] > 0)
+    if ys.numel() == 0 or xs.numel() == 0:
+        return binary
+
+    y1 = max(0, int(ys.min().item()) - 1)
+    y2 = min(img_h, int(ys.max().item()) + 2)
+    x1 = max(0, int(xs.min().item()) - 1)
+    x2 = min(img_w, int(xs.max().item()) + 2)
+    crop = binary[:, y1:y2, x1:x2]
+    h, w = crop.shape[-2:]
+    scale = min(56.0 / max(1, h), 26.0 / max(1, w))
+    new_h = max(1, min(62, int(round(h * scale))))
+    new_w = max(1, min(30, int(round(w * scale))))
+    resized = F.interpolate(crop.unsqueeze(0), size=(new_h, new_w), mode="nearest").squeeze(0)
+    canvas = torch.zeros((1, img_h, img_w), dtype=resized.dtype)
+    y = (img_h - new_h) // 2
+    x0 = (img_w - new_w) // 2
+    canvas[:, y : y + new_h, x0 : x0 + new_w] = resized
+    return canvas
 
 
 class TemplateLoader:
@@ -76,7 +113,7 @@ class TemplateLoader:
             self._save_cache()
 
     def _build_cache_signature(self):
-        signature = {"img_size": tuple(self.img_size), "label_map_version": 4, "roots": []}
+        signature = {"img_size": tuple(self.img_size), "label_map_version": 5, "roots": []}
         for root_dir in self.data_roots:
             root_info = {"root": os.path.abspath(root_dir), "file_count": 0, "latest_mtime": 0.0}
             if os.path.exists(root_dir):
@@ -161,7 +198,7 @@ class TemplateLoader:
                     img_path = os.path.join(class_path, file_name)
                     try:
                         with Image.open(img_path) as img:
-                            tensor_img = self.transform(img)
+                            tensor_img = normalize_char_tensor(self.transform(img), self.img_size)
                     except Exception as exc:
                         print(f"Warning: failed to load {img_path}: {exc}")
                         continue

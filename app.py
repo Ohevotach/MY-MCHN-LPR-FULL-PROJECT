@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from PIL import Image
 import torchvision.transforms as transforms
 
-from dataset.lp_dataset import CharPolluter, TemplateLoader
+from dataset.lp_dataset import CharPolluter, TemplateLoader, normalize_char_tensor
 from models.mchn import ModernHopfieldNetwork
 from utils.image_processing import LPRPipeline
 
@@ -239,7 +239,14 @@ pil_transform = transforms.Compose(
 
 
 def recognize_tensor(tensor, template_mask=None):
-    base_q = tensor.view(1, -1).to(device) if tensor.dim() != 2 else tensor.to(device)
+    if tensor.dim() == 2 and tensor.shape[-1] == 64 * 32:
+        tensor_img = tensor.view(-1, 1, 64, 32)[0]
+    elif tensor.dim() == 3:
+        tensor_img = tensor
+    else:
+        tensor_img = tensor.view(1, 64, 32)
+    normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
+    base_q = normalized.view(1, -1).to(device)
     with torch.no_grad():
         base_scores, base_sim, base_retrieved = ensemble_scores(
             mchn_models, base_q, template_labels, len(loader.idx_to_label), template_mask=template_mask
@@ -251,9 +258,10 @@ def recognize_tensor(tensor, template_mask=None):
             best_template_idx = select_best_template_in_class(base_sim, template_labels, class_idx)
             template_sim = F.cosine_similarity(base_q, memory[best_template_idx].view(1, -1)).item()
             recon_sim = F.cosine_similarity(base_q, base_retrieved[0:1]).item()
-            return class_idx, best_template_idx, float(base_conf.item()), template_sim, recon_sim
+            top_text = format_top_predictions(base_scores[0])
+            return class_idx, best_template_idx, float(base_conf.item()), template_sim, recon_sim, top_text
 
-        q = affine_char_variants(tensor).to(device)
+        q = affine_char_variants(normalized.view(1, -1)).to(device)
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
@@ -265,7 +273,17 @@ def recognize_tensor(tensor, template_mask=None):
     best_q = q[variant_idx : variant_idx + 1]
     template_sim = F.cosine_similarity(best_q, memory[best_template_idx].view(1, -1)).item()
     recon_sim = F.cosine_similarity(best_q, retrieved[variant_idx : variant_idx + 1]).item()
-    return class_idx, best_template_idx, prob, template_sim, recon_sim
+    top_text = format_top_predictions(pooled_scores)
+    return class_idx, best_template_idx, prob, template_sim, recon_sim, top_text
+
+
+def format_top_predictions(scores, k=3):
+    probs = torch.softmax(scores, dim=-1)
+    values, indices = torch.topk(probs, k=min(k, probs.numel()))
+    parts = []
+    for value, idx in zip(values.tolist(), indices.tolist()):
+        parts.append(f"{loader.idx_to_label[int(idx)]}:{value * 100:.1f}%")
+    return " | ".join(parts)
 
 
 def plate_position_mask(position):
@@ -292,10 +310,9 @@ def predict_plate(image):
     char_images_display = [cv2.cvtColor(c, cv2.COLOR_GRAY2RGB) for c in chars]
 
     for i, char_img in enumerate(chars):
-        tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32) / 255.0
-        tensor = tensor.view(1, -1)
+        tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
         current_mask = plate_position_mask(i)
-        class_idx, best_template_idx, prob, template_sim, recon_sim = recognize_tensor(tensor, current_mask)
+        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text = recognize_tensor(tensor, current_mask)
         char = loader.idx_to_label[class_idx]
         plate_text += char
         char_type = "\u6c49\u5b57" if "\u4e00" <= char <= "\u9fff" else ("\u6570\u5b57" if char.isdigit() else "\u5b57\u6bcd")
@@ -305,6 +322,7 @@ def predict_plate(image):
                 "\u7c7b\u578b": char_type,
                 "\u8bc6\u522b": char,
                 "\u7c7b\u522b\u7f6e\u4fe1\u5ea6": f"{prob * 100:.2f}%",
+                "\u5019\u9009Top3": top_text,
                 "\u6a21\u677f\u76f8\u4f3c\u5ea6": f"{template_sim * 100:.2f}%",
                 "\u91cd\u6784\u76f8\u4f3c\u5ea6": f"{recon_sim * 100:.2f}%",
             }
@@ -337,9 +355,9 @@ def predict_plate_from_sample(sample_rel_path):
     rows = []
     gallery = [cv2.cvtColor(c, cv2.COLOR_GRAY2RGB) for c in chars]
     for i, char_img in enumerate(chars):
-        tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32) / 255.0
+        tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
         current_mask = plate_position_mask(i)
-        class_idx, best_template_idx, prob, template_sim, recon_sim = recognize_tensor(tensor.view(1, -1), current_mask)
+        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text = recognize_tensor(tensor, current_mask)
         char = loader.idx_to_label[class_idx]
         plate_text += char
         char_type = "\u6c49\u5b57" if "\u4e00" <= char <= "\u9fff" else ("\u6570\u5b57" if char.isdigit() else "\u5b57\u6bcd")
@@ -349,6 +367,7 @@ def predict_plate_from_sample(sample_rel_path):
                 "\u7c7b\u578b": char_type,
                 "\u8bc6\u522b": char,
                 "\u7c7b\u522b\u7f6e\u4fe1\u5ea6": f"{prob * 100:.2f}%",
+                "\u5019\u9009Top3": top_text,
                 "\u6a21\u677f\u76f8\u4f3c\u5ea6": f"{template_sim * 100:.2f}%",
                 "\u91cd\u6784\u76f8\u4f3c\u5ea6": f"{recon_sim * 100:.2f}%",
             }
@@ -372,10 +391,10 @@ def run_single_char_test(class_label, sample_rel_path, pollution_type, severity,
         return None, None, None, "\u627e\u4e0d\u5230\u9009\u4e2d\u7684\u56fe\u7247\u3002", pd.DataFrame()
 
     with Image.open(img_path) as img:
-        clean_tensor = pil_transform(img)
+        clean_tensor = normalize_char_tensor(pil_transform(img), img_size=(32, 64))
     polluter = CharPolluter(img_h=64, img_w=32, seed=int(seed))
     polluted_tensor = polluter.pollute(clean_tensor, pollution_type=pollution_type, severity=float(severity))
-    class_idx, best_template_idx, prob, template_sim, recon_sim = recognize_tensor(polluted_tensor)
+    class_idx, best_template_idx, prob, template_sim, recon_sim, top_text = recognize_tensor(polluted_tensor)
     pred_label = loader.idx_to_label[class_idx]
     matched_tensor = memory[best_template_idx].detach().cpu().view(1, 64, 32)
 
@@ -387,6 +406,7 @@ def run_single_char_test(class_label, sample_rel_path, pollution_type, severity,
                 "\u6c61\u67d3\u7c7b\u578b": pollution_type,
                 "\u6c61\u67d3\u5f3a\u5ea6": f"{float(severity):.2f}",
                 "\u7c7b\u522b\u7f6e\u4fe1\u5ea6": f"{prob * 100:.2f}%",
+                "\u5019\u9009Top3": top_text,
                 "\u6a21\u677f\u76f8\u4f3c\u5ea6": f"{template_sim * 100:.2f}%",
                 "\u91cd\u6784\u76f8\u4f3c\u5ea6": f"{recon_sim * 100:.2f}%",
             }
@@ -415,7 +435,7 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
                 img_out = gr.Image(label=zh("plate_img"))
                 char_gallery = gr.Gallery(label=zh("char_gallery"), show_label=True, columns=7, height=120, object_fit="contain")
         df_out = gr.Dataframe(
-            headers=["\u4f4d\u7f6e", "\u7c7b\u578b", "\u8bc6\u522b", "\u7c7b\u522b\u7f6e\u4fe1\u5ea6", "\u6a21\u677f\u76f8\u4f3c\u5ea6", "\u91cd\u6784\u76f8\u4f3c\u5ea6"],
+            headers=["\u4f4d\u7f6e", "\u7c7b\u578b", "\u8bc6\u522b", "\u7c7b\u522b\u7f6e\u4fe1\u5ea6", "\u5019\u9009Top3", "\u6a21\u677f\u76f8\u4f3c\u5ea6", "\u91cd\u6784\u76f8\u4f3c\u5ea6"],
             label=zh("char_table"),
         )
         btn.click(predict_plate, img_in, [txt_out, img_out, df_out, char_gallery])
@@ -442,7 +462,7 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
                     polluted_img = gr.Image(label=zh("polluted"))
                     matched_img = gr.Image(label=zh("matched"))
                 char_df = gr.Dataframe(
-                    headers=["\u771f\u5b9e\u7c7b\u522b", "\u9884\u6d4b\u7c7b\u522b", "\u6c61\u67d3\u7c7b\u578b", "\u6c61\u67d3\u5f3a\u5ea6", "\u7c7b\u522b\u7f6e\u4fe1\u5ea6", "\u6a21\u677f\u76f8\u4f3c\u5ea6", "\u91cd\u6784\u76f8\u4f3c\u5ea6"]
+                    headers=["\u771f\u5b9e\u7c7b\u522b", "\u9884\u6d4b\u7c7b\u522b", "\u6c61\u67d3\u7c7b\u578b", "\u6c61\u67d3\u5f3a\u5ea6", "\u7c7b\u522b\u7f6e\u4fe1\u5ea6", "\u5019\u9009Top3", "\u6a21\u677f\u76f8\u4f3c\u5ea6", "\u91cd\u6784\u76f8\u4f3c\u5ea6"]
                 )
         class_dropdown.change(update_sample_choices, class_dropdown, sample_dropdown)
         char_btn.click(

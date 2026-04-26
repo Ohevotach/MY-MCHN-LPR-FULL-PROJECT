@@ -91,11 +91,15 @@ class PlateSegmenter:
             lower_band_score = np.clip((y_center - 0.34) / 0.38, 0.0, 1.0)
             size_penalty = max(0.0, area_ratio - 0.035) * 8.0
             for candidate_img, mode_bias in self._candidate_plate_images(img, rect, (x, y, bw, bh)):
+                color_ratio = self._plate_color_ratio(candidate_img)
+                if color_ratio < 0.28:
+                    continue
                 quality = self._plate_quality_score(candidate_img)
-                if quality < 0.24:
+                if quality < 0.34:
                     continue
                 score = (
                     quality * 4.8
+                    + min(color_ratio / 0.52, 1.0) * 1.8
                     + aspect_score * 1.2
                     + fill * 0.6
                     + y_score * 0.8
@@ -137,8 +141,8 @@ class PlateSegmenter:
     def _crop_bbox_candidate(self, img, bbox):
         x, y, w, h = bbox
         h_img, w_img = img.shape[:2]
-        pad_x = int(0.22 * w)
-        pad_y = int(0.75 * h)
+        pad_x = int(0.12 * w)
+        pad_y = int(0.35 * h)
         x1 = max(0, x - pad_x)
         y1 = max(0, y - pad_y)
         x2 = min(w_img, x + w + pad_x)
@@ -167,10 +171,18 @@ class PlateSegmenter:
         return warped
 
     @staticmethod
+    def _plate_color_ratio(plate_img):
+        hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([90, 35, 35]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 30, 35]), np.array([95, 255, 255]))
+        color_mask = cv2.bitwise_or(blue, green)
+        return float(np.mean(color_mask[14:106, 16:384] > 0))
+
+    @staticmethod
     def _plate_quality_score(plate_img):
         hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
-        blue = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
-        green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
+        blue = cv2.inRange(hsv, np.array([90, 35, 35]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 30, 35]), np.array([95, 255, 255]))
         color_mask = cv2.bitwise_or(blue, green)
         roi = color_mask[12:108, 12:388]
         color_ratio = float(np.mean(roi > 0))
@@ -187,7 +199,7 @@ class PlateSegmenter:
         char_score = 1.0 - min(abs(char_ratio - 0.16) / 0.24, 1.0)
         edge_score = min(edge_ratio / 0.12, 1.0)
         score = 0.38 * color_score + 0.17 * char_score + 0.15 * edge_score + 0.30 * component_score
-        if color_ratio < 0.20 or component_score < 0.16:
+        if color_ratio < 0.28 or component_score < 0.20:
             score *= 0.45
         return score
 
@@ -334,9 +346,27 @@ class PlateSegmenter:
         binary[:, :14] = 0
         binary[:, 386:] = 0
         binary = cv2.medianBlur(binary, 3)
+        binary = PlateSegmenter._remove_long_plate_lines(binary)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
         return binary
+
+    @staticmethod
+    def _remove_long_plate_lines(binary):
+        cleaned = binary.copy()
+        work = cleaned > 0
+        row_sum = work.sum(axis=1)
+        col_sum = work.sum(axis=0)
+
+        for y in np.where(row_sum > 0.38 * binary.shape[1])[0]:
+            cleaned[max(0, y - 1) : min(binary.shape[0], y + 2), :] = 0
+        for x in np.where(col_sum > 0.55 * binary.shape[0])[0]:
+            cleaned[:, max(0, x - 1) : min(binary.shape[1], x + 2)] = 0
+
+        horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (34, 1)))
+        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 42)))
+        long_lines = cv2.bitwise_or(horizontal, vertical)
+        return cv2.bitwise_and(cleaned, cv2.bitwise_not(long_lines))
 
     def _find_contour_boxes(self, binary):
         work = cv2.dilate(binary, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
@@ -539,10 +569,37 @@ class PlateSegmenter:
         crop = binary[y1:y2, x1:x2]
         if crop.size == 0:
             return np.zeros((64, 32), dtype=np.uint8)
+        crop = PlateSegmenter._remove_char_border_fragments(crop)
         ys, xs = np.where(crop > 0)
         if len(xs) > 0 and len(ys) > 0:
             crop = crop[max(0, ys.min() - 1) : min(crop.shape[0], ys.max() + 2), max(0, xs.min() - 1) : min(crop.shape[1], xs.max() + 2)]
         return PlateSegmenter._resize_char_canvas(crop)
+
+    @staticmethod
+    def _remove_char_border_fragments(crop):
+        cleaned = crop.copy()
+        if cleaned.shape[0] < 8 or cleaned.shape[1] < 4:
+            return cleaned
+        cleaned[:1, :] = 0
+        cleaned[-1:, :] = 0
+        cleaned[:, :1] = 0
+        cleaned[:, -1:] = 0
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cleaned
+        kept = np.zeros_like(cleaned)
+        min_area = max(8, int(0.015 * cleaned.shape[0] * cleaned.shape[1]))
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            if area < min_area and (w <= 3 or h <= 3):
+                continue
+            if w >= 0.85 * cleaned.shape[1] and h <= 4:
+                continue
+            if h >= 0.85 * cleaned.shape[0] and w <= 4:
+                continue
+            cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
+        return kept
 
     @staticmethod
     def _resize_char_canvas(crop):

@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from dataset.lp_dataset import PollutedCharDataset, TemplateLoader, build_class_memory
+from dataset.lp_dataset import PollutedCharDataset, TemplateLoader, build_class_memory, normalize_char_tensor
 from models.mchn import ModernHopfieldNetwork
 from utils.image_processing import LPRPipeline
 from utils.metric_visuals import MetricVisualizer
@@ -416,7 +416,8 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
             continue
         result = ""
         for char_img in chars_img_list:
-            char_tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32, device=device).view(1, -1) / 255.0
+            char_tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
+            char_tensor = normalize_char_tensor(char_tensor, img_size=(32, 64)).view(1, -1).to(device)
             position = len(result)
             template_mask = chinese_mask if position == 0 else letter_mask if position == 1 and bool(letter_mask.any().item()) else alnum_mask
             with torch.no_grad():
