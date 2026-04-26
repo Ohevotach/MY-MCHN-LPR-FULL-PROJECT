@@ -23,14 +23,28 @@ def build_position_masks(loader, num_templates, device):
     return chinese_mask, alnum_mask
 
 
+def aggregate_attention_by_class(attention_weights, template_labels, num_classes):
+    class_scores = attention_weights.new_zeros((attention_weights.shape[0], num_classes))
+    label_index = template_labels.to(attention_weights.device).view(1, -1).expand(attention_weights.shape[0], -1)
+    class_scores.scatter_add_(1, label_index, attention_weights)
+    return class_scores
+
+
 print("Loading MCHN memory and OpenCV LPR pipeline...")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 loader = TemplateLoader(data_roots=["./data/chars2", "./data/charsChinese"], img_size=(32, 64))
 if loader.memory_matrix.shape[0] == 0:
     raise RuntimeError("Template memory is empty. Please check ./data/chars2 and ./data/charsChinese.")
 
-mchn = ModernHopfieldNetwork(loader.memory_matrix.to(device), beta=25.0, metric="dot", normalize=True).to(device)
+mchn = ModernHopfieldNetwork(
+    loader.memory_matrix.to(device),
+    beta=80.0,
+    metric="dot",
+    normalize=True,
+    feature_mode="centered",
+).to(device)
 pipeline = LPRPipeline()
+template_labels = loader.labels.to(device)
 chinese_mask, alnum_mask = build_position_masks(loader, mchn.num_templates, device)
 
 
@@ -61,12 +75,12 @@ def predict_analysis(image):
         with torch.no_grad():
             retrieved, pred_idx, weights = mchn(tensor, template_mask=current_mask, return_attention=True)
 
-        template_idx = pred_idx.item()
-        class_idx = int(loader.labels[template_idx])
+        class_scores = aggregate_attention_by_class(weights, template_labels, len(loader.idx_to_label))
+        class_idx = int(torch.argmax(class_scores, dim=-1).item())
         char = loader.idx_to_label[class_idx]
         plate_text += char
 
-        attention_conf = weights[0, template_idx].item()
+        attention_conf = class_scores[0, class_idx].item()
         recon_sim = F.cosine_similarity(tensor, retrieved).item()
         char_type = "汉字" if "\u4e00" <= char <= "\u9fff" else ("数字" if char.isdigit() else "字母")
         rows.append(

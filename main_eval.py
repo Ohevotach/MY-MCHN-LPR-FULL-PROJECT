@@ -5,30 +5,39 @@ import cv2
 import torch
 from torch.utils.data import DataLoader
 
-from dataset.lp_dataset import PollutedCharDataset, TemplateLoader
+from dataset.lp_dataset import PollutedCharDataset, TemplateLoader, build_class_memory
 from models.mchn import ModernHopfieldNetwork
 from utils.image_processing import LPRPipeline
 from utils.metric_visuals import MetricVisualizer
 
 
-def template_indices_to_classes(template_indices, template_labels, device):
-    classes = template_labels[template_indices.detach().cpu()].to(device)
+def memory_indices_to_classes(memory_indices, memory_labels, device):
+    classes = memory_labels[memory_indices.detach().cpu()].to(device)
     return classes
 
 
-def build_position_masks(loader, num_templates, device):
-    chinese_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
-    if loader.chinese_indices:
-        chinese_mask[loader.chinese_indices] = True
+def aggregate_attention_by_class(attention_weights, template_labels, num_classes):
+    batch_size = attention_weights.shape[0]
+    class_scores = attention_weights.new_zeros((batch_size, num_classes))
+    label_index = template_labels.to(attention_weights.device).view(1, -1).expand(batch_size, -1)
+    class_scores.scatter_add_(1, label_index, attention_weights)
+    return class_scores
 
-    alnum_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
-    if loader.alnum_indices:
-        alnum_mask[loader.alnum_indices] = True
+
+def build_position_masks(loader, memory_labels, device):
+    chinese_mask = torch.zeros(len(memory_labels), dtype=torch.bool, device=device)
+    alnum_mask = torch.zeros(len(memory_labels), dtype=torch.bool, device=device)
+    for i, class_idx in enumerate(memory_labels.tolist()):
+        label = loader.idx_to_label[int(class_idx)]
+        if len(label) == 1 and "\u4e00" <= label <= "\u9fff":
+            chinese_mask[i] = True
+        else:
+            alnum_mask[i] = True
 
     return chinese_mask, alnum_mask
 
 
-def run_reconstruction_demo(mchn, dataset, visualizer, device, batch_size=5):
+def run_reconstruction_demo(mchn, dataset, visualizer, device, class_memory, batch_size=5):
     print("\n" + "=" * 50)
     print("Task 1: generating MCHN reconstruction demo...")
 
@@ -37,7 +46,11 @@ def run_reconstruction_demo(mchn, dataset, visualizer, device, batch_size=5):
     polluted_q = polluted_q.to(device)
 
     with torch.no_grad():
-        reconstructed_z, _ = mchn(polluted_q)
+        _, _, weights = mchn(polluted_q, return_attention=True)
+        template_labels = dataset.L.to(device)
+        class_scores = aggregate_attention_by_class(weights, template_labels, len(dataset.idx_to_label))
+        pred_classes = torch.argmax(class_scores, dim=-1).detach().cpu()
+        reconstructed_z = class_memory[pred_classes].detach().cpu()
 
     labels_str = [dataset.idx_to_label[int(idx)] for idx in labels_idx]
 
@@ -50,17 +63,18 @@ def run_reconstruction_demo(mchn, dataset, visualizer, device, batch_size=5):
     )
 
 
-def evaluate_one_setting(model, loader, dataloader, device):
+def evaluate_one_setting(model, template_labels, num_classes, dataloader, device):
     correct = 0
     total = 0
-    template_labels = loader.labels.to(device)
+    template_labels = template_labels.to(device)
 
     with torch.no_grad():
         for q, _, labels in dataloader:
             q = q.to(device)
             labels = labels.to(device)
-            _, pred_template_indices = model(q)
-            pred_classes = template_indices_to_classes(pred_template_indices, template_labels, device)
+            _, _, weights = model(q, return_attention=True)
+            class_scores = aggregate_attention_by_class(weights, template_labels, num_classes)
+            pred_classes = torch.argmax(class_scores, dim=-1)
             correct += (pred_classes == labels).sum().item()
             total += labels.size(0)
 
@@ -76,8 +90,10 @@ def run_robustness_evaluation(loader, visualizer, device, pollution_type, sample
     acc_baseline = []
 
     memory = loader.memory_matrix.to(device)
-    mchn = ModernHopfieldNetwork(memory, beta=25.0, metric="dot", normalize=True).to(device)
-    baseline = ModernHopfieldNetwork(memory, beta=10.0, metric="euclidean", normalize=False).to(device)
+    template_labels = loader.labels
+    num_classes = len(loader.idx_to_label)
+    mchn = ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device)
+    baseline = ModernHopfieldNetwork(memory, beta=10.0, metric="euclidean", normalize=False, feature_mode="raw").to(device)
 
     for sev in severities:
         print(f"Testing severity={sev:.1f} ...")
@@ -90,9 +106,9 @@ def run_robustness_evaluation(loader, visualizer, device, pollution_type, sample
         )
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-        acc_mchn.append(evaluate_one_setting(mchn, loader, test_loader, device))
-        acc_baseline.append(evaluate_one_setting(baseline, loader, test_loader, device))
-        print(f"  MCHN-dot: {acc_mchn[-1]:.2f}% | Euclidean baseline: {acc_baseline[-1]:.2f}%")
+        acc_mchn.append(evaluate_one_setting(mchn, template_labels, num_classes, test_loader, device))
+        acc_baseline.append(evaluate_one_setting(baseline, template_labels, num_classes, test_loader, device))
+        print(f"  MCHN centered-dot: {acc_mchn[-1]:.2f}% | Euclidean baseline: {acc_baseline[-1]:.2f}%")
 
     visualizer.plot_robustness_curve(
         severities,
@@ -112,8 +128,9 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
         return
 
     pipeline = LPRPipeline(use_synthetic_pollution=False)
-    mchn = ModernHopfieldNetwork(loader.memory_matrix.to(device), beta=25.0, metric="dot", normalize=True).to(device)
-    chinese_mask, alnum_mask = build_position_masks(loader, mchn.num_templates, device)
+    memory, memory_labels = build_class_memory(loader, reduce="medoid")
+    mchn = ModernHopfieldNetwork(memory.to(device), beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device)
+    chinese_mask, alnum_mask = build_position_masks(loader, memory_labels, device)
 
     test_files = [
         os.path.join(test_dir, f)
@@ -140,10 +157,10 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
             with torch.no_grad():
                 _, pred_idx, weights = mchn(char_tensor, template_mask=current_mask, return_attention=True)
 
-            template_idx = pred_idx.item()
-            class_idx = int(loader.labels[template_idx])
+            memory_idx = pred_idx.item()
+            class_idx = int(memory_labels[memory_idx])
             plate_result += loader.idx_to_label[class_idx]
-            confidences.append(weights[0, template_idx].item())
+            confidences.append(weights[0, memory_idx].item())
 
         conf_text = ", ".join(f"{c:.3f}" for c in confidences)
         print(f"  MCHN result: {plate_result} | chars={len(chars_img_list)} | attention={conf_text}")
@@ -155,6 +172,8 @@ def parse_args():
     parser.add_argument("--samples-per-level", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--skip-e2e", action="store_true")
+    parser.add_argument("--data-dir", default="./data")
+    parser.add_argument("--output-dir", default="./results")
     return parser.parse_args()
 
 
@@ -163,10 +182,14 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Modern Hopfield polluted LPR evaluation, device={device}")
 
-    os.makedirs("./results", exist_ok=True)
-    visualizer = MetricVisualizer(save_dir="./results")
+    os.makedirs(args.output_dir, exist_ok=True)
+    visualizer = MetricVisualizer(save_dir=args.output_dir)
 
-    loader = TemplateLoader(data_roots=["./data/chars2", "./data/charsChinese"], img_size=(32, 64))
+    loader = TemplateLoader(
+        data_roots=[os.path.join(args.data_dir, "chars2"), os.path.join(args.data_dir, "charsChinese")],
+        img_size=(32, 64),
+        cache_path=os.path.join(args.data_dir, "template_cache_32x64.pt"),
+    )
     if loader.memory_matrix.shape[0] == 0:
         raise RuntimeError("Template memory is empty. Please check ./data/chars2 and ./data/charsChinese.")
 
@@ -177,14 +200,16 @@ if __name__ == "__main__":
         severity=0.6,
         seed=2026,
     )
+    class_memory, _ = build_class_memory(loader, reduce="medoid")
     demo_model = ModernHopfieldNetwork(
         loader.memory_matrix.to(device),
-        beta=25.0,
+        beta=80.0,
         metric="dot",
         normalize=True,
+        feature_mode="centered",
     ).to(device)
 
-    run_reconstruction_demo(demo_model, demo_dataset, visualizer, device)
+    run_reconstruction_demo(demo_model, demo_dataset, visualizer, device, class_memory)
     run_robustness_evaluation(
         loader,
         visualizer,
@@ -195,6 +220,6 @@ if __name__ == "__main__":
     )
 
     if not args.skip_e2e:
-        run_end_to_end_system(loader, device)
+        run_end_to_end_system(loader, device, test_dir=os.path.join(args.data_dir, "full_cars", "ccpd_weather"))
 
-    print("\nAll tasks finished. Figures are saved in ./results.")
+    print(f"\nAll tasks finished. Figures are saved in {args.output_dir}.")

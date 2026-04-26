@@ -10,7 +10,7 @@ class ModernHopfieldNetwork(nn.Module):
         z = softmax(beta * q @ M.T) @ M
     """
 
-    def __init__(self, memory_matrix, beta=25.0, metric="dot", normalize=True):
+    def __init__(self, memory_matrix, beta=40.0, metric="dot", normalize=True, feature_mode="centered"):
         super().__init__()
         if memory_matrix.dim() != 2:
             raise ValueError("memory_matrix must have shape [num_templates, feature_dim].")
@@ -18,15 +18,27 @@ class ModernHopfieldNetwork(nn.Module):
         self.beta = float(beta)
         self.metric = metric
         self.normalize = normalize
+        self.feature_mode = feature_mode
         self.num_templates = memory_matrix.shape[0]
 
+    def _feature_transform(self, x):
+        x = x.float()
+        if self.feature_mode == "raw":
+            return x
+        if self.feature_mode == "centered":
+            return x - x.mean(dim=-1, keepdim=True)
+        if self.feature_mode == "bipolar":
+            return x * 2.0 - 1.0
+        raise ValueError(f"Unsupported feature_mode: {self.feature_mode}")
+
     def _memory_for_similarity(self):
+        memory = self._feature_transform(self.M)
         if self.normalize and self.metric == "dot":
-            return F.normalize(self.M, p=2, dim=-1)
-        return self.M
+            return F.normalize(memory, p=2, dim=-1)
+        return memory
 
     def _query_for_similarity(self, q):
-        q = q.float()
+        q = self._feature_transform(q)
         if self.normalize and self.metric == "dot":
             return F.normalize(q, p=2, dim=-1)
         return q

@@ -55,6 +55,7 @@ class TemplateLoader:
             "zh_qing": "青",
             "zh_ning": "宁",
             "zh_xin": "新",
+            "zh_sx": "晋",
         }
 
         self.valid_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
@@ -77,6 +78,7 @@ class TemplateLoader:
     def _build_cache_signature(self):
         signature = {
             "img_size": tuple(self.img_size),
+            "label_map_version": 2,
             "roots": [],
         }
         for root_dir in self.data_roots:
@@ -330,6 +332,10 @@ def build_class_memory(template_loader, reduce="mean"):
             vector = samples.mean(dim=0)
         elif reduce == "first":
             vector = samples[0]
+        elif reduce == "medoid":
+            center = samples.mean(dim=0, keepdim=True)
+            distances = torch.cdist(samples, center, p=2.0).squeeze(1)
+            vector = samples[torch.argmin(distances)]
         else:
             raise ValueError(f"Unsupported reduce mode: {reduce}")
         class_vectors.append(vector)
