@@ -52,3 +52,63 @@ class MetricVisualizer:
         plt.legend(), plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
         plt.close()
+
+    def plot_multi_robustness_curve(self, severities, model_results, pollution_type="mixed", filename=None):
+        filename = filename or f"robustness_{pollution_type}_multi_curve.png"
+        plt.figure(figsize=(9, 6))
+        styles = ["o-", "s--", "^--", "d--", "x--", "v--", "p--"]
+        colors = ["#e74c3c", "#2c7fb8", "#7f8c8d", "#27ae60", "#8e44ad", "#d35400", "#16a085"]
+
+        for i, (name, values) in enumerate(model_results.items()):
+            style = styles[i % len(styles)]
+            color = colors[i % len(colors)]
+            linewidth = 2.4 if i == 0 else 1.7
+            plt.plot(severities, values, style, color=color, linewidth=linewidth, label=name)
+
+        plt.title(f"Accuracy vs. {pollution_type}", fontsize=14)
+        plt.xlabel("Severity Ratio")
+        plt.ylabel("Accuracy (%)")
+        plt.ylim(0, 105)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
+        plt.close()
+
+    def plot_summary_heatmap(self, matrix, row_labels, col_labels, title, filename):
+        data = np.asarray(matrix, dtype=float)
+        fig_w = max(8, 1.1 * len(col_labels))
+        fig_h = max(5, 0.55 * len(row_labels))
+        plt.figure(figsize=(fig_w, fig_h))
+        plt.imshow(data, aspect="auto", cmap="YlGnBu", vmin=0, vmax=100)
+        plt.colorbar(label="Accuracy (%)")
+        plt.xticks(range(len(col_labels)), col_labels, rotation=35, ha="right")
+        plt.yticks(range(len(row_labels)), row_labels)
+        plt.title(title)
+
+        for i in range(data.shape[0]):
+            for j in range(data.shape[1]):
+                color = "white" if data[i, j] > 65 else "black"
+                plt.text(j, i, f"{data[i, j]:.1f}", ha="center", va="center", fontsize=8, color=color)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
+        plt.close()
+
+    def plot_final_severity_bar(self, final_scores, pollution_type, severity, filename):
+        names = list(final_scores.keys())
+        values = [final_scores[name] for name in names]
+        colors = ["#e74c3c"] + ["#7f8c8d"] * max(0, len(names) - 1)
+
+        plt.figure(figsize=(9, 5))
+        bars = plt.bar(names, values, color=colors)
+        plt.ylim(0, 105)
+        plt.ylabel("Accuracy (%)")
+        plt.title(f"{pollution_type} accuracy at severity={severity}")
+        plt.xticks(rotation=25, ha="right")
+        plt.grid(axis="y", alpha=0.25)
+        for bar, value in zip(bars, values):
+            plt.text(bar.get_x() + bar.get_width() / 2, value + 1, f"{value:.1f}", ha="center", fontsize=9)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
+        plt.close()

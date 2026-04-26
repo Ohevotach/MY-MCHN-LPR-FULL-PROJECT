@@ -11,6 +11,19 @@ from models.mchn import ModernHopfieldNetwork
 from utils.image_processing import LPRPipeline
 
 
+def is_kaggle_runtime():
+    return os.path.exists("/kaggle/working") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
+
+
+def default_cache_path():
+    if is_kaggle_runtime():
+        cache_dir = "/kaggle/working/mchn_cache"
+    else:
+        cache_dir = os.path.join(os.getcwd(), "data")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "template_cache_32x64.pt")
+
+
 def build_template_masks(loader, num_templates, device):
     chinese_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     if loader.chinese_indices:
@@ -41,10 +54,7 @@ def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, tem
         if count == 0:
             scores.append(scaled.new_full((scaled.shape[0],), -1e9))
             continue
-        scores.append(
-            torch.logsumexp(scaled[:, class_mask], dim=-1)
-            - torch.log(scaled.new_tensor(float(count)))
-        )
+        scores.append(torch.logsumexp(scaled[:, class_mask], dim=-1) - torch.log(scaled.new_tensor(float(count))))
     return torch.stack(scores, dim=-1)
 
 
@@ -54,29 +64,45 @@ def select_best_template_in_class(sim_scores, template_labels, class_idx):
     return torch.argmax(sim_scores[0].masked_fill(~mask, -1e9)).item()
 
 
+def ensemble_scores(models, q, template_labels, num_classes, template_mask=None):
+    fused = None
+    first_sim = None
+    first_retrieved = None
+    for model in models:
+        retrieved, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
+        scores = class_free_energy_scores(
+            sim_scores,
+            template_labels,
+            beta=model.beta,
+            num_classes=num_classes,
+            template_mask=template_mask,
+        )
+        log_probs = torch.log_softmax(scores, dim=-1)
+        fused = log_probs if fused is None else fused + log_probs
+        if first_sim is None:
+            first_sim = sim_scores
+            first_retrieved = retrieved
+    return fused, first_sim, first_retrieved
+
+
 print("Loading MCHN memory and OpenCV LPR pipeline...")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-loader = TemplateLoader(data_roots=["./data/chars2", "./data/charsChinese"], img_size=(32, 64))
+loader = TemplateLoader(
+    data_roots=["./data/chars2", "./data/charsChinese"],
+    img_size=(32, 64),
+    cache_path=default_cache_path(),
+)
 if loader.memory_matrix.shape[0] == 0:
     raise RuntimeError("Template memory is empty. Please check ./data/chars2 and ./data/charsChinese.")
 
-mchn = ModernHopfieldNetwork(
-    loader.memory_matrix.to(device),
-    beta=60.0,
-    metric="dot",
-    normalize=True,
-    feature_mode="binary",
-).to(device)
-mchn_centered = ModernHopfieldNetwork(
-    loader.memory_matrix.to(device),
-    beta=80.0,
-    metric="dot",
-    normalize=True,
-    feature_mode="centered",
-).to(device)
+memory = loader.memory_matrix.to(device)
+mchn_models = [
+    ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
+    ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
+]
 pipeline = LPRPipeline()
 template_labels = loader.labels.to(device)
-chinese_mask, alnum_mask = build_template_masks(loader, mchn.num_templates, device)
+chinese_mask, alnum_mask = build_template_masks(loader, memory.shape[0], device)
 
 
 def predict_analysis(image):
@@ -104,33 +130,21 @@ def predict_analysis(image):
         current_mask = chinese_mask if i == 0 else alnum_mask
 
         with torch.no_grad():
-            retrieved, _, sim_scores = mchn(tensor, template_mask=current_mask, return_similarity=True)
-            class_scores_binary = class_free_energy_scores(
-                sim_scores,
+            class_scores, sim_scores, retrieved = ensemble_scores(
+                mchn_models,
+                tensor,
                 template_labels,
-                beta=mchn.beta,
-                num_classes=len(loader.idx_to_label),
+                len(loader.idx_to_label),
                 template_mask=current_mask,
-            )
-            _, _, sim_scores_centered = mchn_centered(tensor, template_mask=current_mask, return_similarity=True)
-            class_scores_centered = class_free_energy_scores(
-                sim_scores_centered,
-                template_labels,
-                beta=mchn_centered.beta,
-                num_classes=len(loader.idx_to_label),
-                template_mask=current_mask,
-            )
-            class_scores = torch.log_softmax(class_scores_binary, dim=-1) + torch.log_softmax(
-                class_scores_centered, dim=-1
             )
 
         class_idx = int(torch.argmax(class_scores, dim=-1).item())
         char = loader.idx_to_label[class_idx]
         plate_text += char
         best_template_idx = select_best_template_in_class(sim_scores, template_labels, class_idx)
-
         prob = torch.softmax(class_scores, dim=-1)[0, class_idx].item()
-        recon_sim = F.cosine_similarity(tensor, loader.memory_matrix[best_template_idx].to(device).view(1, -1)).item()
+        template_sim = F.cosine_similarity(tensor, memory[best_template_idx].view(1, -1)).item()
+        recon_sim = F.cosine_similarity(tensor, retrieved).item()
         char_type = "汉字" if "\u4e00" <= char <= "\u9fff" else ("数字" if char.isdigit() else "字母")
         rows.append(
             {
@@ -138,7 +152,8 @@ def predict_analysis(image):
                 "类型": char_type,
                 "识别": char,
                 "类别置信度": f"{prob * 100:.2f}%",
-                "模板相似度": f"{recon_sim * 100:.2f}%",
+                "模板相似度": f"{template_sim * 100:.2f}%",
+                "重构相似度": f"{recon_sim * 100:.2f}%",
             }
         )
 
@@ -171,7 +186,7 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
             )
 
     df_out = gr.Dataframe(
-        headers=["位置", "类型", "识别", "类别置信度", "模板相似度"],
+        headers=["位置", "类型", "识别", "类别置信度", "模板相似度", "重构相似度"],
         label="逐字符识别分析",
     )
 
@@ -180,4 +195,5 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "7860"))
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    share = os.environ.get("GRADIO_SHARE", "1" if is_kaggle_runtime() else "0") == "1"
+    demo.launch(server_name="0.0.0.0", server_port=port, share=share)

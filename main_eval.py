@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 
 import cv2
@@ -140,21 +141,38 @@ def evaluate_one_setting(models, template_labels, num_classes, dataloader, devic
     return 100.0 * correct / max(total, 1)
 
 
+def build_model_suite(memory, device):
+    return {
+        "MCHN multi-view": [
+            ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
+            ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
+        ],
+        "MCHN binary": ModernHopfieldNetwork(
+            memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary"
+        ).to(device),
+        "MCHN centered": ModernHopfieldNetwork(
+            memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered"
+        ).to(device),
+        "Dot raw": ModernHopfieldNetwork(memory, beta=25.0, metric="dot", normalize=True, feature_mode="raw").to(device),
+        "Euclidean": ModernHopfieldNetwork(
+            memory, beta=10.0, metric="euclidean", normalize=False, feature_mode="raw"
+        ).to(device),
+        "Manhattan": ModernHopfieldNetwork(
+            memory, beta=0.05, metric="manhattan", normalize=False, feature_mode="raw"
+        ).to(device),
+    }
+
+
 def run_robustness_evaluation(loader, visualizer, device, pollution_type, samples_per_level, batch_size):
     print("\n" + "=" * 50)
     print(f"Task 2: robustness evaluation, pollution={pollution_type}...")
 
     severities = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8]
-    acc_mchn = []
-    acc_baseline = []
-
     memory = loader.memory_matrix.to(device)
     template_labels = loader.labels
     num_classes = len(loader.idx_to_label)
-    mchn_binary = ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device)
-    mchn_centered = ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device)
-    mchn_models = [mchn_binary, mchn_centered]
-    baseline = ModernHopfieldNetwork(memory, beta=10.0, metric="euclidean", normalize=False, feature_mode="raw").to(device)
+    model_suite = build_model_suite(memory, device)
+    results = {name: [] for name in model_suite}
 
     for sev in severities:
         print(f"Testing severity={sev:.1f} ...")
@@ -167,16 +185,61 @@ def run_robustness_evaluation(loader, visualizer, device, pollution_type, sample
         )
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-        acc_mchn.append(evaluate_one_setting(mchn_models, template_labels, num_classes, test_loader, device))
-        acc_baseline.append(evaluate_one_setting(baseline, template_labels, num_classes, test_loader, device))
-        print(f"  MCHN multi-view: {acc_mchn[-1]:.2f}% | Euclidean baseline: {acc_baseline[-1]:.2f}%")
+        for name, model in model_suite.items():
+            acc = evaluate_one_setting(model, template_labels, num_classes, test_loader, device)
+            results[name].append(acc)
+        print("  " + " | ".join(f"{name}: {values[-1]:.2f}%" for name, values in results.items()))
 
-    visualizer.plot_robustness_curve(
+    visualizer.plot_multi_robustness_curve(
         severities,
-        acc_mchn,
-        baseline_acc=acc_baseline,
+        results,
         pollution_type=pollution_type,
-        filename=f"robustness_{pollution_type}_curve.png",
+        filename=f"robustness_{pollution_type}_multi_curve.png",
+    )
+    visualizer.plot_final_severity_bar(
+        {name: values[-1] for name, values in results.items()},
+        pollution_type=pollution_type,
+        severity=severities[-1],
+        filename=f"robustness_{pollution_type}_final_bar.png",
+    )
+    return severities, results
+
+
+def save_results_csv(output_dir, all_results, severities):
+    csv_path = os.path.join(output_dir, "robustness_all_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pollution", "model", *[f"severity_{s}" for s in severities]])
+        for pollution, model_results in all_results.items():
+            for model_name, values in model_results.items():
+                writer.writerow([pollution, model_name, *[f"{v:.4f}" for v in values]])
+    print(f"Saved CSV: {csv_path}")
+
+
+def plot_all_pollution_summary(visualizer, all_results, severities):
+    if not all_results:
+        return
+    model_names = list(next(iter(all_results.values())).keys())
+    pollution_names = list(all_results.keys())
+    final_matrix = []
+    avg_matrix = []
+    for model_name in model_names:
+        final_matrix.append([all_results[p][model_name][-1] for p in pollution_names])
+        avg_matrix.append([sum(all_results[p][model_name]) / len(severities) for p in pollution_names])
+
+    visualizer.plot_summary_heatmap(
+        final_matrix,
+        row_labels=model_names,
+        col_labels=pollution_names,
+        title=f"Accuracy at severity={severities[-1]}",
+        filename="summary_final_severity_heatmap.png",
+    )
+    visualizer.plot_summary_heatmap(
+        avg_matrix,
+        row_labels=model_names,
+        col_labels=pollution_names,
+        title="Mean accuracy across severities",
+        filename="summary_mean_accuracy_heatmap.png",
     )
 
 
@@ -241,7 +304,11 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Modern Hopfield polluted license-plate character demo")
-    parser.add_argument("--pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
+    parser.add_argument(
+        "--pollution",
+        default="mixed",
+        choices=["all", "mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"],
+    )
     parser.add_argument("--samples-per-level", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--skip-e2e", action="store_true")
@@ -261,7 +328,7 @@ if __name__ == "__main__":
     loader = TemplateLoader(
         data_roots=[os.path.join(args.data_dir, "chars2"), os.path.join(args.data_dir, "charsChinese")],
         img_size=(32, 64),
-        cache_path=os.path.join(args.data_dir, "template_cache_32x64.pt"),
+        cache_path=os.path.join(args.output_dir, "template_cache_32x64.pt"),
     )
     if loader.memory_matrix.shape[0] == 0:
         raise RuntimeError("Template memory is empty. Please check ./data/chars2 and ./data/charsChinese.")
@@ -292,14 +359,26 @@ if __name__ == "__main__":
     ]
 
     run_reconstruction_demo(demo_models, demo_dataset, visualizer, device, class_memory)
-    run_robustness_evaluation(
-        loader,
-        visualizer,
-        device,
-        pollution_type=args.pollution,
-        samples_per_level=args.samples_per_level,
-        batch_size=args.batch_size,
-    )
+    pollution_types = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "mixed"]
+    if args.pollution != "all":
+        pollution_types = [args.pollution]
+
+    all_results = {}
+    severities = None
+    for pollution_type in pollution_types:
+        severities, results = run_robustness_evaluation(
+            loader,
+            visualizer,
+            device,
+            pollution_type=pollution_type,
+            samples_per_level=args.samples_per_level,
+            batch_size=args.batch_size,
+        )
+        all_results[pollution_type] = results
+
+    save_results_csv(args.output_dir, all_results, severities)
+    if args.pollution == "all":
+        plot_all_pollution_summary(visualizer, all_results, severities)
 
     if not args.skip_e2e:
         run_end_to_end_system(loader, device, test_dir=os.path.join(args.data_dir, "full_cars", "ccpd_weather"))
