@@ -117,6 +117,71 @@ def tensor_to_rgb_image(tensor):
     return cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
 
 
+def normalize_char_image(arr):
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.shape != (64, 32):
+        arr = cv2.resize(arr, (32, 64), interpolation=cv2.INTER_NEAREST)
+    _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binary > 0) > 0.55:
+        binary = cv2.bitwise_not(binary)
+
+    ys, xs = np.where(binary > 0)
+    if len(xs) < 6 or len(ys) < 6:
+        return binary
+
+    coords = np.column_stack([xs, ys]).astype(np.float32)
+    rect = cv2.minAreaRect(coords)
+    angle = rect[2]
+    rw, rh = rect[1]
+    if rw > 1 and rh > 1:
+        if rw > rh:
+            angle += 90.0
+        if angle > 45.0:
+            angle -= 90.0
+        if angle < -45.0:
+            angle += 90.0
+        if 2.0 <= abs(angle) <= 22.0:
+            matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
+            binary = cv2.warpAffine(binary, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)
+
+    ys, xs = np.where(binary > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return binary
+    crop = binary[max(0, ys.min() - 1) : min(64, ys.max() + 2), max(0, xs.min() - 1) : min(32, xs.max() + 2)]
+    h, w = crop.shape[:2]
+    canvas = np.zeros((64, 32), dtype=np.uint8)
+    scale = min(26.0 / max(1, w), 56.0 / max(1, h))
+    new_w = max(1, min(30, int(round(w * scale))))
+    new_h = max(1, min(62, int(round(h * scale))))
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    y = (64 - new_h) // 2
+    x = (32 - new_w) // 2
+    canvas[y : y + new_h, x : x + new_w] = resized
+    return canvas
+
+
+def affine_char_variants(tensor):
+    base = tensor.detach().cpu().view(64, 32).numpy()
+    base = normalize_char_image(np.clip(base * 255, 0, 255))
+    variants = [base]
+    for angle in (-14, -8, 8, 14):
+        matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
+        variants.append(normalize_char_image(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+    for shear in (-0.16, -0.08, 0.08, 0.16):
+        matrix = np.array([[1.0, shear, -shear * 32.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        variants.append(normalize_char_image(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+
+    unique = []
+    seen = set()
+    for item in variants:
+        key = item.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(torch.tensor(item, dtype=torch.float32).view(1, -1) / 255.0)
+    return torch.cat(unique, dim=0)
+
+
 def collect_full_car_samples():
     roots = [
         "./data/full_cars/ccpd_base",
@@ -169,16 +234,19 @@ pil_transform = transforms.Compose(
 
 
 def recognize_tensor(tensor, template_mask=None):
-    q = tensor.to(device).view(1, -1)
+    q = affine_char_variants(tensor).to(device)
     with torch.no_grad():
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
-    class_idx = int(torch.argmax(class_scores, dim=-1).item())
-    best_template_idx = select_best_template_in_class(sim_scores, template_labels, class_idx)
-    prob = torch.softmax(class_scores, dim=-1)[0, class_idx].item()
-    template_sim = F.cosine_similarity(q, memory[best_template_idx].view(1, -1)).item()
-    recon_sim = F.cosine_similarity(q, retrieved).item()
+    flat_idx = int(torch.argmax(class_scores).item())
+    variant_idx = flat_idx // class_scores.shape[1]
+    class_idx = flat_idx % class_scores.shape[1]
+    best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)
+    prob = torch.softmax(class_scores[variant_idx], dim=-1)[class_idx].item()
+    best_q = q[variant_idx : variant_idx + 1]
+    template_sim = F.cosine_similarity(best_q, memory[best_template_idx].view(1, -1)).item()
+    recon_sim = F.cosine_similarity(best_q, retrieved[variant_idx : variant_idx + 1]).item()
     return class_idx, best_template_idx, prob, template_sim, recon_sim
 
 

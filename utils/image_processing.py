@@ -91,7 +91,7 @@ class PlateSegmenter:
             size_penalty = max(0.0, area_ratio - 0.035) * 8.0
             for candidate_img, mode_bias in self._candidate_plate_images(img, rect, (x, y, bw, bh)):
                 quality = self._plate_quality_score(candidate_img)
-                if quality < 0.12:
+                if quality < 0.18:
                     continue
                 score = quality * 4.0 + aspect_score * 1.5 + fill * 0.8 + y_score * 0.8 + mode_bias - size_penalty
                 candidates.append((score, rect, (x, y, bw, bh), candidate_img))
@@ -173,11 +173,31 @@ class PlateSegmenter:
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 80, 180)
         edge_ratio = float(np.mean(edges[18:104, 18:382] > 0))
+        component_score = PlateSegmenter._character_component_score(white[12:108, 12:388])
 
         color_score = min(color_ratio / 0.45, 1.0)
         white_score = 1.0 - min(abs(white_ratio - 0.16) / 0.22, 1.0)
         edge_score = min(edge_ratio / 0.12, 1.0)
-        return 0.55 * color_score + 0.25 * white_score + 0.20 * edge_score
+        return 0.42 * color_score + 0.18 * white_score + 0.15 * edge_score + 0.25 * component_score
+
+    @staticmethod
+    def _character_component_score(white_mask):
+        work = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+        work = cv2.morphologyEx(work, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 4)))
+        contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            ratio = w / max(1, h)
+            if 18 <= h <= 86 and 3 <= w <= 58 and 0.04 <= ratio <= 1.15 and w * h >= 90:
+                boxes.append((x, y, w, h))
+        if not boxes:
+            return 0.0
+        boxes = sorted(boxes, key=lambda b: b[0])
+        centers = np.array([x + w / 2 for x, _, w, _ in boxes], dtype=np.float32)
+        count_score = 1.0 - min(abs(len(boxes) - 7) / 7.0, 1.0)
+        span_score = min((centers[-1] - centers[0]) / 250.0, 1.0) if len(centers) > 1 else 0.0
+        return 0.65 * count_score + 0.35 * span_score
 
     @staticmethod
     def _deskew_plate(plate_img):
@@ -214,7 +234,7 @@ class PlateSegmenter:
         if plate_img is None:
             return []
 
-        plate_img = self._deskew_plate(cv2.resize(plate_img, (self.PLATE_W, self.PLATE_H)))
+        plate_img = self._tighten_plate_crop(self._deskew_plate(cv2.resize(plate_img, (self.PLATE_W, self.PLATE_H))))
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = self._make_character_mask(plate_img, gray)
@@ -231,6 +251,33 @@ class PlateSegmenter:
         if self._has_valid_plate_layout(contour_boxes):
             return [self._crop_char(binary, box) for box in contour_boxes]
         return self._segment_by_fixed_slots(gray, binary, char_count=7)
+
+    @classmethod
+    def _tighten_plate_crop(cls, plate_img):
+        hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
+        mask = cv2.bitwise_or(blue, green)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5)), iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return plate_img
+        cnt = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(cnt) < 0.12 * cls.PLATE_W * cls.PLATE_H:
+            return plate_img
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w / max(1, h) < 2.0:
+            return plate_img
+        pad_x = int(0.04 * w)
+        pad_y = int(0.18 * h)
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(cls.PLATE_W, x + w + pad_x)
+        y2 = min(cls.PLATE_H, y + h + pad_y)
+        crop = plate_img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return plate_img
+        return cv2.resize(crop, (cls.PLATE_W, cls.PLATE_H))
 
     @staticmethod
     def _make_character_mask(plate_img, gray):

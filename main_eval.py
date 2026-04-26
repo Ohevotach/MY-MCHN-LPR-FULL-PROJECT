@@ -4,6 +4,7 @@ import os
 import random
 
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -122,6 +123,53 @@ def predict_prototype(q, prototypes, prototype_labels):
     return prototype_labels[indices]
 
 
+def normalize_char_array(arr):
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.shape != (64, 32):
+        arr = cv2.resize(arr, (32, 64), interpolation=cv2.INTER_NEAREST)
+    _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binary > 0) > 0.55:
+        binary = cv2.bitwise_not(binary)
+    ys, xs = np.where(binary > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return binary
+    crop = binary[max(0, ys.min() - 1) : min(64, ys.max() + 2), max(0, xs.min() - 1) : min(32, xs.max() + 2)]
+    h, w = crop.shape[:2]
+    canvas = np.zeros((64, 32), dtype=np.uint8)
+    scale = min(26.0 / max(1, w), 56.0 / max(1, h))
+    new_w = max(1, min(30, int(round(w * scale))))
+    new_h = max(1, min(62, int(round(h * scale))))
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    y = (64 - new_h) // 2
+    x = (32 - new_w) // 2
+    canvas[y : y + new_h, x : x + new_w] = resized
+    return canvas
+
+
+def build_affine_query_variants(q):
+    tensors = []
+    for row in q.detach().cpu().view(-1, 64, 32).numpy():
+        base = normalize_char_array(row * 255.0)
+        variants = [base]
+        for angle in (-14, -8, 8, 14):
+            matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
+            variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+        for shear in (-0.16, -0.08, 0.08, 0.16):
+            matrix = np.array([[1.0, shear, -shear * 32.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+            variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+        tensors.extend(torch.tensor(item, dtype=torch.float32).view(1, -1) / 255.0 for item in variants)
+    return torch.cat(tensors, dim=0), 9
+
+
+def predict_affine_robust_hopfield(models, q, template_labels, num_classes):
+    q_variants, variants_per_sample = build_affine_query_variants(q)
+    q_variants = q_variants.to(q.device)
+    scores, _ = ensemble_hopfield_scores(models, q_variants, template_labels, num_classes)
+    scores = scores.view(q.shape[0], variants_per_sample, num_classes)
+    best_scores = scores.max(dim=1).values
+    return torch.argmax(best_scores, dim=-1)
+
+
 def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples, batch_size, seed):
     model = SimpleCNN(num_classes=num_classes).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -232,6 +280,7 @@ def run_robustness_evaluation(
             "Modern Hopfield": lambda q: torch.argmax(
                 ensemble_hopfield_scores(hopfield_models, q, train_labels, num_classes)[0], dim=-1
             ),
+            "Affine-robust Hopfield": lambda q: predict_affine_robust_hopfield(hopfield_models, q, train_labels, num_classes),
             "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
             "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
