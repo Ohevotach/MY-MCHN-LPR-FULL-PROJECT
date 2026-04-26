@@ -87,13 +87,22 @@ class PlateSegmenter:
 
             aspect_score = 1.0 - min(abs(aspect - 3.4) / 3.4, 1.0)
             y_center = (y + bh / 2) / max(1, h_img)
-            y_score = 1.0 - min(abs(y_center - 0.68) / 0.68, 0.85)
+            y_score = 1.0 - min(abs(y_center - 0.72) / 0.55, 0.95)
+            lower_band_score = np.clip((y_center - 0.34) / 0.38, 0.0, 1.0)
             size_penalty = max(0.0, area_ratio - 0.035) * 8.0
             for candidate_img, mode_bias in self._candidate_plate_images(img, rect, (x, y, bw, bh)):
                 quality = self._plate_quality_score(candidate_img)
-                if quality < 0.18:
+                if quality < 0.24:
                     continue
-                score = quality * 4.0 + aspect_score * 1.5 + fill * 0.8 + y_score * 0.8 + mode_bias - size_penalty
+                score = (
+                    quality * 4.8
+                    + aspect_score * 1.2
+                    + fill * 0.6
+                    + y_score * 0.8
+                    + lower_band_score * 1.2
+                    + mode_bias
+                    - size_penalty
+                )
                 candidates.append((score, rect, (x, y, bw, bh), candidate_img))
 
         if not candidates:
@@ -166,19 +175,21 @@ class PlateSegmenter:
         roi = color_mask[12:108, 12:388]
         color_ratio = float(np.mean(roi > 0))
 
-        white = cv2.inRange(hsv, np.array([0, 0, 75]), np.array([180, 145, 255]))
-        white_roi = white[18:104, 18:382]
-        white_ratio = float(np.mean(white_roi > 0))
-
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+        char_mask = PlateSegmenter._make_character_mask(plate_img, cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray))
+        char_roi = char_mask[18:104, 18:382]
+        char_ratio = float(np.mean(char_roi > 0))
         edges = cv2.Canny(gray, 80, 180)
         edge_ratio = float(np.mean(edges[18:104, 18:382] > 0))
-        component_score = PlateSegmenter._character_component_score(white[12:108, 12:388])
+        component_score = PlateSegmenter._character_component_score(char_mask[12:108, 12:388])
 
         color_score = min(color_ratio / 0.45, 1.0)
-        white_score = 1.0 - min(abs(white_ratio - 0.16) / 0.22, 1.0)
+        char_score = 1.0 - min(abs(char_ratio - 0.16) / 0.24, 1.0)
         edge_score = min(edge_ratio / 0.12, 1.0)
-        return 0.42 * color_score + 0.18 * white_score + 0.15 * edge_score + 0.25 * component_score
+        score = 0.38 * color_score + 0.17 * char_score + 0.15 * edge_score + 0.30 * component_score
+        if color_ratio < 0.20 or component_score < 0.16:
+            score *= 0.45
+        return score
 
     @staticmethod
     def _character_component_score(white_mask):
@@ -250,6 +261,9 @@ class PlateSegmenter:
         contour_boxes = self._find_contour_boxes(binary)
         if self._has_valid_plate_layout(contour_boxes):
             return [self._crop_char(binary, box) for box in contour_boxes]
+        projection_boxes = self._segment_boxes_by_projection(binary)
+        if self._has_valid_plate_layout(projection_boxes):
+            return [self._crop_char(binary, box) for box in projection_boxes]
         return self._segment_by_fixed_slots(gray, binary, char_count=7)
 
     @classmethod
@@ -328,6 +342,57 @@ class PlateSegmenter:
         if np.min(heights) < 0.45 * np.median(heights):
             return False
         return True
+
+    def _segment_boxes_by_projection(self, binary, char_count=7):
+        work = binary.copy()
+        work[:14, :] = 0
+        work[106:, :] = 0
+        col_sum = (work > 0).sum(axis=0).astype(np.float32)
+        if float(np.max(col_sum)) <= 0:
+            return []
+        smooth = cv2.GaussianBlur(col_sum.reshape(1, -1), (1, 17), 0).ravel()
+        active = np.where(smooth > max(2.0, 0.10 * float(np.max(smooth))))[0]
+        if len(active) < 90:
+            return []
+
+        left = max(10, int(active[0]) - 4)
+        right = min(self.PLATE_W - 10, int(active[-1]) + 4)
+        width = right - left
+        if width < 230:
+            return []
+
+        boundaries = [left]
+        for i in range(1, char_count):
+            expected = left + width * i / char_count
+            radius = max(8, int(width / char_count * 0.34))
+            lo = max(left + 8, int(expected - radius))
+            hi = min(right - 8, int(expected + radius))
+            if hi <= lo:
+                boundaries.append(int(expected))
+                continue
+            local = smooth[lo:hi]
+            min_value = float(np.min(local))
+            valley_positions = np.where(local <= min_value + 0.5)[0]
+            valley = int(lo + valley_positions[len(valley_positions) // 2])
+            boundaries.append(valley)
+        boundaries.append(right)
+        boundaries = sorted(boundaries)
+
+        boxes = []
+        for i in range(char_count):
+            x1 = boundaries[i] + 1
+            x2 = boundaries[i + 1] - 1
+            if x2 - x1 < 12:
+                return []
+            slot = work[:, x1:x2]
+            rows = np.where((slot > 0).sum(axis=1) > 1)[0]
+            if len(rows):
+                y1 = max(14, int(rows[0]) - 3)
+                y2 = min(106, int(rows[-1]) + 4)
+            else:
+                y1, y2 = 18, 104
+            boxes.append((x1, y1, x2 - x1, max(8, y2 - y1)))
+        return boxes
 
     def _segment_by_fixed_slots(self, gray, binary, char_count=7):
         col_sum = (binary > 0).sum(axis=0)

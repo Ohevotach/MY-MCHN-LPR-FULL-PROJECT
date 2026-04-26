@@ -362,6 +362,18 @@ def plot_all_pollution_summary(visualizer, all_results):
         title="Held-out mean accuracy across severities",
         filename="summary_mean_accuracy_heatmap.png",
     )
+    visualizer.plot_method_pollution_curves(
+        SEVERITIES,
+        all_results,
+        method_name="Modern Hopfield",
+        filename="mchn_pollution_severity_curves.png",
+    )
+    visualizer.plot_method_pollution_curves(
+        SEVERITIES,
+        all_results,
+        method_name="Affine-robust Hopfield",
+        filename="affine_robust_mchn_pollution_severity_curves.png",
+    )
 
 
 def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weather", max_images=3):

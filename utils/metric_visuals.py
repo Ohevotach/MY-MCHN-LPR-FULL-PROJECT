@@ -95,6 +95,37 @@ class MetricVisualizer:
         plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
         plt.close()
 
+    def plot_method_pollution_curves(self, severities, all_results, method_name, filename):
+        plt.figure(figsize=(10, 6))
+        styles = ["o-", "s-", "^-", "d-", "x-", "v-", "p-", "h-"]
+        colors = ["#d62728", "#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#7f7f7f"]
+
+        plotted = 0
+        for i, (pollution, method_results) in enumerate(all_results.items()):
+            if method_name not in method_results:
+                continue
+            plt.plot(
+                severities,
+                method_results[method_name],
+                styles[i % len(styles)],
+                color=colors[i % len(colors)],
+                linewidth=2.0,
+                markersize=5,
+                label=pollution,
+            )
+            plotted += 1
+
+        plt.title(f"{method_name} accuracy under different pollutions", fontsize=14)
+        plt.xlabel("Pollution severity")
+        plt.ylabel("Accuracy (%)")
+        plt.ylim(0, 105)
+        plt.grid(True, alpha=0.3)
+        if plotted:
+            plt.legend(ncol=2)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
+        plt.close()
+
     def plot_final_severity_bar(self, final_scores, pollution_type, severity, filename):
         names = list(final_scores.keys())
         values = [final_scores[name] for name in names]
