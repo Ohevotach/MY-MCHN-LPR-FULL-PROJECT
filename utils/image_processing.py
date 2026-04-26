@@ -1,4 +1,5 @@
 import os
+import re
 
 import cv2
 import numpy as np
@@ -420,7 +421,7 @@ class PlateSegmenter:
             boxes.append((max(0, x1), max(0, y1), max(4, x2 - x1), max(8, y2 - y1)))
             x += slot_w
 
-        chars = [self._crop_slot_char(gray, binary, box) for box in boxes]
+        chars = [self._crop_slot_char(plate_img, gray, binary, box) for box in boxes]
         return chars, boxes
 
     @classmethod
@@ -451,25 +452,43 @@ class PlateSegmenter:
         return left, top, right, bottom
 
     @staticmethod
-    def _crop_slot_char(gray, binary, box):
+    def _crop_slot_char(plate_img, gray, binary, box):
         x, y, w, h = box
         x1, y1 = max(0, x), max(0, y)
         x2, y2 = min(binary.shape[1], x + w), min(binary.shape[0], y + h)
-        slot_binary = binary[y1:y2, x1:x2]
-        if slot_binary.size == 0:
+        if x2 <= x1 or y2 <= y1:
             return np.zeros((64, 32), dtype=np.uint8)
 
-        if int(np.count_nonzero(slot_binary)) < 10:
-            slot_gray = gray[y1:y2, x1:x2]
-            if slot_gray.size == 0:
-                return np.zeros((64, 32), dtype=np.uint8)
-            slot_gray = cv2.GaussianBlur(slot_gray, (3, 3), 0)
-            _, slot_binary = cv2.threshold(slot_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            if np.mean(slot_binary > 0) > 0.55:
-                slot_binary = cv2.bitwise_not(slot_binary)
+        slot_binary = PlateSegmenter._local_character_mask(plate_img[y1:y2, x1:x2], gray[y1:y2, x1:x2])
+        if int(np.count_nonzero(slot_binary)) < 8:
+            slot_binary = binary[y1:y2, x1:x2]
 
         slot_binary = PlateSegmenter._remove_char_border_fragments(slot_binary)
         return PlateSegmenter._resize_char_canvas(slot_binary)
+
+    @staticmethod
+    def _local_character_mask(slot_bgr, slot_gray):
+        if slot_gray.size == 0:
+            return np.zeros((64, 32), dtype=np.uint8)
+
+        if slot_bgr.ndim == 3 and slot_bgr.size:
+            hsv = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2HSV)
+            blue = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
+            green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
+            plate_color = cv2.bitwise_or(blue, green)
+            if np.mean(plate_color > 0) > 0.15:
+                white = cv2.inRange(hsv, np.array([0, 0, 80]), np.array([180, 160, 255]))
+                binary = cv2.bitwise_and(white, cv2.dilate(plate_color, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))))
+                if np.count_nonzero(binary) >= 8:
+                    return binary
+
+        blur = cv2.GaussianBlur(slot_gray, (3, 3), 0)
+        adaptive = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, -3)
+        otsu_threshold, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        binary = adaptive if np.count_nonzero(adaptive) > np.count_nonzero(otsu) * 0.55 else otsu
+        if np.mean(binary > 0) > 0.55:
+            binary = cv2.bitwise_not(binary)
+        return binary
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -827,10 +846,6 @@ class LPRPipeline:
             img = ArtificialPolluter.add_synthetic_dirt(img, num_spots=10)
 
         candidates = []
-        filename_plate = self._locate_from_ccpd_filename(img, source_path) if source_path else None
-        if filename_plate is not None:
-            candidates.append(("ccpd_filename", filename_plate))
-
         for score, box in self.detector.detect(img):
             plate_img = self._crop_detector_box(img, box)
             if plate_img is not None:
@@ -849,8 +864,8 @@ class LPRPipeline:
         bw, bh = x2 - x1, y2 - y1
         if bw <= 10 or bh <= 6:
             return None
-        pad_x = int(0.04 * bw)
-        pad_y = int(0.12 * bh)
+        pad_x = int(0.015 * bw)
+        pad_y = int(0.04 * bh)
         x1 = max(0, x1 - pad_x)
         y1 = max(0, y1 - pad_y)
         x2 = min(w, x2 + pad_x)
@@ -938,17 +953,15 @@ class LPRPipeline:
             return None
         stem = os.path.splitext(os.path.basename(path))[0]
         parts = stem.split("-")
-        if len(parts) < 4:
-            return None
-        try:
-            point_tokens = parts[3].split("_")
-            points = []
-            for token in point_tokens:
-                x_str, y_str = token.split("&")
-                points.append([float(x_str), float(y_str)])
-            if len(points) != 4:
-                return None
-        except Exception:
+        points = []
+        if len(parts) >= 4:
+            points = LPRPipeline._parse_coord_pairs(parts[3])
+        if len(points) < 4 and len(parts) >= 3:
+            bbox_points = LPRPipeline._parse_coord_pairs(parts[2])
+            if len(bbox_points) == 2:
+                (x1, y1), (x2, y2) = bbox_points
+                points = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        if len(points) < 4:
             return None
 
         pts = np.array(points, dtype="float32")
@@ -962,3 +975,10 @@ class LPRPipeline:
         dst = np.array([[0, 0], [399, 0], [399, 119], [0, 119]], dtype="float32")
         matrix = cv2.getPerspectiveTransform(ordered, dst)
         return cv2.warpPerspective(img, matrix, (400, 120))
+
+    @staticmethod
+    def _parse_coord_pairs(text):
+        return [
+            [float(x), float(y)]
+            for x, y in re.findall(r"(\d+(?:\.\d+)?)[&xX](\d+(?:\.\d+)?)", text)
+        ]

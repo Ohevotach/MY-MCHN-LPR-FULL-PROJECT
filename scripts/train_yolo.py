@@ -62,8 +62,8 @@ def check_yolo_dataset(yaml_path):
     print(f"Val images: {len(val_images)} ({val_dir})")
     if not train_images:
         raise SystemExit(
-            "YOLO train set is empty. Run ccpd_to_yolo_plate.py with --src ./data/full_cars, "
-            "or check configs/plate_detection.yaml path."
+            "YOLO train set is empty. Put ordinary YOLO images/labels under dataset/.../images/train "
+            "and dataset/.../labels/train, or check the config path."
         )
     if not val_images:
         raise SystemExit("YOLO val set is empty. Add validation images or lower --val-ratio conversion settings.")

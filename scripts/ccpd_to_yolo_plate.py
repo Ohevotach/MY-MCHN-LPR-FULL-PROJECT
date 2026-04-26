@@ -10,17 +10,37 @@ import cv2
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
-def parse_ccpd_box(path):
-    stem = Path(path).stem
-    points = [
+def parse_coord_pairs(text):
+    return [
         (float(x), float(y))
-        for x, y in re.findall(r"(\d+(?:\.\d+)?)[&xX](\d+(?:\.\d+)?)", stem)
+        for x, y in re.findall(r"(\d+(?:\.\d+)?)[&xX](\d+(?:\.\d+)?)", text)
     ]
-    if len(points) < 2:
-        return None
+
+
+def points_to_box(points):
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def parse_ccpd_box(path):
+    stem = Path(path).stem
+    parts = stem.split("-")
+
+    # CCPD-style names usually store the tight rectangle in field 2:
+    # area-tilt-x1&y1_x2&y2-corners-plate-...
+    if len(parts) >= 3:
+        bbox_points = parse_coord_pairs(parts[2])
+        if len(bbox_points) == 2:
+            return points_to_box(bbox_points)
+
+    # Some variants only keep four corner points. Use their enclosing box.
+    if len(parts) >= 4:
+        corner_points = parse_coord_pairs(parts[3])
+        if len(corner_points) >= 4:
+            return points_to_box(corner_points[:4])
+
+    return None
 
 
 def write_yolo_label(label_path, box, width, height):

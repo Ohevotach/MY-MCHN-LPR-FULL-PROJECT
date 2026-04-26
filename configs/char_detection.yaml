@@ -1,6 +1,7 @@
 # YOLO dataset config for character-box detection on rectified plate images.
-# The detector only finds character crops; Modern Hopfield still recognizes class.
-path: ./dataset/yolo_chars_synth
+# Use ordinary YOLO labels. The detector only finds character boxes;
+# Modern Hopfield still recognizes the character class.
+path: ./dataset/yolo_chars
 train: images/train
 val: images/val
 test: images/val

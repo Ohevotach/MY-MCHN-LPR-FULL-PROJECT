@@ -1,70 +1,94 @@
-# YOLO Training Guide
+# YOLO Two-Stage Training
 
-This project uses Modern Hopfield for character recognition. YOLO is only used to make the front end reliable:
-
-1. `plate detector`: finds the license plate box in the full car image.
-2. `character detector`: finds seven character boxes on a rectified plate.
-
-## Recommended Models
-
-- Use your `yolo11n.pt` as the starting model for plate detection.
-- Also use `yolo11n.pt` for character-box detection. This is a one-class detector named `plate_char`, not a recognizer.
-
-## Plate Detection Dataset
-
-YOLO labels need one box per image:
+The main pipeline is:
 
 ```text
-class cx cy w h
-0 0.512 0.733 0.312 0.098
+full image -> plate_yolo11n.pt -> plate crop -> char_yolo11n.pt -> character crops -> Modern Hopfield recognition
 ```
 
-For Kaggle, train the plate detector directly from `ccpd_base`:
+Do not rely on CCPD filenames for the main workflow. Use ordinary YOLO labels.
 
-```powershell
-python scripts\ccpd_to_yolo_plate.py --src .\data\full_cars\ccpd_base --out .\dataset\yolo_plate
+## 1. Prepare Plate Detection Data
+
+Create folders:
+
+```bash
+python scripts/prepare_yolo_dirs.py --out ./dataset/yolo_plate --task plate
 ```
 
-The converter supports both `293&441_482&543` and Kaggle-safe `293x441_482x543` filenames.
+Put your own full-car images and YOLO labels here:
 
-Then train:
-
-```powershell
-python scripts\train_yolo.py --model .\yolo11n.pt --data .\configs\plate_detection.yaml --epochs 100 --imgsz 640 --batch 16 --name plate_yolo11n
+```text
+dataset/yolo_plate/images/train/a.jpg
+dataset/yolo_plate/labels/train/a.txt
+dataset/yolo_plate/images/val/b.jpg
+dataset/yolo_plate/labels/val/b.txt
 ```
 
-After training, use the best checkpoint:
+Each label file contains one or more plate boxes:
 
-```powershell
-$env:PLATE_DETECTOR_WEIGHTS=".\runs\yolo\plate_yolo11n\weights\best.pt"
+```text
+0 cx cy w h
+```
+
+Class `0` means `license_plate`.
+
+## 2. Prepare Character Detection Data
+
+Create folders:
+
+```bash
+python scripts/prepare_yolo_dirs.py --out ./dataset/yolo_chars --task char
+```
+
+Use cropped/rectified plate images. Label every visible character box:
+
+```text
+dataset/yolo_chars/images/train/plate_001.jpg
+dataset/yolo_chars/labels/train/plate_001.txt
+```
+
+Each label line:
+
+```text
+0 cx cy w h
+```
+
+Class `0` means `plate_char`. Do not label the dot separator as a character.
+
+## 3. Train Separately
+
+```bash
+python scripts/train_yolo.py --model ./yolo11n.pt --data ./configs/plate_detection.yaml --epochs 80 --imgsz 640 --batch 16 --name plate_yolo11n
+```
+
+```bash
+python scripts/train_yolo.py --model ./yolo11n.pt --data ./configs/char_detection.yaml --epochs 80 --imgsz 416 --batch 16 --name char_yolo11n
+```
+
+Or train both:
+
+```bash
+python scripts/train_two_stage_yolo.py --model ./yolo11n.pt --batch 16
+```
+
+## 4. Run App
+
+```bash
+export PLATE_DETECTOR_WEIGHTS=./runs/yolo/plate_yolo11n/weights/best.pt
+export CHAR_DETECTOR_WEIGHTS=./runs/yolo/char_yolo11n/weights/best.pt
 python app.py
 ```
 
-## Character Box Dataset
+In Kaggle notebooks, use Python environment variables:
 
-The easiest first version is synthetic training from your existing character templates:
-
-```powershell
-python scripts\generate_synthetic_char_yolo.py --chars2 .\data\chars2 --chars-chinese .\data\charsChinese --out .\dataset\yolo_chars_synth --count 8000
+```python
+import os
+os.environ["PLATE_DETECTOR_WEIGHTS"] = "./runs/yolo/plate_yolo11n/weights/best.pt"
+os.environ["CHAR_DETECTOR_WEIGHTS"] = "./runs/yolo/char_yolo11n/weights/best.pt"
+!python app.py
 ```
 
-Train a one-class character detector:
+## Optional CCPD Helper
 
-```powershell
-python scripts\train_yolo.py --model .\yolo11n.pt --data .\configs\char_detection.yaml --epochs 80 --imgsz 416 --batch 32 --name char_yolo11n
-```
-
-Use the character detector in the app:
-
-```powershell
-$env:CHAR_DETECTOR_WEIGHTS=".\runs\yolo\char_yolo11n\weights\best.pt"
-python app.py
-```
-
-If `CHAR_DETECTOR_WEIGHTS` is not set, the app uses geometry-based slots on the rectified plate.
-
-## Practical Order
-
-1. Train plate detection first. This fixes most current errors.
-2. Keep geometry slot splitting as the first character segmentation method.
-3. Train character-box detection only if slot splitting still fails on tilted or badly cropped plates.
+`scripts/ccpd_to_yolo_plate.py` is only a helper for quickly producing plate boxes from CCPD-like filenames. The app and the normal training flow do not require CCPD.
