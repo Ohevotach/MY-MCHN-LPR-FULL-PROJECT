@@ -1421,6 +1421,7 @@ class LPRPipeline:
 
     def _detect_or_segment_chars(self, plate_img):
         detections = self.char_detector.detect(plate_img)
+<<<<<<< HEAD
         if detections:
             boxes = self._postprocess_char_detections(plate_img, detections)
             chars = self._crop_chars_from_detector_boxes(plate_img, boxes)
@@ -1646,6 +1647,30 @@ class LPRPipeline:
             chars.append(PlateSegmenter._resize_gray_char_canvas(gray, binary, deskew=True))
         return chars
 
+=======
+        if len(detections) >= 5:
+            chars = []
+            for _, box in sorted(detections, key=lambda item: item[1][0])[:7]:
+                x1, y1, x2, y2 = box
+                bw, bh = x2 - x1, y2 - y1
+                pad_x = max(1, int(0.08 * bw))
+                pad_y = max(1, int(0.08 * bh))
+                x1 = max(0, x1 - pad_x)
+                y1 = max(0, y1 - pad_y)
+                x2 = min(plate_img.shape[1], x2 + pad_x)
+                y2 = min(plate_img.shape[0], y2 + pad_y)
+                crop = plate_img[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+                binary = PlateSegmenter._local_character_mask(crop, gray)
+                binary = PlateSegmenter._clean_slot_character(binary)
+                chars.append(PlateSegmenter._resize_gray_char_canvas(gray, binary, deskew=True))
+            if len(chars) >= 5:
+                return chars
+        return self.segmenter.segment_characters(plate_img)
+
+>>>>>>> c66a10ec39239ddf869fae235afc9455b50b96ad
     @staticmethod
     def _locate_from_ccpd_filename(img, path):
         if not path:
