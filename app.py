@@ -36,7 +36,7 @@ def zh(text):
         "polluted": "\u6c61\u67d3\u540e\u5b57\u7b26",
         "matched": "\u5339\u914d\u8bb0\u5fc6\u6a21\u677f",
         "char_result": "\u5355\u5b57\u7b26\u8bc6\u522b\u7ed3\u679c",
-        "detector_hint": "\u53ef\u9009\uff1a\u8bbe\u7f6e PLATE_DETECTOR_WEIGHTS \u4e3a\u672c\u5730 YOLO/ONNX \u8f66\u724c\u68c0\u6d4b\u6743\u91cd\u540e\uff0c\u7cfb\u7edf\u4f1a\u4f18\u5148\u4f7f\u7528\u6a21\u578b\u5b9a\u4f4d\u3002",
+        "detector_hint": "\u4e3b\u8981\u4f7f\u7528 YOLO/ONNX \u8f66\u724c\u68c0\u6d4b\uff1a\u8bf7\u8bbe\u7f6e PLATE_DETECTOR_WEIGHTS \u4e3a\u672c\u5730\u8f66\u724c\u68c0\u6d4b\u6743\u91cd\u3002OpenCV \u989c\u8272/\u5f62\u6001\u5b66\u89c4\u5219\u9ed8\u8ba4\u5173\u95ed\uff0c\u4ec5\u5728 PLATE_OPENCV_FALLBACK=1 \u65f6\u4f5c\u4e3a\u5907\u9009\u589e\u5f3a\u3002",
     }
     return texts[text]
 
@@ -209,7 +209,7 @@ def collect_full_car_samples():
     return choices
 
 
-print("Loading MCHN memory and OpenCV LPR pipeline...")
+print("Loading MCHN memory and YOLO-first LPR pipeline...")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 loader = TemplateLoader(["./data/chars2", "./data/charsChinese"], img_size=(32, 64), cache_path=default_cache_path())
 if loader.memory_matrix.shape[0] == 0:
@@ -302,7 +302,7 @@ def predict_plate(image):
     img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     plate_img, chars = pipeline.process_image(img_bgr)
     if plate_img is None:
-        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002", None, pd.DataFrame(), []
+        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002\u8bf7\u786e\u8ba4 PLATE_DETECTOR_WEIGHTS \u5df2\u6307\u5411\u8bad\u7ec3\u597d\u7684 YOLO/ONNX \u8f66\u724c\u68c0\u6d4b\u6743\u91cd\uff1b\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", None, pd.DataFrame(), []
     if not chars:
         return "\u5b57\u7b26\u5207\u5272\u5931\u8d25\u3002", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
 
@@ -348,7 +348,7 @@ def predict_plate_from_sample(sample_rel_path):
 
     plate_img, chars = pipeline.process_image(path)
     if plate_img is None:
-        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
+        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002\u8bf7\u5148\u8bad\u7ec3\u5e76\u8bbe\u7f6e PLATE_DETECTOR_WEIGHTS\uff1b\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
     if not chars:
         return "\u5b57\u7b26\u5207\u5272\u5931\u8d25\u3002", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
 

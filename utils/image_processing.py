@@ -43,10 +43,9 @@ class ImageEnhancer:
 
 
 class PlateDetector:
-    """Optional model-based plate detector with OpenCV fallback.
+    """Model-based plate detector.
 
     Set PLATE_DETECTOR_WEIGHTS to a local YOLO/ONNX license-plate detector.
-    The project still runs without the detector package or weights.
     """
 
     def __init__(self, weights_path=None, conf=0.35):
@@ -56,6 +55,10 @@ class PlateDetector:
         self.model = None
         if self.weights_path and os.path.exists(self.weights_path):
             self._load_model(self.weights_path)
+
+    @property
+    def is_ready(self):
+        return self.model is not None
 
     def _load_model(self, weights_path):
         ext = os.path.splitext(weights_path)[1].lower()
@@ -872,7 +875,7 @@ class PlateSegmenter:
 
 
 class LPRPipeline:
-    def __init__(self, use_synthetic_pollution=False, detector_weights=None, char_detector_weights=None):
+    def __init__(self, use_synthetic_pollution=False, detector_weights=None, char_detector_weights=None, use_opencv_fallback=None):
         self.enhancer = ImageEnhancer()
         self.segmenter = PlateSegmenter()
         self.detector = PlateDetector(detector_weights)
@@ -881,6 +884,9 @@ class LPRPipeline:
             conf=float(os.environ.get("CHAR_DETECTOR_CONF", "0.25")),
         )
         self.use_synthetic_pollution = use_synthetic_pollution
+        if use_opencv_fallback is None:
+            use_opencv_fallback = os.environ.get("PLATE_OPENCV_FALLBACK", "0").lower() in {"1", "true", "yes", "on"}
+        self.use_opencv_fallback = bool(use_opencv_fallback)
 
     def process_image(self, img_path):
         if isinstance(img_path, str):
@@ -900,12 +906,13 @@ class LPRPipeline:
         for score, box in self.detector.detect(img):
             plate_img = self._crop_detector_box(img, box)
             if plate_img is not None:
-                candidates.append((f"detector_{score:.2f}", plate_img))
+                candidates.append({"source": "yolo", "name": f"detector_{score:.2f}", "plate": plate_img, "det_conf": score})
 
-        for variant_name, variant_img in self._preprocess_variants(img):
-            plate_img = self.segmenter.locate_plate(variant_img)
-            if plate_img is not None:
-                candidates.append((variant_name, plate_img))
+        if self.use_opencv_fallback and not candidates:
+            for variant_name, variant_img in self._preprocess_variants(img):
+                plate_img = self.segmenter.locate_plate(variant_img)
+                if plate_img is not None:
+                    candidates.append({"source": "opencv", "name": variant_name, "plate": plate_img, "det_conf": 0.0})
 
         return self._select_best_plate_result(candidates)
 
@@ -952,16 +959,22 @@ class LPRPipeline:
         best_score = -1.0
         best_plate = None
         best_chars = []
-        for _, plate_img in candidates:
+        for candidate in candidates:
+            plate_img = candidate["plate"]
+            source = candidate["source"]
             refined = PlateSegmenter._refine_plate_region(plate_img)
             if refined is not None:
                 plate_img = refined
             color_ratio = PlateSegmenter._plate_color_ratio(plate_img)
-            if color_ratio < 0.18:
+            if source != "yolo" and color_ratio < 0.18:
                 continue
             chars = self._detect_or_segment_chars(plate_img)
             score = self._plate_result_score(plate_img, chars)
-            if score < 0.18:
+            if source == "yolo":
+                score += 0.35 * float(candidate.get("det_conf", 0.0))
+                if color_ratio < 0.10:
+                    score *= 0.75
+            if score < (0.12 if source == "yolo" else 0.18):
                 continue
             if score > best_score:
                 best_score = score
