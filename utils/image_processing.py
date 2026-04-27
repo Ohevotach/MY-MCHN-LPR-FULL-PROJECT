@@ -134,8 +134,9 @@ class PlateDetector:
             try:
                 self.model = cv2.dnn.readNetFromONNX(weights_path)
                 self.backend = "onnx"
+                print(f"Loaded {self.role} ONNX detector weights: {weights_path}")
             except Exception as exc:
-                print(f"Warning: failed to load ONNX plate detector: {exc}")
+                print(f"Warning: failed to load ONNX {self.role} detector: {exc}")
             return
 
         try:
@@ -143,8 +144,9 @@ class PlateDetector:
 
             self.model = YOLO(weights_path)
             self.backend = "ultralytics"
+            print(f"Loaded {self.role} YOLO detector weights: {weights_path}")
         except Exception as exc:
-            print(f"Warning: failed to load YOLO plate detector: {exc}")
+            print(f"Warning: failed to load YOLO {self.role} detector: {exc}")
 
     def detect(self, img):
         if self.model is None:
@@ -345,6 +347,61 @@ class PlateSegmenter:
             return None
         return warped
 
+    @classmethod
+    def _rectify_plate_perspective(cls, plate_img):
+        if plate_img is None or plate_img.size == 0:
+            return plate_img
+        work = cv2.resize(plate_img, (cls.PLATE_W, cls.PLATE_H))
+        hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([88, 22, 18]), np.array([145, 255, 255]))
+        green = cv2.inRange(hsv, np.array([30, 22, 18]), np.array([98, 255, 255]))
+        mask = cv2.bitwise_or(blue, green)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (23, 7)), iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)), iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return work
+
+        best = None
+        best_area = 0.0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 0.10 * cls.PLATE_W * cls.PLATE_H:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            rw, rh = rect[1]
+            if rw <= 1 or rh <= 1:
+                continue
+            aspect = max(rw, rh) / max(1.0, min(rw, rh))
+            if not (2.2 <= aspect <= 6.8):
+                continue
+            if area > best_area:
+                best_area = area
+                best = rect
+        if best is None:
+            return work
+
+        box = cv2.boxPoints(best).astype("float32")
+        ordered = np.zeros((4, 2), dtype="float32")
+        s = box.sum(axis=1)
+        ordered[0] = box[np.argmin(s)]
+        ordered[2] = box[np.argmax(s)]
+        diff = np.diff(box, axis=1)
+        ordered[1] = box[np.argmin(diff)]
+        ordered[3] = box[np.argmax(diff)]
+
+        # Keep a little border so the first Chinese character and last character
+        # are not clipped after rectification.
+        center = ordered.mean(axis=0, keepdims=True)
+        expanded = center + (ordered - center) * np.array([[1.06, 1.16]], dtype="float32")
+        expanded[:, 0] = np.clip(expanded[:, 0], 0, cls.PLATE_W - 1)
+        expanded[:, 1] = np.clip(expanded[:, 1], 0, cls.PLATE_H - 1)
+        dst = np.array([[0, 0], [cls.PLATE_W - 1, 0], [cls.PLATE_W - 1, cls.PLATE_H - 1], [0, cls.PLATE_H - 1]], dtype="float32")
+        matrix = cv2.getPerspectiveTransform(expanded, dst)
+        rectified = cv2.warpPerspective(work, matrix, (cls.PLATE_W, cls.PLATE_H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        return rectified if rectified.size else work
+
     @staticmethod
     def _plate_color_ratio(plate_img):
         hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
@@ -478,7 +535,8 @@ class PlateSegmenter:
         if plate_img is None:
             return []
 
-        plate_img = self._tighten_plate_crop(self._deskew_plate(cv2.resize(plate_img, (self.PLATE_W, self.PLATE_H))))
+        plate_img = cv2.resize(plate_img, (self.PLATE_W, self.PLATE_H))
+        plate_img = self._tighten_plate_crop(self._deskew_plate(self._rectify_plate_perspective(plate_img)))
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = self._prepare_character_binary(self._make_character_mask(plate_img, gray))
@@ -549,10 +607,10 @@ class PlateSegmenter:
             if i == 2:
                 x += slot_w
                 continue
-            pad_ratio = 0.025 if char_position == 0 else 0.045 if char_position == 1 else 0.055
+            pad_ratio = 0.010 if char_position == 0 else 0.020 if char_position == 1 else 0.020 if char_position == 6 else 0.050
             pad = int(max(1, slot_w * pad_ratio))
-            extra_left = 3 if char_position == 0 else 1
-            extra_right = 2 if char_position in (0, 1, 6) else 1
+            extra_left = 5 if char_position == 0 else 3 if char_position in (1, 6) else 1
+            extra_right = 5 if char_position in (0, 1, 6) else 1
             x1 = int(round(x + pad - extra_left))
             x2 = int(round(x + slot_w - pad + extra_right))
             y1 = int(round(top + 0.01 * height))
@@ -1234,6 +1292,7 @@ class LPRPipeline:
         if crop.size == 0:
             return None
         resized = cv2.resize(crop, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+        resized = PlateSegmenter._rectify_plate_perspective(resized)
         refined = PlateSegmenter._refine_plate_region(resized)
         return refined if refined is not None else resized
 
