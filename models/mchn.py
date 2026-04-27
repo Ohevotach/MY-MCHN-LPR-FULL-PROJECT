@@ -48,9 +48,66 @@ class ModernHopfieldNetwork(nn.Module):
             std = x.std(dim=-1, keepdim=True).clamp_min(1e-6)
             binary = (x > mean + 0.15 * std).float()
             return binary - binary.mean(dim=-1, keepdim=True)
+        if self.feature_mode == "profile":
+            return self._profile_feature_transform(x)
         if self.feature_mode in {"shape", "hybrid", "hybrid_shape"}:
             return self._shape_feature_transform(x)
         raise ValueError(f"Unsupported feature_mode: {self.feature_mode}")
+
+    def _profile_feature_transform(self, x):
+        """Stroke-profile features for real plate fonts.
+
+        Pixel templates are sensitive to anti-aliasing, screws and tiny missing
+        strokes. These features emphasize coarse stroke layout: projections,
+        low-resolution occupancy, edge density and regional ink distribution.
+        """
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        img_h, img_w = self.image_shape
+        expected_dim = img_h * img_w
+        if x.shape[-1] != expected_dim:
+            return x
+
+        img = x.view(-1, 1, img_h, img_w).float()
+        mean = img.flatten(1).mean(dim=-1, keepdim=True).view(-1, 1, 1, 1)
+        std = img.flatten(1).std(dim=-1, keepdim=True).clamp_min(1e-6).view(-1, 1, 1, 1)
+        binary = (img > mean + 0.10 * std).float()
+        centered = (img - mean) / std
+
+        coarse = F.avg_pool2d(binary, kernel_size=(8, 4), stride=(8, 4)).flatten(1)
+        fine = F.avg_pool2d(binary, kernel_size=(4, 4), stride=(4, 4)).flatten(1)
+        row_profile = binary.mean(dim=3).flatten(1)
+        col_profile = binary.mean(dim=2).flatten(1)
+
+        left = binary[:, :, :, : img_w // 2].mean(dim=3).flatten(1)
+        right = binary[:, :, :, img_w // 2 :].mean(dim=3).flatten(1)
+        top = binary[:, :, : img_h // 2, :].mean(dim=2).flatten(1)
+        bottom = binary[:, :, img_h // 2 :, :].mean(dim=2).flatten(1)
+
+        sobel_x = binary.new_tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).view(1, 1, 3, 3)
+        sobel_y = binary.new_tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).view(1, 1, 3, 3)
+        edges = F.conv2d(binary, sobel_x, padding=1).abs() + F.conv2d(binary, sobel_y, padding=1).abs()
+        edge_coarse = F.avg_pool2d(edges, kernel_size=(8, 4), stride=(8, 4)).flatten(1)
+        gray_coarse = F.avg_pool2d(centered, kernel_size=(8, 4), stride=(8, 4)).flatten(1)
+        ink = binary.flatten(1).mean(dim=-1, keepdim=True)
+
+        return torch.cat(
+            [
+                1.30 * coarse,
+                0.75 * fine,
+                1.10 * row_profile,
+                1.10 * col_profile,
+                0.55 * left,
+                0.55 * right,
+                0.45 * top,
+                0.45 * bottom,
+                0.45 * edge_coarse,
+                0.25 * gray_coarse,
+                ink,
+            ],
+            dim=-1,
+        )
 
     def _shape_feature_transform(self, x):
         """Build pollution-tolerant features from a 64x32 character image.

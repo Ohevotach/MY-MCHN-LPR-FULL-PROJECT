@@ -1479,6 +1479,7 @@ class LPRPipeline:
 
         work = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
         work = PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(work)))
+        work = self._deskew_plate_text_band(work)
         gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(work, gray))
@@ -1493,6 +1494,41 @@ class LPRPipeline:
 
         chars = [PlateSegmenter._crop_slot_char(work, gray, binary, self._xyxy_to_xywh(box), idx) for idx, box in enumerate(boxes)]
         return chars
+
+    @staticmethod
+    def _deskew_plate_text_band(plate_img):
+        if plate_img is None or plate_img.size == 0:
+            return plate_img
+        work = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+        gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(work, gray))
+        roi = binary[16:106, 18:382]
+        ys, xs = np.where(roi > 0)
+        if len(xs) < 80 or len(ys) < 30:
+            return work
+        pts = np.column_stack([xs + 18, ys + 16]).astype(np.float32)
+        rect = cv2.minAreaRect(pts)
+        angle = rect[2]
+        rw, rh = rect[1]
+        if rw <= 1 or rh <= 1:
+            return work
+        if rw < rh:
+            angle += 90.0
+        if angle > 45.0:
+            angle -= 90.0
+        if angle < -45.0:
+            angle += 90.0
+        if abs(angle) < 1.2 or abs(angle) > 14.0:
+            return work
+        matrix = cv2.getRotationMatrix2D((PlateSegmenter.PLATE_W / 2.0, PlateSegmenter.PLATE_H / 2.0), angle, 1.0)
+        return cv2.warpAffine(
+            work,
+            matrix,
+            (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
 
     def _text_roi_from_detections_or_plate(self, plate_img, binary, detections):
         det_boxes = self._postprocess_char_detections(plate_img, detections)
@@ -1682,11 +1718,12 @@ class LPRPipeline:
             if slot_idx == 2:
                 x += slot_w
                 continue
-            pad = max(1.0, 0.05 * slot_w)
+            pad_ratio = 0.075 if slot_idx in (0, 1) else 0.090
+            pad = max(1.0, pad_ratio * slot_w)
             x1 = int(round(x + pad))
             x2 = int(round(x + slot_w - pad))
-            y1 = int(round(top + 0.02 * height))
-            y2 = int(round(bottom - 0.02 * height))
+            y1 = int(round(top + 0.055 * height))
+            y2 = int(round(bottom - 0.045 * height))
             boxes.append((
                 max(0, min(plate_width - 1, x1)),
                 max(0, min(plate_height - 1, y1)),

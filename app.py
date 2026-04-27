@@ -103,6 +103,8 @@ def build_hopfield_ensemble(memory, device):
         ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
         ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
         ModernHopfieldNetwork(memory, beta=55.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
+        ModernHopfieldNetwork(memory, beta=70.0, metric="dot", normalize=True, feature_mode="profile").to(device),
+        ModernHopfieldNetwork(memory, beta=7.0, metric="euclidean", normalize=False, feature_mode="profile").to(device),
     ]
 
 
