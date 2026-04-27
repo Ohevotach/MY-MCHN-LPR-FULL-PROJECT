@@ -25,6 +25,7 @@ def zh(text):
         "overall": "\u603b\u4f53\u8bc6\u522b\u7ed3\u679c",
         "plate_img": "\u8f66\u724c\u5b9a\u4f4d\u4e0e\u900f\u89c6\u77eb\u6b63",
         "char_gallery": "\u5b57\u7b26\u5207\u5272\u7ed3\u679c",
+        "debug_gallery": "MCHN \u5b9e\u9645\u8f93\u5165\u4e0e\u5339\u914d\u6a21\u677f",
         "char_table": "\u9010\u5b57\u7b26\u8bc6\u522b\u5206\u6790",
         "choose_class": "\u9009\u62e9\u5b57\u7b26\u7c7b\u522b",
         "choose_sample": "\u4ece\u6587\u4ef6\u5939\u9009\u62e9\u7070\u5ea6\u5b57\u7b26\u56fe",
@@ -320,7 +321,7 @@ pil_transform = transforms.Compose(
 )
 
 
-def recognize_tensor(tensor, template_mask=None):
+def recognize_tensor(tensor, template_mask=None, return_debug=False):
     if tensor.dim() == 2 and tensor.shape[-1] == 64 * 32:
         tensor_img = tensor.view(-1, 1, 64, 32)[0]
     elif tensor.dim() == 3:
@@ -345,16 +346,38 @@ def recognize_tensor(tensor, template_mask=None):
     template_sim = F.cosine_similarity(best_q, memory[best_template_idx].view(1, -1)).item()
     recon_sim = F.cosine_similarity(best_q, retrieved[variant_idx : variant_idx + 1]).item()
     top_text = format_top_predictions(pooled_scores)
+    if return_debug:
+        debug = {
+            "query": tensor_to_rgb_image(best_q.detach().cpu()),
+            "matched": tensor_to_rgb_image(memory[best_template_idx].detach().cpu()),
+            "variant_index": variant_idx,
+            "variant_count": int(q.shape[0]),
+        }
+        return class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug
     return class_idx, best_template_idx, prob, template_sim, recon_sim, top_text
 
 
-def format_top_predictions(scores, k=3):
+def format_top_predictions(scores, k=5):
     probs = torch.softmax(scores, dim=-1)
     values, indices = torch.topk(probs, k=min(k, probs.numel()))
     parts = []
     for value, idx in zip(values.tolist(), indices.tolist()):
         parts.append(f"{loader.idx_to_label[int(idx)]}:{value * 100:.1f}%")
     return " | ".join(parts)
+
+
+def compose_mchn_debug_image(segmented_img, query_img, matched_img):
+    def prepare(img):
+        if img is None:
+            return np.zeros((96, 48, 3), dtype=np.uint8)
+        arr = img.copy()
+        if arr.ndim == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+        return cv2.resize(arr, (48, 96), interpolation=cv2.INTER_NEAREST)
+
+    parts = [prepare(segmented_img), prepare(query_img), prepare(matched_img)]
+    sep = np.full((96, 4, 3), 230, dtype=np.uint8)
+    return np.hstack([parts[0], sep, parts[1], sep, parts[2]])
 
 
 def plate_position_mask(position):
@@ -384,83 +407,89 @@ def char_detector_status_message():
 
 def predict_plate(image):
     if image is None:
-        return "\u8bf7\u5148\u4e0a\u4f20\u56fe\u7247\u3002", None, pd.DataFrame(), []
+        return "\u8bf7\u5148\u4e0a\u4f20\u56fe\u7247\u3002", None, pd.DataFrame(), [], []
 
     img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     plate_img, chars = pipeline.process_image(img_bgr)
     if plate_img is None:
-        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002" + plate_detector_status_message() + "\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", None, pd.DataFrame(), []
+        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002" + plate_detector_status_message() + "\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", None, pd.DataFrame(), [], []
     if not chars:
-        return "\u5b57\u7b26\u5207\u5272\u5931\u8d25\u3002", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
+        return "\u5b57\u7b26\u5207\u5272\u5931\u8d25\u3002", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), [], []
 
     plate_text = ""
     rows = []
     char_images_display = [cv2.cvtColor(c, cv2.COLOR_GRAY2RGB) for c in chars]
+    debug_images = []
 
     for i, char_img in enumerate(chars):
         tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
         current_mask = plate_position_mask(i)
-        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text = recognize_tensor(tensor, current_mask)
+        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(tensor, current_mask, return_debug=True)
         char = loader.idx_to_label[class_idx]
         plate_text += char
         char_type = "\u6c49\u5b57" if "\u4e00" <= char <= "\u9fff" else ("\u6570\u5b57" if char.isdigit() else "\u5b57\u6bcd")
+        debug_images.append(compose_mchn_debug_image(char_images_display[i], debug["query"], debug["matched"]))
         rows.append(
             {
                 "\u4f4d\u7f6e": f"\u7b2c{i + 1}\u4f4d",
                 "\u7c7b\u578b": char_type,
                 "\u8bc6\u522b": char,
                 "\u7c7b\u522b\u7f6e\u4fe1\u5ea6": f"{prob * 100:.2f}%",
-                "\u5019\u9009Top3": top_text,
+                "\u5019\u9009Top5": top_text,
                 "\u6a21\u677f\u76f8\u4f3c\u5ea6": f"{template_sim * 100:.2f}%",
                 "\u91cd\u6784\u76f8\u4f3c\u5ea6": f"{recon_sim * 100:.2f}%",
+                "\u53d8\u4f53": f"{debug['variant_index'] + 1}/{debug['variant_count']}",
             }
         )
 
     if len(chars) != 7:
         plate_text += f"  (\u8b66\u544a: \u5f53\u524d\u5207\u51fa {len(chars)} \u4e2a\u5b57\u7b26)"
 
-    return f"\u6700\u7ec8\u8bc6\u522b: {plate_text}", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(rows), char_images_display
+    return f"\u6700\u7ec8\u8bc6\u522b: {plate_text}", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(rows), char_images_display, debug_images
 
 
 def predict_plate_from_sample(sample_rel_path):
     if not sample_rel_path:
-        return "\u8bf7\u5148\u9009\u62e9\u6837\u4f8b\u56fe\u7247\u3002", None, pd.DataFrame(), []
+        return "\u8bf7\u5148\u9009\u62e9\u6837\u4f8b\u56fe\u7247\u3002", None, pd.DataFrame(), [], []
     path_lookup = dict(full_car_samples)
     path = path_lookup.get(sample_rel_path)
     if not path or not os.path.exists(path):
-        return "\u627e\u4e0d\u5230\u9009\u4e2d\u7684\u6837\u4f8b\u56fe\u7247\u3002", None, pd.DataFrame(), []
+        return "\u627e\u4e0d\u5230\u9009\u4e2d\u7684\u6837\u4f8b\u56fe\u7247\u3002", None, pd.DataFrame(), [], []
     img_bgr = cv2.imread(path)
     if img_bgr is None:
-        return "\u56fe\u7247\u8bfb\u53d6\u5931\u8d25\u3002", None, pd.DataFrame(), []
+        return "\u56fe\u7247\u8bfb\u53d6\u5931\u8d25\u3002", None, pd.DataFrame(), [], []
 
     plate_img, chars = pipeline.process_image(path)
     if plate_img is None:
-        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002" + plate_detector_status_message() + "\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
+        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002" + plate_detector_status_message() + "\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), pd.DataFrame(), [], []
     if not chars:
-        return "\u5b57\u7b26\u5207\u5272\u5931\u8d25\u3002", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
+        return "\u5b57\u7b26\u5207\u5272\u5931\u8d25\u3002", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), [], []
 
     plate_text = ""
     rows = []
     gallery = [cv2.cvtColor(c, cv2.COLOR_GRAY2RGB) for c in chars]
+    debug_images = []
     for i, char_img in enumerate(chars):
         tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
         current_mask = plate_position_mask(i)
-        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text = recognize_tensor(tensor, current_mask)
+        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(tensor, current_mask, return_debug=True)
         char = loader.idx_to_label[class_idx]
         plate_text += char
         char_type = "\u6c49\u5b57" if "\u4e00" <= char <= "\u9fff" else ("\u6570\u5b57" if char.isdigit() else "\u5b57\u6bcd")
+        debug_images.append(compose_mchn_debug_image(gallery[i], debug["query"], debug["matched"]))
         rows.append(
             {
                 "\u4f4d\u7f6e": f"\u7b2c{i + 1}\u4f4d",
                 "\u7c7b\u578b": char_type,
                 "\u8bc6\u522b": char,
                 "\u7c7b\u522b\u7f6e\u4fe1\u5ea6": f"{prob * 100:.2f}%",
-                "\u5019\u9009Top3": top_text,
+                "\u5019\u9009Top5": top_text,
                 "\u6a21\u677f\u76f8\u4f3c\u5ea6": f"{template_sim * 100:.2f}%",
                 "\u91cd\u6784\u76f8\u4f3c\u5ea6": f"{recon_sim * 100:.2f}%",
+                "\u53d8\u4f53": f"{debug['variant_index'] + 1}/{debug['variant_count']}",
             }
         )
-    return f"\u6700\u7ec8\u8bc6\u522b: {plate_text}", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(rows), gallery
+    return f"\u6700\u7ec8\u8bc6\u522b: {plate_text}", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(rows), gallery, debug_images
 
 
 def update_sample_choices(class_label):
@@ -494,7 +523,7 @@ def run_single_char_test(class_label, sample_rel_path, pollution_type, severity,
                 "\u6c61\u67d3\u7c7b\u578b": pollution_type,
                 "\u6c61\u67d3\u5f3a\u5ea6": f"{float(severity):.2f}",
                 "\u7c7b\u522b\u7f6e\u4fe1\u5ea6": f"{prob * 100:.2f}%",
-                "\u5019\u9009Top3": top_text,
+                "\u5019\u9009Top5": top_text,
                 "\u6a21\u677f\u76f8\u4f3c\u5ea6": f"{template_sim * 100:.2f}%",
                 "\u91cd\u6784\u76f8\u4f3c\u5ea6": f"{recon_sim * 100:.2f}%",
             }
@@ -525,11 +554,12 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
                 img_out = gr.Image(label=zh("plate_img"))
                 char_gallery = gr.Gallery(label=zh("char_gallery"), show_label=True, columns=7, height=120, object_fit="contain")
         df_out = gr.Dataframe(
-            headers=["\u4f4d\u7f6e", "\u7c7b\u578b", "\u8bc6\u522b", "\u7c7b\u522b\u7f6e\u4fe1\u5ea6", "\u5019\u9009Top3", "\u6a21\u677f\u76f8\u4f3c\u5ea6", "\u91cd\u6784\u76f8\u4f3c\u5ea6"],
+            headers=["\u4f4d\u7f6e", "\u7c7b\u578b", "\u8bc6\u522b", "\u7c7b\u522b\u7f6e\u4fe1\u5ea6", "\u5019\u9009Top5", "\u6a21\u677f\u76f8\u4f3c\u5ea6", "\u91cd\u6784\u76f8\u4f3c\u5ea6", "\u53d8\u4f53"],
             label=zh("char_table"),
         )
-        btn.click(predict_plate, img_in, [txt_out, img_out, df_out, char_gallery])
-        sample_btn.click(predict_plate_from_sample, car_sample_dropdown, [txt_out, img_out, df_out, char_gallery])
+        debug_gallery = gr.Gallery(label=zh("debug_gallery"), show_label=True, columns=7, height=150, object_fit="contain")
+        btn.click(predict_plate, img_in, [txt_out, img_out, df_out, char_gallery, debug_gallery])
+        sample_btn.click(predict_plate_from_sample, car_sample_dropdown, [txt_out, img_out, df_out, char_gallery, debug_gallery])
 
     with gr.Tab(zh("char_tab")):
         with gr.Row():
@@ -552,7 +582,7 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
                     polluted_img = gr.Image(label=zh("polluted"))
                     matched_img = gr.Image(label=zh("matched"))
                 char_df = gr.Dataframe(
-                    headers=["\u771f\u5b9e\u7c7b\u522b", "\u9884\u6d4b\u7c7b\u522b", "\u6c61\u67d3\u7c7b\u578b", "\u6c61\u67d3\u5f3a\u5ea6", "\u7c7b\u522b\u7f6e\u4fe1\u5ea6", "\u5019\u9009Top3", "\u6a21\u677f\u76f8\u4f3c\u5ea6", "\u91cd\u6784\u76f8\u4f3c\u5ea6"]
+                    headers=["\u771f\u5b9e\u7c7b\u522b", "\u9884\u6d4b\u7c7b\u522b", "\u6c61\u67d3\u7c7b\u578b", "\u6c61\u67d3\u5f3a\u5ea6", "\u7c7b\u522b\u7f6e\u4fe1\u5ea6", "\u5019\u9009Top5", "\u6a21\u677f\u76f8\u4f3c\u5ea6", "\u91cd\u6784\u76f8\u4f3c\u5ea6"]
                 )
         class_dropdown.change(update_sample_choices, class_dropdown, sample_dropdown)
         char_btn.click(
