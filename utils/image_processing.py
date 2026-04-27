@@ -600,6 +600,10 @@ class PlateSegmenter:
         if slot_gray.size == 0:
             return np.zeros((64, 32), dtype=np.uint8)
 
+        candidates = []
+        gray = cv2.GaussianBlur(slot_gray, (3, 3), 0)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4)).apply(gray)
+
         if slot_bgr.ndim == 3 and slot_bgr.size:
             hsv = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2HSV)
             blue = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
@@ -607,26 +611,77 @@ class PlateSegmenter:
             plate_color = cv2.bitwise_or(blue, green)
             if np.mean(plate_color > 0) > 0.15:
                 h, s, v = cv2.split(hsv)
-                bright_cut = max(105, int(np.percentile(v[plate_color > 0], 72)))
-                white = ((v >= bright_cut) & (s <= 185)).astype(np.uint8) * 255
-                not_plate_blue = cv2.bitwise_not(cv2.erode(plate_color, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))))
-                white = cv2.bitwise_and(white, not_plate_blue)
+                bg_values = v[plate_color > 0]
+                bright_cut = max(85, int(np.percentile(bg_values, 58))) if bg_values.size else 110
+                loose_white = ((v >= bright_cut) & (s <= 235)).astype(np.uint8) * 255
+                strict_white = ((v >= max(100, bright_cut + 10)) & (s <= 190)).astype(np.uint8) * 255
+                candidates.extend([loose_white, strict_white])
 
-                adaptive = cv2.adaptiveThreshold(slot_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 17, -5)
-                adaptive = cv2.bitwise_and(adaptive, cv2.dilate(white, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))))
-                binary = cv2.bitwise_or(white, adaptive)
-                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
-                binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
-                if np.count_nonzero(binary) >= 8:
-                    return binary
+                expanded_white = cv2.dilate(loose_white, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+                adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 17, -2)
+                candidates.append(cv2.bitwise_and(adaptive, expanded_white))
 
-        blur = cv2.GaussianBlur(slot_gray, (3, 3), 0)
-        adaptive = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, -3)
-        otsu_threshold, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binary = adaptive if np.count_nonzero(adaptive) > np.count_nonzero(otsu) * 0.55 else otsu
-        if np.mean(binary > 0) > 0.55:
-            binary = cv2.bitwise_not(binary)
-        return binary
+        for block, c_value in ((15, -2), (19, 2), (23, 4)):
+            if min(clahe.shape[:2]) >= block:
+                candidates.append(cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, c_value))
+
+        _, otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        candidates.append(otsu)
+
+        kernel_w = max(5, (slot_gray.shape[1] // 3) | 1)
+        kernel_h = max(7, (slot_gray.shape[0] // 3) | 1)
+        top_hat = cv2.morphologyEx(clahe, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, kernel_h)))
+        if np.max(top_hat) > 0:
+            _, top_hat_binary = cv2.threshold(top_hat, max(8, int(np.percentile(top_hat, 82))), 255, cv2.THRESH_BINARY)
+            candidates.append(top_hat_binary)
+
+        return PlateSegmenter._select_best_slot_mask(candidates)
+
+    @staticmethod
+    def _select_best_slot_mask(candidates):
+        best_mask = None
+        best_score = -1.0
+        for mask in candidates:
+            if mask is None or mask.size == 0:
+                continue
+            current = mask.astype(np.uint8)
+            if np.mean(current > 0) > 0.62:
+                current = cv2.bitwise_not(current)
+            current = cv2.morphologyEx(current, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
+            ink = float(np.mean(current > 0))
+            if ink < 0.012 or ink > 0.72:
+                continue
+            if ink < 0.055:
+                current = cv2.dilate(current, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+            score = PlateSegmenter._slot_mask_score(current)
+            if score > best_score:
+                best_score = score
+                best_mask = current
+        if best_mask is None:
+            return np.zeros((64, 32), dtype=np.uint8)
+        return best_mask
+
+    @staticmethod
+    def _slot_mask_score(mask):
+        h_img, w_img = mask.shape[:2]
+        ink = float(np.mean(mask > 0))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return -1.0
+        boxes = [cv2.boundingRect(cnt) for cnt in contours]
+        areas = [max(1.0, cv2.contourArea(cnt)) for cnt in contours]
+        x1 = min(x for x, _, _, _ in boxes)
+        y1 = min(y for _, y, _, _ in boxes)
+        x2 = max(x + w for x, _, w, _ in boxes)
+        y2 = max(y + h for _, y, _, h in boxes)
+        bbox_w = x2 - x1
+        bbox_h = y2 - y1
+        height_score = min(bbox_h / max(1.0, 0.62 * h_img), 1.0)
+        width_score = 1.0 - min(abs((bbox_w / max(1, w_img)) - 0.46) / 0.48, 1.0)
+        ink_score = 1.0 - min(abs(ink - 0.22) / 0.24, 1.0)
+        component_penalty = min(max(0, len(contours) - 3) * 0.12, 0.45)
+        main_area_ratio = max(areas) / max(1.0, sum(areas))
+        return 0.34 * height_score + 0.24 * ink_score + 0.18 * width_score + 0.24 * main_area_ratio - component_penalty
 
     @staticmethod
     def _clean_slot_character(slot_binary):
