@@ -672,7 +672,7 @@ class PlateSegmenter:
 
         slot_binary = PlateSegmenter._clean_slot_character(slot_binary, position=position)
         slot_gray = gray[y1:y2, x1:x2]
-        return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary)
+        return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary, deskew=True)
 
     @staticmethod
     def _local_character_mask(slot_bgr, slot_gray):
@@ -1149,10 +1149,10 @@ class PlateSegmenter:
         y = (64 - new_h) // 2
         x = (32 - new_w) // 2
         canvas[y : y + new_h, x : x + new_w] = resized
-        return canvas
+        return PlateSegmenter._deskew_char_canvas(canvas)
 
     @staticmethod
-    def _resize_gray_char_canvas(gray_crop, mask=None):
+    def _resize_gray_char_canvas(gray_crop, mask=None, deskew=True):
         canvas = np.zeros((64, 32), dtype=np.uint8)
         if gray_crop is None or gray_crop.size == 0:
             return canvas
@@ -1177,6 +1177,61 @@ class PlateSegmenter:
         if crop.size == 0:
             return canvas
         crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask)
+        h, w = crop.shape[:2]
+        scale = min(26.0 / max(1, w), 56.0 / max(1, h))
+        new_w = max(1, min(30, int(round(w * scale))))
+        new_h = max(1, min(62, int(round(h * scale))))
+        resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        y = (64 - new_h) // 2
+        x = (32 - new_w) // 2
+        canvas[y : y + new_h, x : x + new_w] = resized
+        return PlateSegmenter._deskew_char_canvas(canvas) if deskew else canvas
+
+    @staticmethod
+    def _deskew_char_canvas(char_img):
+        if char_img is None or char_img.size == 0:
+            return char_img
+        img = char_img.copy()
+        if img.shape != (64, 32):
+            img = cv2.resize(img, (32, 64), interpolation=cv2.INTER_LINEAR)
+        threshold = max(8, int(np.mean(img) + 0.25 * np.std(img)))
+        binary = (img > threshold).astype(np.uint8) * 255
+        ys, xs = np.where(binary > 0)
+        if len(xs) < 12 or len(ys) < 12:
+            return img
+
+        coords = np.column_stack([xs, ys]).astype(np.float32)
+        rect = cv2.minAreaRect(coords)
+        rw, rh = rect[1]
+        if rw <= 1 or rh <= 1:
+            return img
+        angle = rect[2]
+        if rw > rh:
+            angle += 90.0
+        if angle > 45.0:
+            angle -= 90.0
+        if angle < -45.0:
+            angle += 90.0
+        if abs(angle) < 3.0 or abs(angle) > 24.0:
+            return img
+
+        matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
+        rotated = cv2.warpAffine(img, matrix, (32, 64), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return PlateSegmenter._recenter_char_canvas(rotated)
+
+    @staticmethod
+    def _recenter_char_canvas(char_img):
+        canvas = np.zeros((64, 32), dtype=np.uint8)
+        if char_img is None or char_img.size == 0:
+            return canvas
+        img = char_img if char_img.shape == (64, 32) else cv2.resize(char_img, (32, 64), interpolation=cv2.INTER_LINEAR)
+        threshold = max(8, int(np.mean(img) + 0.20 * np.std(img)))
+        ys, xs = np.where(img > threshold)
+        if len(xs) == 0 or len(ys) == 0:
+            return img
+        crop = img[max(0, ys.min() - 1) : min(64, ys.max() + 2), max(0, xs.min() - 1) : min(32, xs.max() + 2)]
+        if crop.size == 0:
+            return img
         h, w = crop.shape[:2]
         scale = min(26.0 / max(1, w), 56.0 / max(1, h))
         new_w = max(1, min(30, int(round(w * scale))))
@@ -1383,7 +1438,7 @@ class LPRPipeline:
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 binary = PlateSegmenter._local_character_mask(crop, gray)
                 binary = PlateSegmenter._clean_slot_character(binary)
-                chars.append(PlateSegmenter._resize_gray_char_canvas(gray, binary))
+                chars.append(PlateSegmenter._resize_gray_char_canvas(gray, binary, deskew=True))
             if len(chars) >= 5:
                 return chars
         return self.segmenter.segment_characters(plate_img)
