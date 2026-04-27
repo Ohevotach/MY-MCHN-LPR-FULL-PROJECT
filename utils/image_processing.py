@@ -1102,6 +1102,7 @@ class PlateSegmenter:
             gray_crop = cv2.cvtColor(gray_crop, cv2.COLOR_BGR2GRAY)
 
         crop = gray_crop.copy()
+        crop_mask = None
         if mask is not None and mask.size:
             mask = cv2.resize(mask.astype(np.uint8), (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
             ys, xs = np.where(mask > 0)
@@ -1113,10 +1114,11 @@ class PlateSegmenter:
                 y1 = max(0, int(ys.min()) - pad_y)
                 y2 = min(crop.shape[0], int(ys.max()) + pad_y + 1)
                 crop = crop[y1:y2, x1:x2]
+                crop_mask = mask[y1:y2, x1:x2]
 
         if crop.size == 0:
             return canvas
-        crop = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(crop)
+        crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask)
         h, w = crop.shape[:2]
         scale = min(26.0 / max(1, w), 56.0 / max(1, h))
         new_w = max(1, min(30, int(round(w * scale))))
@@ -1126,6 +1128,30 @@ class PlateSegmenter:
         x = (32 - new_w) // 2
         canvas[y : y + new_h, x : x + new_w] = resized
         return canvas
+
+    @staticmethod
+    def _foreground_gray_signal(gray_crop, mask=None):
+        if gray_crop.size == 0:
+            return gray_crop
+        enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray_crop)
+        base = enhanced.astype(np.float32)
+        if mask is not None and mask.size:
+            mask = cv2.resize(mask.astype(np.uint8), (enhanced.shape[1], enhanced.shape[0]), interpolation=cv2.INTER_NEAREST)
+            dilated = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+            bg_pixels = enhanced[dilated == 0]
+            background = float(np.percentile(bg_pixels, 65)) if bg_pixels.size else float(np.percentile(enhanced, 35))
+            signal = np.clip(base - background + 18.0, 0, 255)
+            if 0.01 <= float(np.mean(dilated > 0)) <= 0.75:
+                signal[dilated == 0] = 0
+        else:
+            background = float(np.percentile(enhanced, 45))
+            signal = np.clip(base - background + 12.0, 0, 255)
+
+        max_value = float(np.max(signal))
+        if max_value > 1:
+            signal = signal * (255.0 / max_value)
+        signal = cv2.morphologyEx(signal.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+        return signal
 
     @staticmethod
     def _trim_sparse_borders(crop):
