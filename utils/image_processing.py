@@ -528,20 +528,25 @@ class PlateSegmenter:
         unit = width / float(ratios.sum())
         x = float(left)
         boxes = []
+        char_position = 0
         for i, ratio in enumerate(ratios):
             slot_w = unit * float(ratio)
             if i == 2:
                 x += slot_w
                 continue
-            pad = int(max(2, slot_w * 0.10))
-            x1 = int(round(x + pad))
-            x2 = int(round(x + slot_w - pad))
-            y1 = int(round(top + 0.04 * height))
-            y2 = int(round(bottom - 0.04 * height))
+            pad_ratio = 0.025 if char_position == 0 else 0.045 if char_position == 1 else 0.055
+            pad = int(max(1, slot_w * pad_ratio))
+            extra_left = 3 if char_position == 0 else 1
+            extra_right = 2 if char_position in (0, 1, 6) else 1
+            x1 = int(round(x + pad - extra_left))
+            x2 = int(round(x + slot_w - pad + extra_right))
+            y1 = int(round(top + 0.01 * height))
+            y2 = int(round(bottom - 0.01 * height))
             boxes.append((max(0, x1), max(0, y1), max(4, x2 - x1), max(8, y2 - y1)))
+            char_position += 1
             x += slot_w
 
-        chars = [self._crop_slot_char(plate_img, gray, binary, box) for box in boxes]
+        chars = [self._crop_slot_char(plate_img, gray, binary, box, idx) for idx, box in enumerate(boxes)]
         return chars, boxes
 
     @classmethod
@@ -581,7 +586,7 @@ class PlateSegmenter:
         return left, top, right, bottom
 
     @staticmethod
-    def _crop_slot_char(plate_img, gray, binary, box):
+    def _crop_slot_char(plate_img, gray, binary, box, position=None):
         x, y, w, h = box
         x1, y1 = max(0, x), max(0, y)
         x2, y2 = min(binary.shape[1], x + w), min(binary.shape[0], y + h)
@@ -592,7 +597,7 @@ class PlateSegmenter:
         if int(np.count_nonzero(slot_binary)) < 8:
             slot_binary = binary[y1:y2, x1:x2]
 
-        slot_binary = PlateSegmenter._clean_slot_character(slot_binary)
+        slot_binary = PlateSegmenter._clean_slot_character(slot_binary, position=position)
         return PlateSegmenter._resize_char_canvas(slot_binary)
 
     @staticmethod
@@ -684,7 +689,7 @@ class PlateSegmenter:
         return 0.34 * height_score + 0.24 * ink_score + 0.18 * width_score + 0.24 * main_area_ratio - component_penalty
 
     @staticmethod
-    def _clean_slot_character(slot_binary):
+    def _clean_slot_character(slot_binary, position=None):
         if slot_binary.size == 0:
             return slot_binary
         cleaned = slot_binary.copy()
@@ -693,6 +698,7 @@ class PlateSegmenter:
         cleaned[:, :1] = 0
         cleaned[:, -1:] = 0
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
+        cleaned = PlateSegmenter._remove_slot_border_lines(cleaned)
 
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -700,29 +706,44 @@ class PlateSegmenter:
 
         h_img, w_img = cleaned.shape[:2]
         kept = np.zeros_like(cleaned)
-        min_area = max(6, int(0.012 * h_img * w_img))
+        min_area = max(4, int(0.006 * h_img * w_img)) if position == 0 else max(5, int(0.009 * h_img * w_img))
         center_x = w_img / 2.0
         scored = []
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             area = cv2.contourArea(cnt)
-            if area < min_area and h < 0.24 * h_img:
+            if area < min_area and h < 0.18 * h_img:
                 continue
             if w >= 0.85 * w_img and h <= 0.10 * h_img:
                 continue
             if h >= 0.90 * h_img and w <= 0.08 * w_img:
                 continue
+            if (x <= 1 or x + w >= w_img - 1) and h < 0.30 * h_img and area < 2.4 * min_area:
+                continue
             cx = x + w / 2.0
             center_score = 1.0 - min(abs(cx - center_x) / max(center_x, 1.0), 1.0)
             height_score = min(h / max(1.0, 0.62 * h_img), 1.0)
-            scored.append((area + 35.0 * center_score + 25.0 * height_score, cnt))
+            scored.append((area + 30.0 * center_score + 30.0 * height_score, cnt, (x, y, w, h)))
 
         if not scored:
             return cleaned
         scored.sort(key=lambda item: item[0], reverse=True)
-        for _, cnt in scored[:4]:
+        keep_limit = 10 if position == 0 else 6
+        for _, cnt, _ in scored[:keep_limit]:
             cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
+        if np.count_nonzero(kept) < 0.45 * np.count_nonzero(cleaned):
+            return cleaned
         return kept
+
+    @staticmethod
+    def _remove_slot_border_lines(mask):
+        if mask.size == 0:
+            return mask
+        cleaned = mask.copy()
+        horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, cleaned.shape[1] // 2), 1)))
+        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, int(cleaned.shape[0] * 0.82)))))
+        lines = cv2.bitwise_or(horizontal, vertical)
+        return cv2.bitwise_and(cleaned, cv2.bitwise_not(lines))
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -1043,6 +1064,7 @@ class PlateSegmenter:
         canvas = np.zeros((64, 32), dtype=np.uint8)
         if crop.size == 0:
             return canvas
+        crop = PlateSegmenter._trim_sparse_borders(crop)
         h, w = crop.shape[:2]
         scale = min(26.0 / max(1, w), 56.0 / max(1, h))
         new_w = max(1, min(30, int(round(w * scale))))
@@ -1052,6 +1074,27 @@ class PlateSegmenter:
         x = (32 - new_w) // 2
         canvas[y : y + new_h, x : x + new_w] = resized
         return canvas
+
+    @staticmethod
+    def _trim_sparse_borders(crop):
+        if crop.size == 0:
+            return crop
+        work = crop.copy()
+        h, w = work.shape[:2]
+        if h < 4 or w < 3:
+            return work
+        col_sum = (work > 0).sum(axis=0)
+        row_sum = (work > 0).sum(axis=1)
+        active_cols = np.where(col_sum > max(1, 0.05 * h))[0]
+        active_rows = np.where(row_sum > max(1, 0.04 * w))[0]
+        if len(active_cols) == 0 or len(active_rows) == 0:
+            return work
+        x1 = max(0, int(active_cols[0]) - 1)
+        x2 = min(w, int(active_cols[-1]) + 2)
+        y1 = max(0, int(active_rows[0]) - 1)
+        y2 = min(h, int(active_rows[-1]) + 2)
+        trimmed = work[y1:y2, x1:x2]
+        return trimmed if trimmed.size else work
 
 
 class LPRPipeline:
