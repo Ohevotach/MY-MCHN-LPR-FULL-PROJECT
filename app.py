@@ -70,6 +70,7 @@ def build_template_masks(loader, num_templates, device):
             letter_mask[idx] = True
         elif label.isdigit() and len(label) == 1:
             digit_mask[idx] = True
+    alnum_mask = letter_mask | digit_mask
     return chinese_mask, alnum_mask, letter_mask, digit_mask
 
 
@@ -95,7 +96,7 @@ def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, tem
         if count == 0:
             scores.append(scaled.new_full((scaled.shape[0],), -1e9))
         else:
-            scores.append(torch.logsumexp(scaled[:, class_mask], dim=-1) - torch.log(scaled.new_tensor(float(count))))
+            scores.append(torch.max(scaled[:, class_mask], dim=-1).values)
     return torch.stack(scores, dim=-1)
 
 

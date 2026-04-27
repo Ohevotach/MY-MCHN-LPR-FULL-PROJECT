@@ -96,7 +96,7 @@ def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, tem
         if count == 0:
             scores.append(scaled.new_full((scaled.shape[0],), -1e9))
             continue
-        score = torch.logsumexp(scaled[:, class_mask], dim=-1) - torch.log(scaled.new_tensor(float(count)))
+        score = torch.max(scaled[:, class_mask], dim=-1).values
         scores.append(score)
     return torch.stack(scores, dim=-1)
 
