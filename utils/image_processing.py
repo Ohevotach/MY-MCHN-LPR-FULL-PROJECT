@@ -714,9 +714,9 @@ class PlateSegmenter:
             area = cv2.contourArea(cnt)
             if area < min_area and h < 0.18 * h_img:
                 continue
-            if w >= 0.85 * w_img and h <= 0.10 * h_img:
+            if w >= 0.85 * w_img and h <= 0.10 * h_img and (y <= 2 or y + h >= h_img - 2):
                 continue
-            if h >= 0.90 * h_img and w <= 0.08 * w_img:
+            if h >= 0.94 * h_img and w <= 0.055 * w_img and (x <= 1 or x + w >= w_img - 1):
                 continue
             if (x <= 1 or x + w >= w_img - 1) and h < 0.30 * h_img and area < 2.4 * min_area:
                 continue
@@ -740,10 +740,12 @@ class PlateSegmenter:
         if mask.size == 0:
             return mask
         cleaned = mask.copy()
-        horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, cleaned.shape[1] // 2), 1)))
-        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, int(cleaned.shape[0] * 0.82)))))
-        lines = cv2.bitwise_or(horizontal, vertical)
-        return cv2.bitwise_and(cleaned, cv2.bitwise_not(lines))
+        horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(cleaned.shape[1] * 0.72)), 1)))
+        edge_mask = np.zeros_like(cleaned)
+        edge_mask[:3, :] = 255
+        edge_mask[-3:, :] = 255
+        edge_lines = cv2.bitwise_and(horizontal, edge_mask)
+        return cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
