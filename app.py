@@ -204,6 +204,7 @@ def normalize_char_image(arr):
     _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(binary > 0) > 0.55:
         binary = cv2.bitwise_not(binary)
+    binary = _strip_character_frame_lines(binary)
 
     ys, xs = np.where(binary > 0)
     if len(xs) < 6 or len(ys) < 6:
@@ -238,6 +239,40 @@ def normalize_char_image(arr):
     x = (32 - new_w) // 2
     canvas[y : y + new_h, x : x + new_w] = resized
     return canvas
+
+
+def _strip_character_frame_lines(binary):
+    work = (binary > 0).astype(np.uint8) * 255
+    if work.shape != (64, 32):
+        work = cv2.resize(work, (32, 64), interpolation=cv2.INTER_NEAREST)
+
+    cleaned = work.copy()
+    h_img, w_img = cleaned.shape[:2]
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = cv2.contourArea(cnt)
+        near_side = x <= 2 or x + w >= w_img - 2
+        near_top_bottom = y <= 2 or y + h >= h_img - 2
+        if near_side and h >= 0.42 * h_img and w <= 0.16 * w_img:
+            cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+        elif near_top_bottom and w >= 0.55 * w_img and h <= 0.12 * h_img:
+            cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+        elif (near_side or near_top_bottom) and area < 0.010 * h_img * w_img:
+            cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+
+    vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30)))
+    side_mask = np.zeros_like(cleaned)
+    side_mask[:, :3] = 255
+    side_mask[:, -3:] = 255
+    cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(cv2.bitwise_and(vertical, side_mask)))
+
+    horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (18, 1)))
+    edge_mask = np.zeros_like(cleaned)
+    edge_mask[:3, :] = 255
+    edge_mask[-3:, :] = 255
+    cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(cv2.bitwise_and(horizontal, edge_mask)))
+    return cleaned
 
 
 def affine_char_variants(tensor):
@@ -284,6 +319,7 @@ def robust_char_query_variants(tensor_img):
     variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_OPEN, kernels[0])))
     variants.append(normalize_char_image(cv2.medianBlur(otsu, 3)))
     variants.append(normalize_char_image(_keep_likely_character_components(otsu)))
+    variants.append(normalize_char_image(_strip_character_frame_lines(otsu)))
 
     unique = []
     seen = set()

@@ -1530,7 +1530,11 @@ class LPRPipeline:
         if not candidates:
             return []
 
-        best_name, best_chars = max(candidates, key=lambda item: self._char_sequence_score(item[1]))
+        source_bias = {"layout": 0.45, "detector": -0.25, "opencv": 0.00, "opencv_partial": -0.25}
+        best_name, best_chars = max(
+            candidates,
+            key=lambda item: self._char_sequence_score(item[1]) + source_bias.get(item[0], 0.0),
+        )
         return best_chars
 
     @staticmethod
@@ -1571,6 +1575,10 @@ class LPRPipeline:
             side_cut_penalty = min(max(left_touch, right_touch) / 0.18, 1.0) * (0.28 if idx > 0 else 0.16)
             vertical_cut_penalty = min(max(top_touch, bottom_touch) / 0.18, 1.0) * 0.16
             too_narrow_penalty = 0.24 if idx > 0 and w < 0.28 * 32 else 0.0
+            if idx == 1 and (w < 0.34 * 32 or h < 0.48 * 64):
+                too_narrow_penalty += 0.35
+            if 2 <= idx <= 6 and (w < 0.22 * 32 or h < 0.42 * 64):
+                too_narrow_penalty += 0.28
             crop_scores.append(
                 0.30 * ink_score
                 + 0.27 * height_score
@@ -1602,16 +1610,44 @@ class LPRPipeline:
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(work, gray))
 
-        roi = self._text_roi_from_detections_or_plate(work, binary, detections)
-        if roi is None:
-            return []
-        left, top, right, bottom = roi
-        boxes = self._license_plate_layout_boxes(left, top, right, bottom, PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H)
-        if len(boxes) != 7:
-            return []
+        rois = []
+        for roi in (
+            self._text_roi_from_detections_or_plate(work, binary, detections),
+            PlateSegmenter._estimate_plate_text_roi(work, binary),
+            self._canonical_text_roi_from_binary(binary),
+        ):
+            if roi is None:
+                continue
+            if roi not in rois:
+                rois.append(roi)
 
-        chars = [PlateSegmenter._crop_slot_char(work, gray, binary, self._xyxy_to_xywh(box), idx) for idx, box in enumerate(boxes)]
-        return chars
+        best_chars = []
+        best_score = -1.0
+        for roi in rois:
+            left, top, right, bottom = roi
+            boxes = self._license_plate_layout_boxes(left, top, right, bottom, PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H)
+            if len(boxes) != 7:
+                continue
+            chars = [PlateSegmenter._crop_slot_char(work, gray, binary, self._xyxy_to_xywh(box), idx) for idx, box in enumerate(boxes)]
+            score = self._char_sequence_score(chars)
+            if score > best_score:
+                best_score = score
+                best_chars = chars
+        return best_chars
+
+    @staticmethod
+    def _canonical_text_roi_from_binary(binary):
+        rows = np.where((binary[:, 18:382] > 0).sum(axis=1) > 2)[0]
+        if len(rows) >= 18:
+            top = max(14, int(rows[0]) - 5)
+            bottom = min(108, int(rows[-1]) + 6)
+            if bottom - top < 56:
+                center = (top + bottom) // 2
+                top = max(14, center - 38)
+                bottom = min(108, center + 38)
+        else:
+            top, bottom = 18, 104
+        return 18, top, 382, bottom
 
     def _rectify_text_band_from_detections(self, plate_img, detections):
         if plate_img is None or plate_img.size == 0 or len(detections) < 4:
@@ -1724,6 +1760,7 @@ class LPRPipeline:
             normalized.append((float(conf), (x1, y1, x2, y2)))
 
         normalized = self._nms_char_boxes(normalized, iou_threshold=0.35)
+        normalized = self._remove_separator_like_detections(normalized, w_img)
         if len(normalized) > 7:
             normalized = self._choose_best_char_sequence(normalized, w_img)
 
@@ -1731,6 +1768,43 @@ class LPRPipeline:
         if len(boxes) < 7 and len(boxes) >= 4:
             boxes = self._complete_char_boxes_from_layout(boxes, plate_img)
         return boxes[:7]
+
+    @staticmethod
+    def _remove_separator_like_detections(detections, plate_width):
+        if len(detections) <= 7:
+            ordered = sorted(detections, key=lambda item: (item[1][0] + item[1][2]) / 2.0)
+        else:
+            ordered = sorted(detections, key=lambda item: (item[1][0] + item[1][2]) / 2.0)
+        if len(ordered) < 7:
+            return ordered
+
+        widths = np.array([box[2] - box[0] for _, box in ordered], dtype=np.float32)
+        heights = np.array([box[3] - box[1] for _, box in ordered], dtype=np.float32)
+        areas = widths * heights
+        median_h = float(np.median(heights))
+        median_area = float(np.median(areas))
+        if median_h <= 1 or median_area <= 1:
+            return ordered
+
+        cleaned = []
+        removed = 0
+        for idx, item in enumerate(ordered):
+            _, box = item
+            x1, y1, x2, y2 = box
+            bw = x2 - x1
+            bh = y2 - y1
+            area = bw * bh
+            cx = (x1 + x2) / 2.0
+            early_plate = cx < 0.48 * plate_width
+            separator_like = early_plate and idx >= 1 and (
+                bh < 0.56 * median_h or area < 0.36 * median_area or bw < 0.40 * float(np.median(widths))
+            )
+            if separator_like and removed < 2:
+                removed += 1
+                continue
+            cleaned.append(item)
+
+        return cleaned if len(cleaned) >= 4 else ordered
 
     @staticmethod
     def _nms_char_boxes(detections, iou_threshold=0.35):
