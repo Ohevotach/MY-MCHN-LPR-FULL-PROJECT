@@ -49,16 +49,69 @@ class PlateDetector:
     """
 
     def __init__(self, weights_path=None, conf=0.35):
-        self.weights_path = weights_path or os.environ.get("PLATE_DETECTOR_WEIGHTS")
+        self.weights_path = self._resolve_weights_path(weights_path or os.environ.get("PLATE_DETECTOR_WEIGHTS"))
+        if not self.weights_path:
+            self.weights_path = self._find_default_weights()
         self.conf = float(os.environ.get("PLATE_DETECTOR_CONF", conf))
         self.backend = None
         self.model = None
         if self.weights_path and os.path.exists(self.weights_path):
             self._load_model(self.weights_path)
+        elif self.weights_path:
+            print(f"Warning: plate detector weights not found: {self.weights_path}")
+        else:
+            print("Warning: no plate detector weights found. Set PLATE_DETECTOR_WEIGHTS or train a YOLO plate detector.")
 
     @property
     def is_ready(self):
         return self.model is not None
+
+    @staticmethod
+    def _resolve_weights_path(path):
+        if not path:
+            return None
+        path = os.path.expanduser(str(path).strip().strip('"').strip("'"))
+        if os.path.isfile(path):
+            return path
+        if os.path.isdir(path):
+            best_path = os.path.join(path, "best.pt")
+            if os.path.isfile(best_path):
+                return best_path
+        if os.path.basename(path).lower() in {"weights", "weightst"}:
+            best_path = os.path.join(os.path.dirname(path), "weights", "best.pt")
+            if os.path.isfile(best_path):
+                return best_path
+        if not os.path.splitext(path)[1]:
+            best_path = os.path.join(path, "weights", "best.pt")
+            if os.path.isfile(best_path):
+                return best_path
+        return path
+
+    @staticmethod
+    def _find_default_weights():
+        candidates = [
+            "./runs/yolo/plate_yolo11n_ccpd_base/weights/best.pt",
+            "./runs/yolo/plate_yolo11n/weights/best.pt",
+            "./runs/detect/plate_yolo11n_ccpd_base/weights/best.pt",
+            "./runs/detect/plate_yolo11n/weights/best.pt",
+            "./runs/detect/train/weights/best.pt",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                print(f"Auto-loaded plate detector weights: {path}")
+                return path
+        for root in ("./runs/yolo", "./runs/detect"):
+            if not os.path.exists(root):
+                continue
+            matches = []
+            for current_root, _, files in os.walk(root):
+                if "best.pt" in files:
+                    matches.append(os.path.join(current_root, "best.pt"))
+            if matches:
+                matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                print(f"Auto-loaded latest plate detector weights: {matches[0]}")
+                return matches[0]
+        return None
 
     def _load_model(self, weights_path):
         ext = os.path.splitext(weights_path)[1].lower()
@@ -417,8 +470,8 @@ class PlateSegmenter:
 
         candidates = []
         geometric_chars, geometric_boxes = self._segment_by_plate_geometry(plate_img, gray, binary)
-        if geometric_chars:
-            candidates.append(("geometry", geometric_boxes, geometric_chars))
+        if self._is_usable_char_sequence(geometric_chars):
+            return geometric_chars[:7]
 
         contour_boxes = self._find_contour_boxes(binary)
         if contour_boxes:
@@ -431,6 +484,8 @@ class PlateSegmenter:
         fixed_chars = self._segment_by_fixed_slots(gray, binary, char_count=7)
         if fixed_chars:
             candidates.append(("fixed", [], fixed_chars))
+        if geometric_chars:
+            candidates.append(("geometry", geometric_boxes, geometric_chars))
 
         if not candidates:
             return []
@@ -443,6 +498,19 @@ class PlateSegmenter:
                 best_score = score
                 best_chars = chars
         return best_chars
+
+    @staticmethod
+    def _is_usable_char_sequence(chars):
+        if len(chars) != 7:
+            return False
+        usable = 0
+        for char_img in chars:
+            if char_img is None or char_img.size == 0:
+                continue
+            ink = float(np.mean(char_img > 0))
+            if 0.015 <= ink <= 0.65:
+                usable += 1
+        return usable >= 6
 
     def _segment_by_plate_geometry(self, plate_img, gray, binary):
         roi = self._estimate_plate_text_roi(plate_img, binary)
@@ -492,15 +560,24 @@ class PlateSegmenter:
         if len(rows) < 20 or len(cols) < 120:
             return None
 
-        left = max(10, int(cols[0]) + 5)
-        right = min(cls.PLATE_W - 10, int(cols[-1]) - 5)
-        top = max(14, int(rows[0]) + 8)
-        bottom = min(cls.PLATE_H - 8, int(rows[-1]) - 6)
+        left = max(12, int(cols[0]) + 3)
+        right = min(cls.PLATE_W - 12, int(cols[-1]) - 3)
+        top = max(16, int(rows[0]) + 6)
+        bottom = min(cls.PLATE_H - 8, int(rows[-1]) - 5)
 
         char_rows = np.where((binary[:, left:right] > 0).sum(axis=1) > 3)[0]
         if len(char_rows) >= 20:
-            top = max(top, int(char_rows[0]) - 4)
-            bottom = min(bottom, int(char_rows[-1]) + 5)
+            candidate_top = max(14, int(char_rows[0]) - 5)
+            candidate_bottom = min(cls.PLATE_H - 7, int(char_rows[-1]) + 6)
+            if candidate_bottom - candidate_top >= 42:
+                top, bottom = candidate_top, candidate_bottom
+
+        if right - left < 300:
+            left, right = 18, 382
+        if bottom - top < 56:
+            center = (top + bottom) // 2
+            top = max(14, center - 38)
+            bottom = min(cls.PLATE_H - 7, center + 38)
         return left, top, right, bottom
 
     @staticmethod
@@ -515,7 +592,7 @@ class PlateSegmenter:
         if int(np.count_nonzero(slot_binary)) < 8:
             slot_binary = binary[y1:y2, x1:x2]
 
-        slot_binary = PlateSegmenter._remove_char_border_fragments(slot_binary)
+        slot_binary = PlateSegmenter._clean_slot_character(slot_binary)
         return PlateSegmenter._resize_char_canvas(slot_binary)
 
     @staticmethod
@@ -529,9 +606,16 @@ class PlateSegmenter:
             green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
             plate_color = cv2.bitwise_or(blue, green)
             if np.mean(plate_color > 0) > 0.15:
-                white = cv2.inRange(hsv, np.array([0, 0, 75]), np.array([180, 170, 255]))
-                adaptive = cv2.adaptiveThreshold(slot_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, -4)
+                h, s, v = cv2.split(hsv)
+                bright_cut = max(105, int(np.percentile(v[plate_color > 0], 72)))
+                white = ((v >= bright_cut) & (s <= 185)).astype(np.uint8) * 255
+                not_plate_blue = cv2.bitwise_not(cv2.erode(plate_color, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))))
+                white = cv2.bitwise_and(white, not_plate_blue)
+
+                adaptive = cv2.adaptiveThreshold(slot_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 17, -5)
+                adaptive = cv2.bitwise_and(adaptive, cv2.dilate(white, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))))
                 binary = cv2.bitwise_or(white, adaptive)
+                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
                 binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
                 if np.count_nonzero(binary) >= 8:
                     return binary
@@ -543,6 +627,47 @@ class PlateSegmenter:
         if np.mean(binary > 0) > 0.55:
             binary = cv2.bitwise_not(binary)
         return binary
+
+    @staticmethod
+    def _clean_slot_character(slot_binary):
+        if slot_binary.size == 0:
+            return slot_binary
+        cleaned = slot_binary.copy()
+        cleaned[:1, :] = 0
+        cleaned[-1:, :] = 0
+        cleaned[:, :1] = 0
+        cleaned[:, -1:] = 0
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
+
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cleaned
+
+        h_img, w_img = cleaned.shape[:2]
+        kept = np.zeros_like(cleaned)
+        min_area = max(6, int(0.012 * h_img * w_img))
+        center_x = w_img / 2.0
+        scored = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            if area < min_area and h < 0.24 * h_img:
+                continue
+            if w >= 0.85 * w_img and h <= 0.10 * h_img:
+                continue
+            if h >= 0.90 * h_img and w <= 0.08 * w_img:
+                continue
+            cx = x + w / 2.0
+            center_score = 1.0 - min(abs(cx - center_x) / max(center_x, 1.0), 1.0)
+            height_score = min(h / max(1.0, 0.62 * h_img), 1.0)
+            scored.append((area + 35.0 * center_score + 25.0 * height_score, cnt))
+
+        if not scored:
+            return cleaned
+        scored.sort(key=lambda item: item[0], reverse=True)
+        for _, cnt in scored[:4]:
+            cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
+        return kept
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):

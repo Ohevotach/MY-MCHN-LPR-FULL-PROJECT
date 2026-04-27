@@ -295,6 +295,15 @@ def plate_position_mask(position):
     return alnum_mask
 
 
+def plate_detector_status_message():
+    weights = pipeline.detector.weights_path
+    if pipeline.detector.is_ready:
+        return f"当前已加载车牌检测权重: {weights}"
+    if weights:
+        return f"当前车牌检测权重路径不存在或加载失败: {weights}"
+    return "当前没有加载车牌检测权重。请先训练 YOLO，或设置 PLATE_DETECTOR_WEIGHTS 后重启 app。"
+
+
 def predict_plate(image):
     if image is None:
         return "\u8bf7\u5148\u4e0a\u4f20\u56fe\u7247\u3002", None, pd.DataFrame(), []
@@ -302,7 +311,7 @@ def predict_plate(image):
     img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     plate_img, chars = pipeline.process_image(img_bgr)
     if plate_img is None:
-        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002\u8bf7\u786e\u8ba4 PLATE_DETECTOR_WEIGHTS \u5df2\u6307\u5411\u8bad\u7ec3\u597d\u7684 YOLO/ONNX \u8f66\u724c\u68c0\u6d4b\u6743\u91cd\uff1b\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", None, pd.DataFrame(), []
+        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002" + plate_detector_status_message() + "\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", None, pd.DataFrame(), []
     if not chars:
         return "\u5b57\u7b26\u5207\u5272\u5931\u8d25\u3002", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
 
@@ -348,7 +357,7 @@ def predict_plate_from_sample(sample_rel_path):
 
     plate_img, chars = pipeline.process_image(path)
     if plate_img is None:
-        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002\u8bf7\u5148\u8bad\u7ec3\u5e76\u8bbe\u7f6e PLATE_DETECTOR_WEIGHTS\uff1b\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
+        return "\u65e0\u6cd5\u5b9a\u4f4d\u8f66\u724c\u3002" + plate_detector_status_message() + "\u5982\u9700 OpenCV \u5907\u9009\uff0c\u53ef\u8bbe\u7f6e PLATE_OPENCV_FALLBACK=1\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
     if not chars:
         return "\u5b57\u7b26\u5207\u5272\u5931\u8d25\u3002", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(), []
 
