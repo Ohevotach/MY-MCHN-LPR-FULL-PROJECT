@@ -56,6 +56,7 @@ def build_template_masks(loader, labels, device):
     num_templates = int(labels.shape[0])
     chinese_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     alnum_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
+    plate_tail_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     letter_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     digit_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     for idx, label_idx in enumerate(labels.tolist()):
@@ -68,7 +69,12 @@ def build_template_masks(loader, labels, device):
         elif label.isdigit() and len(label) == 1:
             digit_mask[idx] = True
     alnum_mask = letter_mask | digit_mask
-    return chinese_mask, alnum_mask, letter_mask, digit_mask
+    plate_tail_mask = alnum_mask.clone()
+    for idx, label_idx in enumerate(labels.tolist()):
+        label = loader.idx_to_label[int(label_idx)]
+        if label in {"I", "O"}:
+            plate_tail_mask[idx] = False
+    return chinese_mask, alnum_mask, plate_tail_mask, letter_mask, digit_mask
 
 
 def is_chinese_label(label):
@@ -95,10 +101,37 @@ def augment_hopfield_memory(memory, labels, img_h=64, img_w=32):
     eroded = -F.max_pool2d(-imgs, kernel_size=3, stride=1, padding=1)
     blurred = F.avg_pool2d(F.pad(imgs, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
     variants.extend([dilated, eroded, 0.65 * imgs + 0.35 * blurred])
+    variants.extend(affine_memory_variants(imgs))
 
     stacked = torch.cat([v.clamp(0.0, 1.0).view(memory.shape[0], -1) for v in variants], dim=0)
     expanded_labels = labels.repeat(len(variants))
     return stacked.contiguous(), expanded_labels.contiguous()
+
+
+def affine_memory_variants(imgs):
+    """Template variants for real plate crops.
+
+    End-to-end segmentation often makes characters slightly slanted or
+    horizontally squeezed. These deterministic variants keep the method
+    single-shot while narrowing the gap between clean folders and real crops.
+    """
+    device = imgs.device
+    dtype = imgs.dtype
+    transforms_ = []
+    for angle in (-7.0, 7.0):
+        rad = np.deg2rad(angle)
+        transforms_.append([[np.cos(rad), -np.sin(rad), 0.0], [np.sin(rad), np.cos(rad), 0.0]])
+    for shear in (-0.12, 0.12):
+        transforms_.append([[1.0, shear, 0.0], [0.0, 1.0, 0.0]])
+    for scale_x in (0.88, 1.12):
+        transforms_.append([[scale_x, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+    out = []
+    for matrix in transforms_:
+        theta = torch.tensor(matrix, dtype=dtype, device=device).unsqueeze(0).repeat(imgs.shape[0], 1, 1)
+        grid = F.affine_grid(theta, imgs.shape, align_corners=False)
+        out.append(F.grid_sample(imgs, grid, mode="bilinear", padding_mode="zeros", align_corners=False))
+    return out
 
 
 def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
@@ -327,7 +360,7 @@ memory = memory.to(device)
 template_labels = template_labels.to(device)
 mchn_models = build_hopfield_ensemble(memory, device)
 pipeline = LPRPipeline()
-chinese_mask, alnum_mask, letter_mask, digit_mask = build_template_masks(loader, template_labels, device)
+chinese_mask, alnum_mask, plate_tail_mask, letter_mask, digit_mask = build_template_masks(loader, template_labels, device)
 pollution_choices = ["none", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "mixed"]
 full_car_samples = collect_full_car_samples()
 
@@ -412,7 +445,7 @@ def plate_position_mask(position):
         return chinese_mask
     if position == 1 and bool(letter_mask.any().item()):
         return letter_mask
-    return alnum_mask
+    return plate_tail_mask if bool(plate_tail_mask.any().item()) else alnum_mask
 
 
 def plate_detector_status_message():

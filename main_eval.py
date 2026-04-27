@@ -76,8 +76,29 @@ def augment_hopfield_memory(memory, labels, img_h=64, img_w=32):
     eroded = -F.max_pool2d(-imgs, kernel_size=3, stride=1, padding=1)
     blurred = F.avg_pool2d(F.pad(imgs, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
     variants.extend([dilated, eroded, 0.65 * imgs + 0.35 * blurred])
+    variants.extend(affine_memory_variants(imgs))
     stacked = torch.cat([v.clamp(0.0, 1.0).view(memory.shape[0], -1) for v in variants], dim=0)
     return stacked.contiguous(), labels.repeat(len(variants)).contiguous()
+
+
+def affine_memory_variants(imgs):
+    device = imgs.device
+    dtype = imgs.dtype
+    transforms_ = []
+    for angle in (-7.0, 7.0):
+        rad = np.deg2rad(angle)
+        transforms_.append([[np.cos(rad), -np.sin(rad), 0.0], [np.sin(rad), np.cos(rad), 0.0]])
+    for shear in (-0.12, 0.12):
+        transforms_.append([[1.0, shear, 0.0], [0.0, 1.0, 0.0]])
+    for scale_x in (0.88, 1.12):
+        transforms_.append([[scale_x, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+    out = []
+    for matrix in transforms_:
+        theta = torch.tensor(matrix, dtype=dtype, device=device).unsqueeze(0).repeat(imgs.shape[0], 1, 1)
+        grid = F.affine_grid(theta, imgs.shape, align_corners=False)
+        out.append(F.grid_sample(imgs, grid, mode="bilinear", padding_mode="zeros", align_corners=False))
+    return out
 
 
 def build_stratified_split(labels, train_ratio=0.7, seed=2026):
