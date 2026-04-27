@@ -36,11 +36,7 @@ def zh(text):
         "polluted": "\u6c61\u67d3\u540e\u5b57\u7b26",
         "matched": "\u5339\u914d\u8bb0\u5fc6\u6a21\u677f",
         "char_result": "\u5355\u5b57\u7b26\u8bc6\u522b\u7ed3\u679c",
-<<<<<<< HEAD
         "detector_hint": "\u4e3b\u8981\u4f7f\u7528 YOLO/ONNX \u4e24\u9636\u6bb5\u6d41\u7a0b\uff1aPLATE_DETECTOR_WEIGHTS \u8d1f\u8d23\u8f66\u724c\u5b9a\u4f4d\uff0cCHAR_DETECTOR_WEIGHTS \u8d1f\u8d23\u5b57\u7b26\u6846\u68c0\u6d4b\uff0c\u7136\u540e\u7531 MCHN \u8bc6\u522b\u5b57\u7b26\u7c7b\u522b\u3002OpenCV \u5206\u5272\u4ec5\u4f5c\u4e3a\u5907\u9009\u3002",
-=======
-        "detector_hint": "\u4e3b\u8981\u4f7f\u7528 YOLO/ONNX \u8f66\u724c\u68c0\u6d4b\uff1a\u8bf7\u8bbe\u7f6e PLATE_DETECTOR_WEIGHTS \u4e3a\u672c\u5730\u8f66\u724c\u68c0\u6d4b\u6743\u91cd\u3002OpenCV \u989c\u8272/\u5f62\u6001\u5b66\u89c4\u5219\u9ed8\u8ba4\u5173\u95ed\uff0c\u4ec5\u5728 PLATE_OPENCV_FALLBACK=1 \u65f6\u4f5c\u4e3a\u5907\u9009\u589e\u5f3a\u3002",
->>>>>>> c66a10ec39239ddf869fae235afc9455b50b96ad
     }
     return texts[text]
 
@@ -302,30 +298,20 @@ def plate_position_mask(position):
 def plate_detector_status_message():
     weights = pipeline.detector.weights_path
     if pipeline.detector.is_ready:
-<<<<<<< HEAD
-        return f"当前已加载车牌检测权重: {weights}。{char_detector_status_message()}"
+        return f"\u5f53\u524d\u5df2\u52a0\u8f7d\u8f66\u724c\u68c0\u6d4b\u6743\u91cd: {weights}\u3002{char_detector_status_message()}"
     if weights:
-        return f"当前车牌检测权重路径不存在或加载失败: {weights}。{char_detector_status_message()}"
-    return "当前没有加载车牌检测权重。请先训练 YOLO，或设置 PLATE_DETECTOR_WEIGHTS 后重启 app。"
+        return f"\u5f53\u524d\u8f66\u724c\u68c0\u6d4b\u6743\u91cd\u8def\u5f84\u4e0d\u5b58\u5728\u6216\u52a0\u8f7d\u5931\u8d25: {weights}\u3002{char_detector_status_message()}"
+    return "\u5f53\u524d\u6ca1\u6709\u52a0\u8f7d\u8f66\u724c\u68c0\u6d4b\u6743\u91cd\u3002\u8bf7\u5148\u8bad\u7ec3 YOLO\uff0c\u6216\u8bbe\u7f6e PLATE_DETECTOR_WEIGHTS \u540e\u91cd\u542f app\u3002"
 
 
 def char_detector_status_message():
     weights = pipeline.char_detector.weights_path
     if pipeline.char_detector.is_ready:
-        return f"已加载字符检测权重: {weights}"
+        return f"\u5df2\u52a0\u8f7d\u5b57\u7b26\u68c0\u6d4b\u6743\u91cd: {weights}"
     if weights:
-        return f"字符检测权重路径不存在或加载失败: {weights}，将退回 OpenCV 字符分割。"
-    return "未加载字符检测权重，将退回 OpenCV 字符分割；建议设置 CHAR_DETECTOR_WEIGHTS。"
+        return f"\u5b57\u7b26\u68c0\u6d4b\u6743\u91cd\u8def\u5f84\u4e0d\u5b58\u5728\u6216\u52a0\u8f7d\u5931\u8d25: {weights}\uff0c\u5c06\u9000\u56de OpenCV \u5b57\u7b26\u5206\u5272\u3002"
+    return "\u672a\u52a0\u8f7d\u5b57\u7b26\u68c0\u6d4b\u6743\u91cd\uff0c\u5c06\u9000\u56de OpenCV \u5b57\u7b26\u5206\u5272\uff1b\u5efa\u8bae\u8bbe\u7f6e CHAR_DETECTOR_WEIGHTS\u3002"
 
-
-=======
-        return f"当前已加载车牌检测权重: {weights}"
-    if weights:
-        return f"当前车牌检测权重路径不存在或加载失败: {weights}"
-    return "当前没有加载车牌检测权重。请先训练 YOLO，或设置 PLATE_DETECTOR_WEIGHTS 后重启 app。"
-
-
->>>>>>> c66a10ec39239ddf869fae235afc9455b50b96ad
 def predict_plate(image):
     if image is None:
         return "\u8bf7\u5148\u4e0a\u4f20\u56fe\u7247\u3002", None, pd.DataFrame(), []
@@ -452,10 +438,7 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
     gr.Markdown("# " + zh("title"))
     with gr.Tab(zh("plate_tab")):
         gr.Markdown(zh("detector_hint"))
-<<<<<<< HEAD
         gr.Markdown(plate_detector_status_message())
-=======
->>>>>>> c66a10ec39239ddf869fae235afc9455b50b96ad
         with gr.Row():
             with gr.Column(scale=1):
                 img_in = gr.Image(label=zh("upload_plate"), type="numpy")
