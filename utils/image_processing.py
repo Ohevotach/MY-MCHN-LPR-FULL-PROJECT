@@ -352,6 +352,9 @@ class PlateSegmenter:
         if plate_img is None or plate_img.size == 0:
             return plate_img
         work = cv2.resize(plate_img, (cls.PLATE_W, cls.PLATE_H))
+        quad_rectified = cls._rectify_by_plate_color_quad(work)
+        if quad_rectified is not None:
+            work = quad_rectified
         hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
         blue = cv2.inRange(hsv, np.array([88, 22, 18]), np.array([145, 255, 255]))
         green = cv2.inRange(hsv, np.array([30, 22, 18]), np.array([98, 255, 255]))
@@ -401,6 +404,57 @@ class PlateSegmenter:
         matrix = cv2.getPerspectiveTransform(expanded, dst)
         rectified = cv2.warpPerspective(work, matrix, (cls.PLATE_W, cls.PLATE_H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         return rectified if rectified.size else work
+
+    @classmethod
+    def _rectify_by_plate_color_quad(cls, plate_img):
+        if plate_img is None or plate_img.size == 0:
+            return None
+        work = cv2.resize(plate_img, (cls.PLATE_W, cls.PLATE_H))
+        hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([88, 18, 18]), np.array([145, 255, 255]))
+        green = cv2.inRange(hsv, np.array([30, 18, 18]), np.array([100, 255, 255]))
+        mask = cv2.bitwise_or(blue, green)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 7)), iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)), iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        for cnt in contours[:3]:
+            area = cv2.contourArea(cnt)
+            if area < 0.10 * cls.PLATE_W * cls.PLATE_H:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            rw, rh = rect[1]
+            if rw <= 1 or rh <= 1:
+                continue
+            aspect = max(rw, rh) / max(1.0, min(rw, rh))
+            if not (2.0 <= aspect <= 6.8):
+                continue
+            box = cv2.boxPoints(rect).astype("float32")
+            center = box.mean(axis=0, keepdims=True)
+            box = center + (box - center) * np.array([[1.04, 1.18]], dtype="float32")
+            box[:, 0] = np.clip(box[:, 0], 0, cls.PLATE_W - 1)
+            box[:, 1] = np.clip(box[:, 1], 0, cls.PLATE_H - 1)
+            ordered = cls._order_quad_points(box)
+            dst = np.array([[0, 0], [cls.PLATE_W - 1, 0], [cls.PLATE_W - 1, cls.PLATE_H - 1], [0, cls.PLATE_H - 1]], dtype="float32")
+            rectified = cv2.warpPerspective(work, cv2.getPerspectiveTransform(ordered, dst), (cls.PLATE_W, cls.PLATE_H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            if rectified is not None and rectified.size:
+                return rectified
+        return None
+
+    @staticmethod
+    def _order_quad_points(points):
+        pts = np.asarray(points, dtype="float32")
+        ordered = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        ordered[0] = pts[np.argmin(s)]
+        ordered[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        ordered[1] = pts[np.argmin(diff)]
+        ordered[3] = pts[np.argmax(diff)]
+        return ordered
 
     @staticmethod
     def _plate_color_ratio(plate_img):
@@ -1450,21 +1504,66 @@ class LPRPipeline:
 
     def _detect_or_segment_chars(self, plate_img):
         detections = self.char_detector.detect(plate_img)
+        candidates = []
         if detections:
             layout_chars = self._segment_chars_by_layout_guidance(plate_img, detections)
             if self.segmenter._is_usable_char_sequence(layout_chars):
-                return layout_chars[:7]
+                candidates.append(("layout", layout_chars[:7]))
 
             boxes = self._postprocess_char_detections(plate_img, detections)
             chars = self._crop_chars_from_detector_boxes(plate_img, boxes)
             if self.segmenter._is_usable_char_sequence(chars):
-                return chars[:7]
+                candidates.append(("detector", chars[:7]))
 
             fallback_chars = self.segmenter.segment_characters(plate_img)
-            if self._plate_result_score(plate_img, chars) >= self._plate_result_score(plate_img, fallback_chars):
-                return chars
-            return fallback_chars
-        return self.segmenter.segment_characters(plate_img)
+            if self.segmenter._is_usable_char_sequence(fallback_chars):
+                candidates.append(("opencv", fallback_chars[:7]))
+            elif fallback_chars:
+                candidates.append(("opencv_partial", fallback_chars))
+        else:
+            fallback_chars = self.segmenter.segment_characters(plate_img)
+            if fallback_chars:
+                candidates.append(("opencv", fallback_chars))
+
+        if not candidates:
+            return []
+
+        best_name, best_chars = max(candidates, key=lambda item: self._char_sequence_score(item[1]))
+        return best_chars
+
+    @staticmethod
+    def _char_sequence_score(chars):
+        if not chars:
+            return -1.0
+        count_score = 1.0 - min(abs(len(chars) - 7) / 7.0, 1.0)
+        if len(chars) == 7:
+            count_score += 0.45
+
+        crop_scores = []
+        for idx, char_img in enumerate(chars[:7]):
+            if char_img is None or char_img.size == 0:
+                crop_scores.append(0.0)
+                continue
+            foreground = char_img > 0
+            ink = float(np.mean(foreground))
+            rows = np.where(foreground.sum(axis=1) > 0)[0]
+            cols = np.where(foreground.sum(axis=0) > 0)[0]
+            if len(rows) == 0 or len(cols) == 0:
+                crop_scores.append(0.0)
+                continue
+            h = rows[-1] - rows[0] + 1
+            w = cols[-1] - cols[0] + 1
+            border = np.concatenate([foreground[0, :], foreground[-1, :], foreground[:, 0], foreground[:, -1]])
+            contours, _ = cv2.findContours((foreground.astype(np.uint8) * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            component_penalty = min(max(0, len(contours) - (6 if idx == 0 else 4)) * 0.10, 0.35)
+            ink_target = 0.28 if idx == 0 else 0.22
+            ink_score = 1.0 - min(abs(ink - ink_target) / 0.28, 1.0)
+            height_score = 1.0 - min(abs((h / 64.0) - 0.72) / 0.42, 1.0)
+            width_target = 0.58 if idx == 0 else 0.48
+            width_score = 1.0 - min(abs((w / 32.0) - width_target) / 0.48, 1.0)
+            border_score = 1.0 - min(float(np.mean(border)) / 0.20, 1.0)
+            crop_scores.append(0.32 * ink_score + 0.30 * height_score + 0.20 * width_score + 0.18 * border_score - component_penalty)
+        return 0.36 * count_score + 0.64 * float(np.mean(crop_scores))
 
     def _segment_chars_by_layout_guidance(self, plate_img, detections):
         """Cut seven license-plate slots using the plate layout, not raw YOLO boxes.
