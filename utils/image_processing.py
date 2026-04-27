@@ -613,7 +613,8 @@ class PlateSegmenter:
             slot_binary = binary[y1:y2, x1:x2]
 
         slot_binary = PlateSegmenter._clean_slot_character(slot_binary, position=position)
-        return PlateSegmenter._resize_char_canvas(slot_binary)
+        slot_gray = gray[y1:y2, x1:x2]
+        return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary)
 
     @staticmethod
     def _local_character_mask(slot_bgr, slot_gray):
@@ -1093,6 +1094,40 @@ class PlateSegmenter:
         return canvas
 
     @staticmethod
+    def _resize_gray_char_canvas(gray_crop, mask=None):
+        canvas = np.zeros((64, 32), dtype=np.uint8)
+        if gray_crop is None or gray_crop.size == 0:
+            return canvas
+        if gray_crop.ndim == 3:
+            gray_crop = cv2.cvtColor(gray_crop, cv2.COLOR_BGR2GRAY)
+
+        crop = gray_crop.copy()
+        if mask is not None and mask.size:
+            mask = cv2.resize(mask.astype(np.uint8), (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+            ys, xs = np.where(mask > 0)
+            if len(xs) > 0 and len(ys) > 0:
+                pad_x = max(1, int(0.10 * (xs.max() - xs.min() + 1)))
+                pad_y = max(1, int(0.08 * (ys.max() - ys.min() + 1)))
+                x1 = max(0, int(xs.min()) - pad_x)
+                x2 = min(crop.shape[1], int(xs.max()) + pad_x + 1)
+                y1 = max(0, int(ys.min()) - pad_y)
+                y2 = min(crop.shape[0], int(ys.max()) + pad_y + 1)
+                crop = crop[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            return canvas
+        crop = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(crop)
+        h, w = crop.shape[:2]
+        scale = min(26.0 / max(1, w), 56.0 / max(1, h))
+        new_w = max(1, min(30, int(round(w * scale))))
+        new_h = max(1, min(62, int(round(h * scale))))
+        resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        y = (64 - new_h) // 2
+        x = (32 - new_w) // 2
+        canvas[y : y + new_h, x : x + new_w] = resized
+        return canvas
+
+    @staticmethod
     def _trim_sparse_borders(crop):
         if crop.size == 0:
             return crop
@@ -1263,7 +1298,7 @@ class LPRPipeline:
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 binary = PlateSegmenter._local_character_mask(crop, gray)
                 binary = PlateSegmenter._clean_slot_character(binary)
-                chars.append(PlateSegmenter._resize_char_canvas(binary))
+                chars.append(PlateSegmenter._resize_gray_char_canvas(gray, binary))
             if len(chars) >= 5:
                 return chars
         return self.segmenter.segment_characters(plate_img)
