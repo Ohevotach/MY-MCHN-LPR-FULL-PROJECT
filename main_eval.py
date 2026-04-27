@@ -52,11 +52,11 @@ class SimpleCNN(nn.Module):
 
 def build_hopfield_ensemble(memory, device):
     return [
-        ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
-        ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
-        ModernHopfieldNetwork(memory, beta=55.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
-        ModernHopfieldNetwork(memory, beta=70.0, metric="dot", normalize=True, feature_mode="profile").to(device),
-        ModernHopfieldNetwork(memory, beta=7.0, metric="euclidean", normalize=False, feature_mode="profile").to(device),
+        ModernHopfieldNetwork(memory, beta=28.0, metric="dot", normalize=True, feature_mode="binary").to(device),
+        ModernHopfieldNetwork(memory, beta=32.0, metric="dot", normalize=True, feature_mode="centered").to(device),
+        ModernHopfieldNetwork(memory, beta=26.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
+        ModernHopfieldNetwork(memory, beta=30.0, metric="dot", normalize=True, feature_mode="profile").to(device),
+        ModernHopfieldNetwork(memory, beta=2.5, metric="euclidean", normalize=False, feature_mode="profile").to(device),
     ]
 
 
@@ -102,15 +102,18 @@ def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, tem
 
 
 def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_mask=None):
-    fused = None
+    log_prob_parts = []
     primary_sim = None
     for model in models:
         _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
         scores = class_free_energy_scores(sim_scores, template_labels, beta=model.beta, num_classes=num_classes, template_mask=template_mask)
         log_probs = torch.log_softmax(scores, dim=-1)
-        fused = log_probs if fused is None else fused + log_probs
+        log_prob_parts.append(log_probs)
         if primary_sim is None:
             primary_sim = sim_scores
+    fused = torch.logsumexp(torch.stack(log_prob_parts, dim=0), dim=0) - torch.log(
+        primary_sim.new_tensor(float(len(log_prob_parts)))
+    )
     return fused, primary_sim
 
 

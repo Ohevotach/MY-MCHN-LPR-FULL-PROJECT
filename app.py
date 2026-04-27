@@ -101,11 +101,11 @@ def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, tem
 
 def build_hopfield_ensemble(memory, device):
     return [
-        ModernHopfieldNetwork(memory, beta=60.0, metric="dot", normalize=True, feature_mode="binary").to(device),
-        ModernHopfieldNetwork(memory, beta=80.0, metric="dot", normalize=True, feature_mode="centered").to(device),
-        ModernHopfieldNetwork(memory, beta=55.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
-        ModernHopfieldNetwork(memory, beta=70.0, metric="dot", normalize=True, feature_mode="profile").to(device),
-        ModernHopfieldNetwork(memory, beta=7.0, metric="euclidean", normalize=False, feature_mode="profile").to(device),
+        ModernHopfieldNetwork(memory, beta=28.0, metric="dot", normalize=True, feature_mode="binary").to(device),
+        ModernHopfieldNetwork(memory, beta=32.0, metric="dot", normalize=True, feature_mode="centered").to(device),
+        ModernHopfieldNetwork(memory, beta=26.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
+        ModernHopfieldNetwork(memory, beta=30.0, metric="dot", normalize=True, feature_mode="profile").to(device),
+        ModernHopfieldNetwork(memory, beta=2.5, metric="euclidean", normalize=False, feature_mode="profile").to(device),
     ]
 
 
@@ -116,17 +116,20 @@ def select_best_template_in_class(sim_scores, template_labels, class_idx):
 
 
 def ensemble_scores(models, q, template_labels, num_classes, template_mask=None):
-    fused = None
+    log_prob_parts = []
     first_sim = None
     first_retrieved = None
     for model in models:
         retrieved, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
         scores = class_free_energy_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
         log_probs = torch.log_softmax(scores, dim=-1)
-        fused = log_probs if fused is None else fused + log_probs
+        log_prob_parts.append(log_probs)
         if first_sim is None:
             first_sim = sim_scores
             first_retrieved = retrieved
+    fused = torch.logsumexp(torch.stack(log_prob_parts, dim=0), dim=0) - torch.log(
+        first_sim.new_tensor(float(len(log_prob_parts)))
+    )
     return fused, first_sim, first_retrieved
 
 
@@ -213,19 +216,10 @@ def robust_char_query_variants(tensor_img):
         otsu = cv2.bitwise_not(otsu)
     variants.append(normalize_char_image(otsu))
 
-    kernels = [
-        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
-        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)),
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2)),
-    ]
-    for kernel in kernels:
-        variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_OPEN, kernel)))
-        variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel)))
-
+    kernels = [cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))]
+    variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernels[0])))
     variants.append(normalize_char_image(cv2.medianBlur(otsu, 3)))
     variants.append(normalize_char_image(_keep_likely_character_components(otsu)))
-    variants.append(normalize_char_image(cv2.dilate(_keep_likely_character_components(otsu), kernels[0], iterations=1)))
-    variants.append(normalize_char_image(cv2.erode(cv2.dilate(otsu, kernels[0], iterations=1), kernels[0], iterations=1)))
 
     unique = []
     seen = set()
