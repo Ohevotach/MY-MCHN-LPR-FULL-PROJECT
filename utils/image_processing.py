@@ -1422,6 +1422,10 @@ class LPRPipeline:
     def _detect_or_segment_chars(self, plate_img):
         detections = self.char_detector.detect(plate_img)
         if detections:
+            layout_chars = self._segment_chars_by_layout_guidance(plate_img, detections)
+            if self.segmenter._is_usable_char_sequence(layout_chars):
+                return layout_chars[:7]
+
             boxes = self._postprocess_char_detections(plate_img, detections)
             chars = self._crop_chars_from_detector_boxes(plate_img, boxes)
             if self.segmenter._is_usable_char_sequence(chars):
@@ -1432,6 +1436,60 @@ class LPRPipeline:
                 return chars
             return fallback_chars
         return self.segmenter.segment_characters(plate_img)
+
+    def _segment_chars_by_layout_guidance(self, plate_img, detections):
+        """Cut seven license-plate slots using the plate layout, not raw YOLO boxes.
+
+        Character detectors trained from approximate slot labels often fire on the
+        separator dot or expand into neighboring glyphs. The rectified plate layout
+        is more stable for Chinese plates, while detections still help estimate the
+        text band when the color mask is noisy.
+        """
+        if plate_img is None or plate_img.size == 0:
+            return []
+
+        work = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+        work = PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(work)))
+        gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(work, gray))
+
+        roi = self._text_roi_from_detections_or_plate(work, binary, detections)
+        if roi is None:
+            return []
+        left, top, right, bottom = roi
+        boxes = self._license_plate_layout_boxes(left, top, right, bottom, PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H)
+        if len(boxes) != 7:
+            return []
+
+        chars = [PlateSegmenter._crop_slot_char(work, gray, binary, self._xyxy_to_xywh(box), idx) for idx, box in enumerate(boxes)]
+        return chars
+
+    def _text_roi_from_detections_or_plate(self, plate_img, binary, detections):
+        det_boxes = self._postprocess_char_detections(plate_img, detections)
+        det_boxes = det_boxes[:7]
+        if len(det_boxes) >= 4:
+            xs1 = np.array([box[0] for box in det_boxes], dtype=np.float32)
+            ys1 = np.array([box[1] for box in det_boxes], dtype=np.float32)
+            xs2 = np.array([box[2] for box in det_boxes], dtype=np.float32)
+            ys2 = np.array([box[3] for box in det_boxes], dtype=np.float32)
+            heights = ys2 - ys1
+            widths = xs2 - xs1
+
+            left = max(14, int(np.min(xs1) - 0.85 * np.median(widths)))
+            right = min(PlateSegmenter.PLATE_W - 10, int(np.max(xs2) + 0.85 * np.median(widths)))
+            top = max(14, int(np.percentile(ys1, 25) - 0.10 * np.median(heights)))
+            bottom = min(PlateSegmenter.PLATE_H - 6, int(np.percentile(ys2, 75) + 0.10 * np.median(heights)))
+
+            if right - left >= 250 and bottom - top >= 48:
+                return left, top, right, bottom
+
+        return PlateSegmenter._estimate_plate_text_roi(plate_img, binary)
+
+    @staticmethod
+    def _xyxy_to_xywh(box):
+        x1, y1, x2, y2 = box
+        return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
 
     def _postprocess_char_detections(self, plate_img, detections):
         h_img, w_img = plate_img.shape[:2]
