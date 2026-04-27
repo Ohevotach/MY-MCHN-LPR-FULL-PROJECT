@@ -60,6 +60,25 @@ def build_hopfield_ensemble(memory, device):
     ]
 
 
+def augment_hopfield_memory(memory, labels, img_h=64, img_w=32):
+    if memory.numel() == 0:
+        return memory, labels
+    imgs = memory.float().view(-1, 1, img_h, img_w)
+    variants = [
+        imgs,
+        torch.roll(imgs, shifts=1, dims=2),
+        torch.roll(imgs, shifts=-1, dims=2),
+        torch.roll(imgs, shifts=1, dims=3),
+        torch.roll(imgs, shifts=-1, dims=3),
+    ]
+    dilated = F.max_pool2d(imgs, kernel_size=3, stride=1, padding=1)
+    eroded = -F.max_pool2d(-imgs, kernel_size=3, stride=1, padding=1)
+    blurred = F.avg_pool2d(F.pad(imgs, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
+    variants.extend([dilated, eroded, 0.65 * imgs + 0.35 * blurred])
+    stacked = torch.cat([v.clamp(0.0, 1.0).view(memory.shape[0], -1) for v in variants], dim=0)
+    return stacked.contiguous(), labels.repeat(len(variants)).contiguous()
+
+
 def build_stratified_split(labels, train_ratio=0.7, seed=2026):
     rng = random.Random(seed)
     train_indices = []
@@ -285,17 +304,18 @@ def run_robustness_evaluation(
     print(f"Task 2: held-out evaluation, pollution={pollution_type}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
+    hopfield_memory, hopfield_labels = augment_hopfield_memory(train_memory, train_labels)
     prototypes, prototype_labels = build_class_memory_from_tensors(train_memory, train_labels)
     num_classes = len(loader.idx_to_label)
 
-    hopfield_models = build_hopfield_ensemble(train_memory, device)
+    hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
 
     def make_methods():
         return {
             "Modern Hopfield": lambda q: torch.argmax(
-                ensemble_hopfield_scores(hopfield_models, q, train_labels, num_classes)[0], dim=-1
+                ensemble_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes)[0], dim=-1
             ),
-            "Affine-robust Hopfield": lambda q: predict_affine_robust_hopfield(hopfield_models, q, train_labels, num_classes),
+            "Affine-robust Hopfield": lambda q: predict_affine_robust_hopfield(hopfield_models, q, hopfield_labels, num_classes),
             "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
             "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
@@ -487,9 +507,10 @@ if __name__ == "__main__":
 
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    demo_models = build_hopfield_ensemble(train_memory, device)
+    demo_memory, demo_labels = augment_hopfield_memory(train_memory, train_labels)
+    demo_models = build_hopfield_ensemble(demo_memory.to(device), device)
     run_reconstruction_demo(
-        {"hopfield": demo_models, "train_memory": train_memory, "train_labels": train_labels},
+        {"hopfield": demo_models, "train_memory": demo_memory.to(device), "train_labels": demo_labels.to(device)},
         loader,
         test_indices,
         visualizer,

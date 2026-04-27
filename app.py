@@ -52,16 +52,13 @@ def default_cache_path():
     return os.path.join(cache_dir, "template_cache_32x64.pt")
 
 
-def build_template_masks(loader, num_templates, device):
+def build_template_masks(loader, labels, device):
+    num_templates = int(labels.shape[0])
     chinese_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     alnum_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     letter_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
     digit_mask = torch.zeros(num_templates, dtype=torch.bool, device=device)
-    if loader.chinese_indices:
-        chinese_mask[loader.chinese_indices] = True
-    if loader.alnum_indices:
-        alnum_mask[loader.alnum_indices] = True
-    for idx, label_idx in enumerate(loader.labels.tolist()):
+    for idx, label_idx in enumerate(labels.tolist()):
         label = loader.idx_to_label[int(label_idx)]
         if is_chinese_label(label):
             chinese_mask[idx] = True
@@ -76,6 +73,32 @@ def build_template_masks(loader, num_templates, device):
 
 def is_chinese_label(label):
     return (len(label) == 1 and "\u4e00" <= label <= "\u9fff") or str(label).startswith("zh_")
+
+
+def augment_hopfield_memory(memory, labels, img_h=64, img_w=32):
+    """Add label-preserving template variants to the associative memory.
+
+    This keeps recognition as modern Hopfield retrieval, but gives each class
+    memories with stroke thickness, small shifts and blur closer to real plates.
+    """
+    if memory.numel() == 0:
+        return memory, labels
+    imgs = memory.float().view(-1, 1, img_h, img_w)
+    variants = [imgs]
+
+    variants.append(torch.roll(imgs, shifts=1, dims=2))
+    variants.append(torch.roll(imgs, shifts=-1, dims=2))
+    variants.append(torch.roll(imgs, shifts=1, dims=3))
+    variants.append(torch.roll(imgs, shifts=-1, dims=3))
+
+    dilated = F.max_pool2d(imgs, kernel_size=3, stride=1, padding=1)
+    eroded = -F.max_pool2d(-imgs, kernel_size=3, stride=1, padding=1)
+    blurred = F.avg_pool2d(F.pad(imgs, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
+    variants.extend([dilated, eroded, 0.65 * imgs + 0.35 * blurred])
+
+    stacked = torch.cat([v.clamp(0.0, 1.0).view(memory.shape[0], -1) for v in variants], dim=0)
+    expanded_labels = labels.repeat(len(variants))
+    return stacked.contiguous(), expanded_labels.contiguous()
 
 
 def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
@@ -292,11 +315,12 @@ loader = TemplateLoader(["./data/chars2", "./data/charsChinese"], img_size=(32, 
 if loader.memory_matrix.shape[0] == 0:
     raise RuntimeError("Template memory is empty. Please check ./data/chars2 and ./data/charsChinese.")
 
-memory = loader.memory_matrix.to(device)
+memory, template_labels = augment_hopfield_memory(loader.memory_matrix, loader.labels)
+memory = memory.to(device)
+template_labels = template_labels.to(device)
 mchn_models = build_hopfield_ensemble(memory, device)
 pipeline = LPRPipeline()
-template_labels = loader.labels.to(device)
-chinese_mask, alnum_mask, letter_mask, digit_mask = build_template_masks(loader, memory.shape[0], device)
+chinese_mask, alnum_mask, letter_mask, digit_mask = build_template_masks(loader, template_labels, device)
 pollution_choices = ["none", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "mixed"]
 full_car_samples = collect_full_car_samples()
 
