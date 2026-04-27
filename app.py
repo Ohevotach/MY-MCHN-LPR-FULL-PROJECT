@@ -62,11 +62,18 @@ def build_template_masks(loader, num_templates, device):
         alnum_mask[loader.alnum_indices] = True
     for idx, label_idx in enumerate(loader.labels.tolist()):
         label = loader.idx_to_label[int(label_idx)]
-        if len(label) == 1 and "A" <= label <= "Z":
+        if is_chinese_label(label):
+            chinese_mask[idx] = True
+            alnum_mask[idx] = False
+        elif len(label) == 1 and "A" <= label <= "Z":
             letter_mask[idx] = True
         elif label.isdigit() and len(label) == 1:
             digit_mask[idx] = True
     return chinese_mask, alnum_mask, letter_mask, digit_mask
+
+
+def is_chinese_label(label):
+    return (len(label) == 1 and "\u4e00" <= label <= "\u9fff") or str(label).startswith("zh_")
 
 
 def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
@@ -191,6 +198,78 @@ def affine_char_variants(tensor):
     return torch.cat(unique, dim=0)
 
 
+def robust_char_query_variants(tensor_img):
+    if tensor_img.dim() == 2:
+        tensor_img = tensor_img.unsqueeze(0)
+    normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
+    base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
+
+    variants = [base, normalize_char_image(base)]
+    _, otsu = cv2.threshold(base, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(otsu > 0) > 0.55:
+        otsu = cv2.bitwise_not(otsu)
+    variants.append(normalize_char_image(otsu))
+
+    kernels = [
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2)),
+    ]
+    for kernel in kernels:
+        variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_OPEN, kernel)))
+        variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel)))
+
+    variants.append(normalize_char_image(cv2.medianBlur(otsu, 3)))
+    variants.append(normalize_char_image(_keep_likely_character_components(otsu)))
+    variants.append(normalize_char_image(cv2.dilate(_keep_likely_character_components(otsu), kernels[0], iterations=1)))
+    variants.append(normalize_char_image(cv2.erode(cv2.dilate(otsu, kernels[0], iterations=1), kernels[0], iterations=1)))
+
+    unique = []
+    seen = set()
+    for item in variants:
+        if item is None or item.size == 0:
+            continue
+        item = normalize_char_image(item)
+        ink = float(np.mean(item > 0))
+        if ink < 0.01 or ink > 0.70:
+            continue
+        key = item.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(torch.tensor(item, dtype=torch.float32).view(1, -1) / 255.0)
+    if not unique:
+        unique.append(normalized.view(1, -1))
+    return torch.cat(unique, dim=0)
+
+
+def _keep_likely_character_components(binary):
+    work = (binary > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return work
+    h_img, w_img = work.shape[:2]
+    scored = []
+    center_x = w_img / 2.0
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = cv2.contourArea(cnt)
+        if area < max(3, 0.004 * h_img * w_img):
+            continue
+        if h < 0.10 * h_img and area < 0.04 * h_img * w_img:
+            continue
+        center_score = 1.0 - min(abs((x + w / 2.0) - center_x) / max(center_x, 1.0), 1.0)
+        height_score = min(h / max(1.0, 0.55 * h_img), 1.0)
+        scored.append((area + 20.0 * center_score + 25.0 * height_score, cnt))
+    if not scored:
+        return work
+    scored.sort(key=lambda item: item[0], reverse=True)
+    kept = np.zeros_like(work)
+    for _, cnt in scored[:4]:
+        cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
+    return kept
+
+
 def collect_full_car_samples():
     roots = [
         "./data/full_cars/ccpd_base",
@@ -246,27 +325,12 @@ def recognize_tensor(tensor, template_mask=None):
         tensor_img = tensor
     else:
         tensor_img = tensor.view(1, 64, 32)
-    normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
-    base_q = normalized.view(1, -1).to(device)
     with torch.no_grad():
-        base_scores, base_sim, base_retrieved = ensemble_scores(
-            mchn_models, base_q, template_labels, len(loader.idx_to_label), template_mask=template_mask
-        )
-        base_probs = torch.softmax(base_scores[0], dim=-1)
-        base_conf, base_class = torch.max(base_probs, dim=-1)
-        if float(base_conf.item()) >= 0.72:
-            class_idx = int(base_class.item())
-            best_template_idx = select_best_template_in_class(base_sim, template_labels, class_idx)
-            template_sim = F.cosine_similarity(base_q, memory[best_template_idx].view(1, -1)).item()
-            recon_sim = F.cosine_similarity(base_q, base_retrieved[0:1]).item()
-            top_text = format_top_predictions(base_scores[0])
-            return class_idx, best_template_idx, float(base_conf.item()), template_sim, recon_sim, top_text
-
-        q = affine_char_variants(normalized.view(1, -1)).to(device)
+        q = robust_char_query_variants(tensor_img).to(device)
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
-    pooled_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
+    pooled_scores = torch.max(class_scores, dim=0).values
     class_idx = int(torch.argmax(pooled_scores).item())
     variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)

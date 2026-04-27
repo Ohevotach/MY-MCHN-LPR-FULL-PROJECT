@@ -113,7 +113,7 @@ class TemplateLoader:
             self._save_cache()
 
     def _build_cache_signature(self):
-        signature = {"img_size": tuple(self.img_size), "label_map_version": 5, "roots": []}
+        signature = {"img_size": tuple(self.img_size), "label_map_version": 6, "roots": []}
         for root_dir in self.data_roots:
             root_info = {"root": os.path.abspath(root_dir), "file_count": 0, "latest_mtime": 0.0}
             if os.path.exists(root_dir):
@@ -230,7 +230,7 @@ class TemplateLoader:
 
     @staticmethod
     def _is_chinese_label(label):
-        return len(label) == 1 and "\u4e00" <= label <= "\u9fff"
+        return (len(label) == 1 and "\u4e00" <= label <= "\u9fff") or str(label).startswith("zh_")
 
     def get_memory_matrix(self):
         return self.memory_matrix, self.labels, self.idx_to_label

@@ -788,6 +788,11 @@ class PlateSegmenter:
             area = cv2.contourArea(cnt)
             if area < min_area and h < 0.18 * h_img:
                 continue
+            if position is not None and position >= 1:
+                if y <= 0.18 * h_img and h <= 0.24 * h_img and area < 0.10 * h_img * w_img:
+                    continue
+                if y + h >= 0.84 * h_img and h <= 0.20 * h_img and area < 0.08 * h_img * w_img:
+                    continue
             if w >= 0.85 * w_img and h <= 0.10 * h_img and (y <= 2 or y + h >= h_img - 2):
                 continue
             if h >= 0.94 * h_img and w <= 0.055 * w_img and (x <= 1 or x + w >= w_img - 1):
@@ -807,6 +812,30 @@ class PlateSegmenter:
             cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
         if np.count_nonzero(kept) < 0.45 * np.count_nonzero(cleaned):
             return cleaned
+        return PlateSegmenter._suppress_isolated_slot_noise(kept, position)
+
+    @staticmethod
+    def _suppress_isolated_slot_noise(mask, position=None):
+        if mask.size == 0 or position == 0:
+            return mask
+        cleaned = mask.copy()
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cleaned
+        h_img, w_img = cleaned.shape[:2]
+        boxes = [cv2.boundingRect(cnt) for cnt in contours]
+        tall_boxes = [(x, y, w, h) for x, y, w, h in boxes if h >= 0.32 * h_img]
+        if not tall_boxes:
+            return cleaned
+        x1 = max(0, min(x for x, _, _, _ in tall_boxes) - 2)
+        x2 = min(w_img, max(x + w for x, _, w, _ in tall_boxes) + 2)
+        kept = np.zeros_like(cleaned)
+        for cnt, (x, y, w, h) in zip(contours, boxes):
+            area = cv2.contourArea(cnt)
+            near_main = x + w >= x1 and x <= x2
+            if h < 0.24 * h_img and not near_main and area < 0.08 * h_img * w_img:
+                continue
+            cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
         return kept
 
     @staticmethod
