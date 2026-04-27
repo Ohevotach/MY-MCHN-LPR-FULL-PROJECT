@@ -715,8 +715,10 @@ class PlateSegmenter:
     @staticmethod
     def _crop_slot_char(plate_img, gray, binary, box, position=None):
         x, y, w, h = box
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(binary.shape[1], x + w), min(binary.shape[0], y + h)
+        pad_x = max(1, int(round(w * (0.10 if position == 0 else 0.07))))
+        pad_y = max(1, int(round(h * 0.08)))
+        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+        x2, y2 = min(binary.shape[1], x + w + pad_x), min(binary.shape[0], y + h + pad_y)
         if x2 <= x1 or y2 <= y1:
             return np.zeros((64, 32), dtype=np.uint8)
 
@@ -1594,6 +1596,7 @@ class LPRPipeline:
 
         work = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
         work = PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(work)))
+        work = self._rectify_text_band_from_detections(work, detections)
         work = self._deskew_plate_text_band(work)
         gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
@@ -1609,6 +1612,36 @@ class LPRPipeline:
 
         chars = [PlateSegmenter._crop_slot_char(work, gray, binary, self._xyxy_to_xywh(box), idx) for idx, box in enumerate(boxes)]
         return chars
+
+    def _rectify_text_band_from_detections(self, plate_img, detections):
+        if plate_img is None or plate_img.size == 0 or len(detections) < 4:
+            return plate_img
+
+        boxes = self._postprocess_char_detections(plate_img, detections)
+        if len(boxes) < 4:
+            return plate_img
+
+        h_img, w_img = plate_img.shape[:2]
+        centers = np.array([((x1 + x2) / 2.0, (y1 + y2) / 2.0) for x1, y1, x2, y2 in boxes], dtype=np.float32)
+        xs = centers[:, 0]
+        ys = centers[:, 1]
+        if float(np.max(xs) - np.min(xs)) < 0.35 * w_img:
+            return plate_img
+
+        slope, _ = np.polyfit(xs, ys, deg=1)
+        angle = np.degrees(np.arctan(float(slope)))
+        if abs(angle) < 1.0 or abs(angle) > 16.0:
+            return plate_img
+
+        matrix = cv2.getRotationMatrix2D((w_img / 2.0, h_img / 2.0), angle, 1.0)
+        rotated = cv2.warpAffine(
+            plate_img,
+            matrix,
+            (w_img, h_img),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        return rotated
 
     @staticmethod
     def _deskew_plate_text_band(plate_img):
@@ -1828,23 +1861,32 @@ class LPRPipeline:
         unit = width / float(ratios.sum())
         x = float(left)
         boxes = []
+        char_position = 0
         for slot_idx, ratio in enumerate(ratios):
             slot_w = unit * float(ratio)
             if slot_idx == 2:
                 x += slot_w
                 continue
-            pad_ratio = 0.075 if slot_idx in (0, 1) else 0.090
+            if char_position == 0:
+                pad_ratio = 0.025
+            elif char_position == 1:
+                pad_ratio = 0.018
+            elif char_position == 6:
+                pad_ratio = 0.035
+            else:
+                pad_ratio = 0.055
             pad = max(1.0, pad_ratio * slot_w)
             x1 = int(round(x + pad))
             x2 = int(round(x + slot_w - pad))
-            y1 = int(round(top + 0.055 * height))
-            y2 = int(round(bottom - 0.045 * height))
+            y1 = int(round(top + 0.025 * height))
+            y2 = int(round(bottom - 0.020 * height))
             boxes.append((
                 max(0, min(plate_width - 1, x1)),
                 max(0, min(plate_height - 1, y1)),
                 max(1, min(plate_width, x2)),
                 max(1, min(plate_height, y2)),
             ))
+            char_position += 1
             x += slot_w
         return boxes
 

@@ -127,6 +127,7 @@ def build_hopfield_ensemble(memory, device):
     return [
         ModernHopfieldNetwork(memory, beta=28.0, metric="dot", normalize=True, feature_mode="binary").to(device),
         ModernHopfieldNetwork(memory, beta=32.0, metric="dot", normalize=True, feature_mode="centered").to(device),
+        ModernHopfieldNetwork(memory, beta=30.0, metric="dot", normalize=True, feature_mode="binary_centered").to(device),
         ModernHopfieldNetwork(memory, beta=26.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
         ModernHopfieldNetwork(memory, beta=30.0, metric="dot", normalize=True, feature_mode="profile").to(device),
         ModernHopfieldNetwork(memory, beta=2.5, metric="euclidean", normalize=False, feature_mode="profile").to(device),
@@ -235,13 +236,19 @@ def robust_char_query_variants(tensor_img):
     base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
 
     variants = [base, normalize_char_image(base)]
-    _, otsu = cv2.threshold(base, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    blurred = cv2.GaussianBlur(base, (3, 3), 0)
+    _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(otsu > 0) > 0.55:
         otsu = cv2.bitwise_not(otsu)
     variants.append(normalize_char_image(otsu))
 
+    for scale, offset in ((1.25, -18), (1.45, -32)):
+        contrast = np.clip(base.astype(np.float32) * scale + offset, 0, 255).astype(np.uint8)
+        variants.append(normalize_char_image(contrast))
+
     kernels = [cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))]
     variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernels[0])))
+    variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_OPEN, kernels[0])))
     variants.append(normalize_char_image(cv2.medianBlur(otsu, 3)))
     variants.append(normalize_char_image(_keep_likely_character_components(otsu)))
 
@@ -352,11 +359,12 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False):
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
-    # Use consensus across preprocessing variants. Taking the single best
-    # variant is brittle: a noisy crop can accidentally match a wrong template
-    # with very high confidence. Log-mean keeps classes that are stable across
-    # variants and suppresses one-off hallucinations.
-    pooled_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
+    # End-to-end crops are less template-like than folder samples. Blend
+    # consensus with a small best-variant vote so a clean, well-normalized crop
+    # is not drowned out by harsher preprocessing variants.
+    mean_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
+    max_scores = torch.max(class_scores, dim=0).values
+    pooled_scores = 0.62 * mean_scores + 0.38 * max_scores
     class_idx = int(torch.argmax(pooled_scores).item())
     variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)
