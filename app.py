@@ -332,7 +332,11 @@ def recognize_tensor(tensor, template_mask=None):
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
-    pooled_scores = torch.max(class_scores, dim=0).values
+    # Use consensus across preprocessing variants. Taking the single best
+    # variant is brittle: a noisy crop can accidentally match a wrong template
+    # with very high confidence. Log-mean keeps classes that are stable across
+    # variants and suppresses one-off hallucinations.
+    pooled_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
     class_idx = int(torch.argmax(pooled_scores).item())
     variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)

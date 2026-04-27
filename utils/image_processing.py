@@ -1554,6 +1554,10 @@ class LPRPipeline:
             h = rows[-1] - rows[0] + 1
             w = cols[-1] - cols[0] + 1
             border = np.concatenate([foreground[0, :], foreground[-1, :], foreground[:, 0], foreground[:, -1]])
+            left_touch = float(np.mean(foreground[:, :2]))
+            right_touch = float(np.mean(foreground[:, -2:]))
+            top_touch = float(np.mean(foreground[:2, :]))
+            bottom_touch = float(np.mean(foreground[-2:, :]))
             contours, _ = cv2.findContours((foreground.astype(np.uint8) * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             component_penalty = min(max(0, len(contours) - (6 if idx == 0 else 4)) * 0.10, 0.35)
             ink_target = 0.28 if idx == 0 else 0.22
@@ -1562,7 +1566,19 @@ class LPRPipeline:
             width_target = 0.58 if idx == 0 else 0.48
             width_score = 1.0 - min(abs((w / 32.0) - width_target) / 0.48, 1.0)
             border_score = 1.0 - min(float(np.mean(border)) / 0.20, 1.0)
-            crop_scores.append(0.32 * ink_score + 0.30 * height_score + 0.20 * width_score + 0.18 * border_score - component_penalty)
+            side_cut_penalty = min(max(left_touch, right_touch) / 0.18, 1.0) * (0.28 if idx > 0 else 0.16)
+            vertical_cut_penalty = min(max(top_touch, bottom_touch) / 0.18, 1.0) * 0.16
+            too_narrow_penalty = 0.24 if idx > 0 and w < 0.28 * 32 else 0.0
+            crop_scores.append(
+                0.30 * ink_score
+                + 0.27 * height_score
+                + 0.25 * width_score
+                + 0.18 * border_score
+                - component_penalty
+                - side_cut_penalty
+                - vertical_cut_penalty
+                - too_narrow_penalty
+            )
         return 0.36 * count_score + 0.64 * float(np.mean(crop_scores))
 
     def _segment_chars_by_layout_guidance(self, plate_img, detections):
