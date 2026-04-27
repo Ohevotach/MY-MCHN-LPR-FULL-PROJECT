@@ -48,18 +48,20 @@ class PlateDetector:
     Set PLATE_DETECTOR_WEIGHTS to a local YOLO/ONNX license-plate detector.
     """
 
-    def __init__(self, weights_path=None, conf=0.35):
-        self.weights_path = self._resolve_weights_path(weights_path or os.environ.get("PLATE_DETECTOR_WEIGHTS"))
-        if not self.weights_path:
-            self.weights_path = self._find_default_weights()
+    def __init__(self, weights_path=None, conf=0.35, role="plate", auto_discover=True):
+        self.role = role
+        env_name = "CHAR_DETECTOR_WEIGHTS" if role == "char" else "PLATE_DETECTOR_WEIGHTS"
+        self.weights_path = self._resolve_weights_path(weights_path or os.environ.get(env_name))
+        if not self.weights_path and auto_discover:
+            self.weights_path = self._find_default_weights(role=role)
         self.conf = float(os.environ.get("PLATE_DETECTOR_CONF", conf))
         self.backend = None
         self.model = None
         if self.weights_path and os.path.exists(self.weights_path):
             self._load_model(self.weights_path)
         elif self.weights_path:
-            print(f"Warning: plate detector weights not found: {self.weights_path}")
-        else:
+            print(f"Warning: {role} detector weights not found: {self.weights_path}")
+        elif role == "plate":
             print("Warning: no plate detector weights found. Set PLATE_DETECTOR_WEIGHTS or train a YOLO plate detector.")
 
     @property
@@ -88,17 +90,28 @@ class PlateDetector:
         return path
 
     @staticmethod
-    def _find_default_weights():
-        candidates = [
-            "./runs/yolo/plate_yolo11n_ccpd_base/weights/best.pt",
-            "./runs/yolo/plate_yolo11n/weights/best.pt",
-            "./runs/detect/plate_yolo11n_ccpd_base/weights/best.pt",
-            "./runs/detect/plate_yolo11n/weights/best.pt",
-            "./runs/detect/train/weights/best.pt",
-        ]
+    def _find_default_weights(role="plate"):
+        if role == "char":
+            candidates = [
+                "./runs/yolo/char_yolo11n_real/weights/best.pt",
+                "./runs/yolo/char_yolo11n/weights/best.pt",
+                "./runs/yolo/char_yolo11n_synth/weights/best.pt",
+                "./runs/detect/char_yolo11n_real/weights/best.pt",
+                "./runs/detect/char_yolo11n/weights/best.pt",
+            ]
+            name_hints = ("char", "character")
+        else:
+            candidates = [
+                "./runs/yolo/plate_yolo11n_ccpd_base/weights/best.pt",
+                "./runs/yolo/plate_yolo11n/weights/best.pt",
+                "./runs/detect/plate_yolo11n_ccpd_base/weights/best.pt",
+                "./runs/detect/plate_yolo11n/weights/best.pt",
+                "./runs/detect/train/weights/best.pt",
+            ]
+            name_hints = ("plate", "license")
         for path in candidates:
             if os.path.exists(path):
-                print(f"Auto-loaded plate detector weights: {path}")
+                print(f"Auto-loaded {role} detector weights: {path}")
                 return path
         for root in ("./runs/yolo", "./runs/detect"):
             if not os.path.exists(root):
@@ -106,10 +119,12 @@ class PlateDetector:
             matches = []
             for current_root, _, files in os.walk(root):
                 if "best.pt" in files:
-                    matches.append(os.path.join(current_root, "best.pt"))
+                    lowered = current_root.lower()
+                    if any(hint in lowered for hint in name_hints):
+                        matches.append(os.path.join(current_root, "best.pt"))
             if matches:
                 matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                print(f"Auto-loaded latest plate detector weights: {matches[0]}")
+                print(f"Auto-loaded latest {role} detector weights: {matches[0]}")
                 return matches[0]
         return None
 
@@ -1103,10 +1118,11 @@ class LPRPipeline:
     def __init__(self, use_synthetic_pollution=False, detector_weights=None, char_detector_weights=None, use_opencv_fallback=None):
         self.enhancer = ImageEnhancer()
         self.segmenter = PlateSegmenter()
-        self.detector = PlateDetector(detector_weights)
+        self.detector = PlateDetector(detector_weights, role="plate")
         self.char_detector = PlateDetector(
             char_detector_weights or os.environ.get("CHAR_DETECTOR_WEIGHTS"),
             conf=float(os.environ.get("CHAR_DETECTOR_CONF", "0.25")),
+            role="char",
         )
         self.use_synthetic_pollution = use_synthetic_pollution
         if use_opencv_fallback is None:
@@ -1234,13 +1250,19 @@ class LPRPipeline:
             chars = []
             for _, box in sorted(detections, key=lambda item: item[1][0])[:7]:
                 x1, y1, x2, y2 = box
+                bw, bh = x2 - x1, y2 - y1
+                pad_x = max(1, int(0.08 * bw))
+                pad_y = max(1, int(0.08 * bh))
+                x1 = max(0, x1 - pad_x)
+                y1 = max(0, y1 - pad_y)
+                x2 = min(plate_img.shape[1], x2 + pad_x)
+                y2 = min(plate_img.shape[0], y2 + pad_y)
                 crop = plate_img[y1:y2, x1:x2]
                 if crop.size == 0:
                     continue
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                if np.mean(binary > 0) > 0.55:
-                    binary = cv2.bitwise_not(binary)
+                binary = PlateSegmenter._local_character_mask(crop, gray)
+                binary = PlateSegmenter._clean_slot_character(binary)
                 chars.append(PlateSegmenter._resize_char_canvas(binary))
             if len(chars) >= 5:
                 return chars

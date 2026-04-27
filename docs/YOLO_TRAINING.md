@@ -68,6 +68,14 @@ Each label line:
 
 Class `0` means `plate_char`. Do not label the dot separator as a character.
 
+For CCPD-style full-car images, you can generate an initial real character-box dataset without manual labeling. The helper rectifies each plate from the filename coordinates and writes seven approximate character boxes:
+
+```bash
+python scripts/ccpd_to_yolo_chars.py --src ./data/full_cars/ccpd_base --out ./dataset/yolo_chars --val-ratio 0.2
+```
+
+This is much more reliable than OpenCV threshold segmentation for blurry or reflective plates. The labels are slot-based, so inspect a few generated plate crops before long training. If the plate is badly tilted or the filename coordinates are wrong, remove those samples or relabel them manually.
+
 ## 3. Train Separately
 
 ```bash
@@ -76,6 +84,12 @@ python scripts/train_yolo.py --model ./yolo11n.pt --data ./configs/plate_detecti
 
 ```bash
 python scripts/train_yolo.py --model ./yolo11n.pt --data ./configs/char_detection.yaml --epochs 80 --imgsz 416 --batch 16 --name char_yolo11n
+```
+
+For about 200 CCPD images, use a smaller batch if needed and train a little longer:
+
+```bash
+python scripts/train_yolo.py --model ./yolo11n.pt --data ./configs/char_detection.yaml --epochs 120 --imgsz 416 --batch 8 --name char_yolo11n_real
 ```
 
 Or train both:
@@ -118,7 +132,7 @@ If validation precision is high but recall is low, add more images with small/ti
 
 ```bash
 export PLATE_DETECTOR_WEIGHTS=./runs/yolo/plate_yolo11n/weights/best.pt
-export CHAR_DETECTOR_WEIGHTS=./runs/yolo/char_yolo11n/weights/best.pt
+export CHAR_DETECTOR_WEIGHTS=./runs/yolo/char_yolo11n_real/weights/best.pt
 python app.py
 ```
 
@@ -133,7 +147,7 @@ In Kaggle notebooks, use Python environment variables:
 ```python
 import os
 os.environ["PLATE_DETECTOR_WEIGHTS"] = "./runs/yolo/plate_yolo11n/weights/best.pt"
-os.environ["CHAR_DETECTOR_WEIGHTS"] = "./runs/yolo/char_yolo11n/weights/best.pt"
+os.environ["CHAR_DETECTOR_WEIGHTS"] = "./runs/yolo/char_yolo11n_real/weights/best.pt"
 !python app.py
 ```
 
