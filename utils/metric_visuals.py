@@ -143,3 +143,28 @@ class MetricVisualizer:
         plt.tight_layout()
         plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
         plt.close()
+
+    def plot_confusion_matrix(self, matrix, labels, title, filename, normalize=True, max_labels=80):
+        data = np.asarray(matrix, dtype=float)
+        if normalize:
+            row_sum = data.sum(axis=1, keepdims=True)
+            data = np.divide(data, np.maximum(row_sum, 1.0)) * 100.0
+
+        label_count = len(labels)
+        if label_count > max_labels:
+            labels = labels[:max_labels]
+            data = data[:max_labels, :max_labels]
+            label_count = max_labels
+
+        fig_size = max(8, min(20, 0.32 * label_count + 4))
+        plt.figure(figsize=(fig_size, fig_size))
+        plt.imshow(data, aspect="auto", cmap="Blues", vmin=0, vmax=100 if normalize else None)
+        plt.colorbar(label="Recall (%)" if normalize else "Count")
+        plt.xticks(range(label_count), labels, rotation=90, fontsize=7, fontproperties=self.zh_font)
+        plt.yticks(range(label_count), labels, fontsize=7, fontproperties=self.zh_font)
+        plt.xlabel("Predicted")
+        plt.ylabel("Ground Truth")
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
+        plt.close()

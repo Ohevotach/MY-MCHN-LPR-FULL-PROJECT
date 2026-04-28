@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from dataset.lp_dataset import PollutedCharDataset, TemplateLoader, build_class_memory, normalize_char_tensor
 from models.mchn import ModernHopfieldNetwork
+from models.traditional_hopfield import TraditionalHopfieldNetwork
 from utils.image_processing import LPRPipeline
 from utils.metric_visuals import MetricVisualizer
 
@@ -158,6 +159,10 @@ def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_m
     return fused, primary_sim
 
 
+def predict_modern_hopfield_scores(models, q, template_labels, num_classes, template_mask=None):
+    return ensemble_hopfield_scores(models, q, template_labels, num_classes, template_mask=template_mask)[0]
+
+
 def predict_nearest_neighbor(q, train_memory, train_labels, metric):
     if metric == "cosine":
         qn = F.normalize(q, dim=-1)
@@ -277,6 +282,49 @@ def evaluate_methods(methods, test_loader, device):
     return {name: 100.0 * value / max(total, 1) for name, value in correct.items()}
 
 
+def evaluate_topk_score_methods(score_methods, test_loader, device, topk=(1, 3)):
+    correct = {name: {k: 0 for k in topk} for name in score_methods}
+    total = 0
+    with torch.no_grad():
+        for q, _, labels in test_loader:
+            q = q.to(device)
+            labels = labels.to(device)
+            max_k = max(topk)
+            for name, scorer in score_methods.items():
+                scores = scorer(q)
+                _, pred = torch.topk(scores, k=min(max_k, scores.shape[-1]), dim=-1)
+                for k in topk:
+                    kk = min(k, pred.shape[-1])
+                    correct[name][k] += pred[:, :kk].eq(labels.unsqueeze(1)).any(dim=1).sum().item()
+            total += labels.size(0)
+    return {
+        name: {k: 100.0 * value / max(total, 1) for k, value in values.items()}
+        for name, values in correct.items()
+    }
+
+
+def collect_prediction_outputs(methods, test_loader, device):
+    labels_all = []
+    preds_all = {name: [] for name in methods}
+    with torch.no_grad():
+        for q, _, labels in test_loader:
+            q = q.to(device)
+            labels = labels.to(device)
+            labels_all.append(labels.detach().cpu())
+            for name, predictor in methods.items():
+                preds_all[name].append(predictor(q).detach().cpu())
+    labels_all = torch.cat(labels_all, dim=0)
+    preds_all = {name: torch.cat(parts, dim=0) for name, parts in preds_all.items()}
+    return labels_all, preds_all
+
+
+def build_confusion_matrix(labels, preds, num_classes):
+    matrix = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    for target, pred in zip(labels.view(-1), preds.view(-1)):
+        matrix[int(target), int(pred)] += 1
+    return matrix.numpy()
+
+
 def select_best_template_in_class(sim_scores, template_labels, pred_classes):
     labels = template_labels.to(sim_scores.device)
     selected = []
@@ -331,12 +379,14 @@ def run_robustness_evaluation(
     num_classes = len(loader.idx_to_label)
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
+    traditional_hopfield = TraditionalHopfieldNetwork(train_memory, train_labels, steps=8).to(device)
 
     def make_methods():
         return {
             "Modern Hopfield": lambda q: torch.argmax(
-                ensemble_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes)[0], dim=-1
+                predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
             ),
+            "Traditional Hopfield": lambda q: traditional_hopfield.predict(q),
             "Affine-robust Hopfield": lambda q: predict_affine_robust_hopfield(hopfield_models, q, hopfield_labels, num_classes),
             "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
             "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
@@ -344,7 +394,14 @@ def run_robustness_evaluation(
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
         }
 
+    def make_score_methods():
+        return {
+            "Modern Hopfield": lambda q: predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes),
+            "CNN": lambda q: trained_cnn(q),
+        }
+
     results = {name: [] for name in make_methods()}
+    top3_results = {f"{name} Top-3": [] for name in make_score_methods()}
     for severity in SEVERITIES:
         test_dataset = PollutedCharDataset(
             loader,
@@ -356,9 +413,19 @@ def run_robustness_evaluation(
         )
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
         accs = evaluate_methods(make_methods(), test_loader, device)
+        topk_accs = evaluate_topk_score_methods(make_score_methods(), test_loader, device, topk=(3,))
         for name, acc in accs.items():
             results[name].append(acc)
-        print("  severity=" + f"{severity:.1f}: " + " | ".join(f"{k}: {v:.2f}%" for k, v in accs.items()))
+        for name, values in topk_accs.items():
+            top3_results[f"{name} Top-3"].append(values[3])
+        top3_text = " | ".join(f"{k}: {v[-1]:.2f}%" for k, v in top3_results.items())
+        print(
+            "  severity="
+            + f"{severity:.1f}: "
+            + " | ".join(f"{k}: {v:.2f}%" for k, v in accs.items())
+            + " | "
+            + top3_text
+        )
 
     visualizer.plot_multi_robustness_curve(
         SEVERITIES,
@@ -372,7 +439,96 @@ def run_robustness_evaluation(
         severity=SEVERITIES[-1],
         filename=f"robustness_{pollution_type}_methods_final_bar.png",
     )
+    save_topk_results_csv(visualizer.save_dir, pollution_type, top3_results)
+    save_confusion_reports(
+        visualizer,
+        pollution_type,
+        loader.idx_to_label,
+        make_methods(),
+        loader,
+        test_indices,
+        batch_size,
+        device,
+        severity=SEVERITIES[-1],
+        method_names=("Modern Hopfield", "Traditional Hopfield", "CNN"),
+    )
     return results
+
+
+def run_ablation_evaluation(
+    loader,
+    visualizer,
+    device,
+    train_indices,
+    test_indices,
+    samples,
+    batch_size,
+    pollution_type="mixed",
+    severity=0.6,
+    seed=2026,
+):
+    print("\n" + "=" * 50)
+    print(f"Task 2b: ablation study, pollution={pollution_type}, severity={severity}...")
+    train_memory = loader.memory_matrix[train_indices].to(device)
+    train_labels = loader.labels[train_indices].to(device)
+    aug_memory, aug_labels = augment_hopfield_memory(train_memory, train_labels)
+    num_classes = len(loader.idx_to_label)
+
+    ablations = {
+        "MCHN-Raw": (
+            [ModernHopfieldNetwork(train_memory, beta=30.0, metric="dot", normalize=True, feature_mode="raw").to(device)],
+            train_labels,
+        ),
+        "MCHN-Binary": (
+            [ModernHopfieldNetwork(train_memory, beta=30.0, metric="dot", normalize=True, feature_mode="binary").to(device)],
+            train_labels,
+        ),
+        "MCHN-Shape": (
+            [ModernHopfieldNetwork(train_memory, beta=28.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device)],
+            train_labels,
+        ),
+        "MCHN-Profile": (
+            [ModernHopfieldNetwork(train_memory, beta=30.0, metric="dot", normalize=True, feature_mode="profile").to(device)],
+            train_labels,
+        ),
+        "MCHN-Ensemble-NoAug": (build_hopfield_ensemble(train_memory, device), train_labels),
+        "MCHN-Ensemble-Aug": (build_hopfield_ensemble(aug_memory, device), aug_labels),
+    }
+
+    dataset = PollutedCharDataset(
+        loader,
+        virtual_size=samples,
+        pollution_type=pollution_type,
+        severity=severity,
+        seed=seed + 17,
+        sample_indices=test_indices,
+    )
+    test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    methods = {
+        name: (lambda q, models=models, labels=labels: torch.argmax(
+            predict_modern_hopfield_scores(models, q, labels, num_classes),
+            dim=-1,
+        ))
+        for name, (models, labels) in ablations.items()
+    }
+    scores = evaluate_methods(methods, test_loader, device)
+    for name, value in scores.items():
+        print(f"  {name}: {value:.2f}%")
+
+    csv_path = os.path.join(visualizer.save_dir, "ablation_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pollution", "severity", "method", "accuracy"])
+        for name, value in scores.items():
+            writer.writerow([pollution_type, severity, name, f"{value:.4f}"])
+    visualizer.plot_final_severity_bar(
+        scores,
+        pollution_type=f"ablation_{pollution_type}",
+        severity=severity,
+        filename="ablation_final_bar.png",
+    )
+    print(f"Saved ablation CSV: {csv_path}")
+    return scores
 
 
 def build_class_memory_from_tensors(memory, labels):
@@ -394,6 +550,84 @@ def save_results_csv(output_dir, all_results):
             for method, values in method_results.items():
                 writer.writerow([pollution, method, *[f"{value:.4f}" for value in values]])
     print(f"Saved CSV: {csv_path}")
+
+
+def save_topk_results_csv(output_dir, pollution_type, topk_results):
+    csv_path = os.path.join(output_dir, f"topk_{pollution_type}_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pollution", "metric", *[f"severity_{s}" for s in SEVERITIES]])
+        for metric, values in topk_results.items():
+            writer.writerow([pollution_type, metric, *[f"{value:.4f}" for value in values]])
+    print(f"Saved Top-k CSV: {csv_path}")
+
+
+def save_confusion_reports(
+    visualizer,
+    pollution_type,
+    idx_to_label,
+    methods,
+    loader,
+    test_indices,
+    batch_size,
+    device,
+    severity,
+    method_names=("Modern Hopfield",),
+):
+    selected_methods = {name: methods[name] for name in method_names if name in methods}
+    if not selected_methods:
+        return
+
+    dataset = PollutedCharDataset(
+        loader,
+        virtual_size=max(1000, len(test_indices) * 20),
+        pollution_type=pollution_type,
+        severity=severity,
+        seed=3026,
+        sample_indices=test_indices,
+    )
+    test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    true_labels, predictions = collect_prediction_outputs(selected_methods, test_loader, device)
+    label_names = [str(idx_to_label[i]) for i in range(len(idx_to_label))]
+
+    for method_name, pred_labels in predictions.items():
+        safe_name = method_name.lower().replace(" ", "_").replace("-", "_")
+        matrix = build_confusion_matrix(true_labels, pred_labels, len(idx_to_label))
+        matrix_path = os.path.join(visualizer.save_dir, f"confusion_{pollution_type}_{safe_name}.csv")
+        with open(matrix_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["true\\pred", *label_names])
+            for label_name, row in zip(label_names, matrix):
+                writer.writerow([label_name, *row.tolist()])
+        visualizer.plot_confusion_matrix(
+            matrix,
+            label_names,
+            title=f"{method_name} confusion matrix ({pollution_type}, severity={severity})",
+            filename=f"confusion_{pollution_type}_{safe_name}.png",
+        )
+        save_top_confusions_csv(visualizer.save_dir, pollution_type, safe_name, matrix, label_names)
+        print(f"Saved confusion report: {matrix_path}")
+
+
+def save_top_confusions_csv(output_dir, pollution_type, method_name, matrix, label_names, top_n=30):
+    pairs = []
+    for i in range(matrix.shape[0]):
+        row_total = int(matrix[i].sum())
+        if row_total == 0:
+            continue
+        for j in range(matrix.shape[1]):
+            if i == j or matrix[i, j] == 0:
+                continue
+            pairs.append((int(matrix[i, j]), row_total, label_names[i], label_names[j]))
+    pairs.sort(key=lambda item: item[0], reverse=True)
+
+    csv_path = os.path.join(output_dir, f"top_confusions_{pollution_type}_{method_name}.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["wrong_count", "true_total", "true_label", "pred_label", "error_rate"])
+        for wrong_count, true_total, true_label, pred_label in pairs[:top_n]:
+            writer.writerow([wrong_count, true_total, true_label, pred_label, f"{wrong_count / max(true_total, 1):.4f}"])
+    print(f"Saved top confusions CSV: {csv_path}")
 
 
 def save_mchn_memory_artifacts(loader, train_indices, test_indices, hopfield_memory, hopfield_labels, output_dir="./saved_weights"):
@@ -509,6 +743,10 @@ def parse_args():
     parser.add_argument("--cnn-train-samples", type=int, default=20000)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--skip-ablation", action="store_true")
+    parser.add_argument("--ablation-samples", type=int, default=1000)
+    parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
+    parser.add_argument("--ablation-severity", type=float, default=0.6)
     parser.add_argument("--skip-e2e", action="store_true", default=True)
     parser.add_argument("--run-e2e", action="store_false", dest="skip_e2e")
     parser.add_argument("--data-dir", default="./data")
@@ -584,6 +822,20 @@ if __name__ == "__main__":
     save_results_csv(args.output_dir, all_results)
     if args.pollution == "all":
         plot_all_pollution_summary(visualizer, all_results)
+
+    if not args.skip_ablation:
+        run_ablation_evaluation(
+            loader,
+            visualizer,
+            device,
+            train_indices=train_indices,
+            test_indices=test_indices,
+            samples=args.ablation_samples,
+            batch_size=args.batch_size,
+            pollution_type=args.ablation_pollution,
+            severity=args.ablation_severity,
+            seed=args.seed,
+        )
 
     if not args.skip_e2e:
         run_end_to_end_system(loader, device, test_dir=os.path.join(args.data_dir, "full_cars", "ccpd_weather"))
