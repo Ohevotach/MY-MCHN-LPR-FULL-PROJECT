@@ -704,6 +704,14 @@ class PlateSegmenter:
             if candidate_bottom - candidate_top >= 42:
                 top, bottom = candidate_top, candidate_bottom
 
+        char_cols = np.where((binary[top:bottom, :] > 0).sum(axis=0) > 2)[0]
+        if len(char_cols) >= 60:
+            candidate_left = max(12, int(char_cols[0]) - 6)
+            candidate_right = min(cls.PLATE_W - 12, int(char_cols[-1]) + 7)
+            if candidate_right - candidate_left >= 260:
+                left = max(left, candidate_left)
+                right = min(right, candidate_right)
+
         if right - left < 300:
             left, right = 18, 382
         if bottom - top < 56:
@@ -715,8 +723,8 @@ class PlateSegmenter:
     @staticmethod
     def _crop_slot_char(plate_img, gray, binary, box, position=None):
         x, y, w, h = box
-        pad_x = max(1, int(round(w * (0.10 if position == 0 else 0.07))))
-        pad_y = max(1, int(round(h * 0.08)))
+        pad_x = max(0, int(round(w * (0.025 if position in (0, 6) else 0.015))))
+        pad_y = max(1, int(round(h * 0.045)))
         x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
         x2, y2 = min(binary.shape[1], x + w + pad_x), min(binary.shape[0], y + h + pad_y)
         if x2 <= x1 or y2 <= y1:
@@ -726,6 +734,7 @@ class PlateSegmenter:
         if int(np.count_nonzero(slot_binary)) < 8:
             slot_binary = binary[y1:y2, x1:x2]
 
+        slot_binary = PlateSegmenter._erase_slot_frame_margins(slot_binary, position=position)
         slot_binary = PlateSegmenter._clean_slot_character(slot_binary, position=position)
         slot_gray = gray[y1:y2, x1:x2]
         return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary, deskew=True)
@@ -788,6 +797,7 @@ class PlateSegmenter:
                 continue
             if ink < 0.055:
                 current = cv2.dilate(current, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+            current = PlateSegmenter._erase_slot_frame_margins(current)
             score = PlateSegmenter._slot_mask_score(current)
             if score > best_score:
                 best_score = score
@@ -822,11 +832,7 @@ class PlateSegmenter:
     def _clean_slot_character(slot_binary, position=None):
         if slot_binary.size == 0:
             return slot_binary
-        cleaned = slot_binary.copy()
-        cleaned[:1, :] = 0
-        cleaned[-1:, :] = 0
-        cleaned[:, :1] = 0
-        cleaned[:, -1:] = 0
+        cleaned = PlateSegmenter._erase_slot_frame_margins(slot_binary, position=position)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
         cleaned = PlateSegmenter._remove_slot_border_lines(cleaned)
 
@@ -901,10 +907,43 @@ class PlateSegmenter:
         cleaned = mask.copy()
         horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(cleaned.shape[1] * 0.72)), 1)))
         edge_mask = np.zeros_like(cleaned)
-        edge_mask[:3, :] = 255
-        edge_mask[-3:, :] = 255
+        edge_band = max(2, int(round(cleaned.shape[0] * 0.055)))
+        edge_mask[:edge_band, :] = 255
+        edge_mask[-edge_band:, :] = 255
         edge_lines = cv2.bitwise_and(horizontal, edge_mask)
-        return cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
+
+        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(14, int(cleaned.shape[0] * 0.62)))))
+        side_mask = np.zeros_like(cleaned)
+        side_band = max(2, int(round(cleaned.shape[1] * 0.10)))
+        side_mask[:, :side_band] = 255
+        side_mask[:, -side_band:] = 255
+        side_lines = cv2.bitwise_and(vertical, side_mask)
+
+        return cv2.bitwise_and(cleaned, cv2.bitwise_not(cv2.bitwise_or(edge_lines, side_lines)))
+
+    @staticmethod
+    def _erase_slot_frame_margins(mask, position=None):
+        if mask is None or mask.size == 0:
+            return mask
+        cleaned = (mask > 0).astype(np.uint8) * 255
+        h_img, w_img = cleaned.shape[:2]
+        if h_img < 8 or w_img < 6:
+            return cleaned
+
+        top_band = max(1, int(round(0.045 * h_img)))
+        bottom_band = max(1, int(round(0.050 * h_img)))
+        side_band = max(1, int(round((0.055 if position in (0, 6) else 0.040) * w_img)))
+
+        if np.mean(cleaned[: top_band + 1, :] > 0) > 0.10:
+            cleaned[:top_band, :] = 0
+        if np.mean(cleaned[h_img - bottom_band - 1 :, :] > 0) > 0.10:
+            cleaned[h_img - bottom_band :, :] = 0
+        if np.mean(cleaned[:, : side_band + 1] > 0) > 0.12:
+            cleaned[:, :side_band] = 0
+        if np.mean(cleaned[:, w_img - side_band - 1 :] > 0) > 0.12:
+            cleaned[:, w_img - side_band :] = 0
+
+        return cleaned
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -1942,18 +1981,18 @@ class LPRPipeline:
                 x += slot_w
                 continue
             if char_position == 0:
-                pad_ratio = 0.025
+                pad_ratio = 0.050
             elif char_position == 1:
-                pad_ratio = 0.018
-            elif char_position == 6:
                 pad_ratio = 0.035
+            elif char_position == 6:
+                pad_ratio = 0.065
             else:
-                pad_ratio = 0.055
+                pad_ratio = 0.050
             pad = max(1.0, pad_ratio * slot_w)
             x1 = int(round(x + pad))
             x2 = int(round(x + slot_w - pad))
-            y1 = int(round(top + 0.025 * height))
-            y2 = int(round(bottom - 0.020 * height))
+            y1 = int(round(top + 0.060 * height))
+            y2 = int(round(bottom - 0.055 * height))
             boxes.append((
                 max(0, min(plate_width - 1, x1)),
                 max(0, min(plate_height - 1, y1)),
