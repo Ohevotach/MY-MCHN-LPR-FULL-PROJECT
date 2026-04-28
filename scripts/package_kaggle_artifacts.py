@@ -1,17 +1,10 @@
-import argparse
+﻿import argparse
 import os
 import zipfile
 from pathlib import Path
 
 
 DEFAULT_PATTERNS = [
-<<<<<<< HEAD
-=======
-    "saved_weights/*.pt",
-    "saved_weights/*.onnx",
-    "saved_weights/*.yaml",
-    "saved_weights/*.csv",
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     "runs/**/weights/best.pt",
     "runs/**/weights/last.pt",
     "runs/**/*.yaml",

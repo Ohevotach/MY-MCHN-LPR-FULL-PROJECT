@@ -1,4 +1,4 @@
-# YOLO Two-Stage Training
+﻿# YOLO Two-Stage Training
 
 The main pipeline is:
 
@@ -119,7 +119,6 @@ python scripts/ccpd_to_yolo_plate.py --src ./data/full_cars/ccpd_base --out ./da
 python scripts/train_yolo.py --model ./yolo11n.pt --data ./configs/plate_detection.yaml --epochs 120 --imgsz 640 --batch 8 --name plate_yolo11n_ccpd_base
 ```
 
-<<<<<<< HEAD
 After training, reusable checkpoints are copied to `./saved_weights`:
 
 ```text
@@ -145,12 +144,6 @@ On Windows PowerShell, run the app with the trained detector:
 
 ```powershell
 $env:PLATE_DETECTOR_WEIGHTS="./saved_weights/plate_yolo11n_ccpd_base_best.pt"
-=======
-On Windows PowerShell, run the app with the trained detector:
-
-```powershell
-$env:PLATE_DETECTOR_WEIGHTS="./runs/yolo/plate_yolo11n_ccpd_base/weights/best.pt"
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 python app.py
 ```
 
@@ -158,7 +151,6 @@ If validation precision is high but recall is low, add more images with small/ti
 
 ## 4. Run App
 
-<<<<<<< HEAD
 ```bash
 export PLATE_DETECTOR_WEIGHTS=./saved_weights/plate_yolo11n_best.pt
 export CHAR_DETECTOR_WEIGHTS=./saved_weights/char_yolo11n_real_best.pt
@@ -166,29 +158,6 @@ python app.py
 ```
 
 If these variables are not set, the app searches `./saved_weights` first and then falls back to `./runs`.
-=======
-The app now auto-loads reusable artifacts from:
-
-```text
-saved_weights/plate_best.pt
-saved_weights/char_best.pt
-saved_weights/template_cache_32x64.pt
-```
-
-After training on Kaggle, collect the latest artifacts with:
-
-```bash
-python scripts/collect_saved_weights.py --include-last --include-kaggle-cache
-```
-
-Download the `saved_weights` folder. On the next Kaggle run, put that folder back in the project root to avoid retraining. For continued YOLO training, use `saved_weights/plate_last.pt` or `saved_weights/char_last.pt` as `--model`.
-
-```bash
-export PLATE_DETECTOR_WEIGHTS=./runs/yolo/plate_yolo11n/weights/best.pt
-export CHAR_DETECTOR_WEIGHTS=./runs/yolo/char_yolo11n_real/weights/best.pt
-python app.py
-```
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 
 If no plate detector weights are set, the app will not silently rely on OpenCV plate localization. To allow the old rule-based fallback for comparison only:
 
@@ -200,13 +169,8 @@ In Kaggle notebooks, use Python environment variables:
 
 ```python
 import os
-<<<<<<< HEAD
 os.environ["PLATE_DETECTOR_WEIGHTS"] = "./saved_weights/plate_yolo11n_best.pt"
 os.environ["CHAR_DETECTOR_WEIGHTS"] = "./saved_weights/char_yolo11n_real_best.pt"
-=======
-os.environ["PLATE_DETECTOR_WEIGHTS"] = "./runs/yolo/plate_yolo11n/weights/best.pt"
-os.environ["CHAR_DETECTOR_WEIGHTS"] = "./runs/yolo/char_yolo11n_real/weights/best.pt"
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 !python app.py
 ```
 

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 
 import cv2
@@ -93,17 +93,10 @@ class PlateDetector:
     def _find_default_weights(role="plate"):
         if role == "char":
             candidates = [
-<<<<<<< HEAD
                 "./saved_weights/char_yolo11n_real_best.pt",
                 "./saved_weights/char_yolo11n_best.pt",
                 "./saved_weights/char_yolo11n_synth_best.pt",
                 "./saved_weights/char_best.pt",
-=======
-                os.path.join(os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights"), "char_best.pt"),
-                os.path.join(os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights"), "char_last.pt"),
-                "./saved_weights/char_best.pt",
-                "./saved_weights/char_last.pt",
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
                 "./runs/yolo/char_yolo11n_real/weights/best.pt",
                 "./runs/yolo/char_yolo11n/weights/best.pt",
                 "./runs/yolo/char_yolo11n_synth/weights/best.pt",
@@ -113,16 +106,9 @@ class PlateDetector:
             name_hints = ("char", "character")
         else:
             candidates = [
-<<<<<<< HEAD
                 "./saved_weights/plate_yolo11n_ccpd_base_best.pt",
                 "./saved_weights/plate_yolo11n_best.pt",
                 "./saved_weights/plate_best.pt",
-=======
-                os.path.join(os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights"), "plate_best.pt"),
-                os.path.join(os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights"), "plate_last.pt"),
-                "./saved_weights/plate_best.pt",
-                "./saved_weights/plate_last.pt",
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
                 "./runs/yolo/plate_yolo11n_ccpd_base/weights/best.pt",
                 "./runs/yolo/plate_yolo11n/weights/best.pt",
                 "./runs/detect/plate_yolo11n_ccpd_base/weights/best.pt",
@@ -134,16 +120,11 @@ class PlateDetector:
             if os.path.exists(path):
                 print(f"Auto-loaded {role} detector weights: {path}")
                 return path
-<<<<<<< HEAD
         for root in ("./saved_weights", "./runs/yolo", "./runs/detect"):
-=======
-        for root in ("./runs/yolo", "./runs/detect"):
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
             if not os.path.exists(root):
                 continue
             matches = []
             for current_root, _, files in os.walk(root):
-<<<<<<< HEAD
                 for file_name in files:
                     lowered_name = file_name.lower()
                     if not (lowered_name == "best.pt" or lowered_name.endswith("_best.pt")):
@@ -151,12 +132,6 @@ class PlateDetector:
                     lowered = f"{current_root}/{file_name}".lower()
                     if any(hint in lowered for hint in name_hints):
                         matches.append(os.path.join(current_root, file_name))
-=======
-                if "best.pt" in files:
-                    lowered = current_root.lower()
-                    if any(hint in lowered for hint in name_hints):
-                        matches.append(os.path.join(current_root, "best.pt"))
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
             if matches:
                 matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
                 print(f"Auto-loaded latest {role} detector weights: {matches[0]}")
@@ -739,17 +714,6 @@ class PlateSegmenter:
             if candidate_bottom - candidate_top >= 42:
                 top, bottom = candidate_top, candidate_bottom
 
-<<<<<<< HEAD
-=======
-        char_cols = np.where((binary[top:bottom, :] > 0).sum(axis=0) > 2)[0]
-        if len(char_cols) >= 60:
-            candidate_left = max(12, int(char_cols[0]) - 6)
-            candidate_right = min(cls.PLATE_W - 12, int(char_cols[-1]) + 7)
-            if candidate_right - candidate_left >= 260:
-                left = max(left, candidate_left)
-                right = min(right, candidate_right)
-
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
         if right - left < 300:
             left, right = 18, 382
         if bottom - top < 56:
@@ -761,13 +725,8 @@ class PlateSegmenter:
     @staticmethod
     def _crop_slot_char(plate_img, gray, binary, box, position=None):
         x, y, w, h = box
-<<<<<<< HEAD
         pad_x = max(1, int(round(w * (0.10 if position == 0 else 0.07))))
         pad_y = max(1, int(round(h * 0.08)))
-=======
-        pad_x = max(0, int(round(w * (0.025 if position in (0, 6) else 0.015))))
-        pad_y = max(1, int(round(h * 0.045)))
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
         x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
         x2, y2 = min(binary.shape[1], x + w + pad_x), min(binary.shape[0], y + h + pad_y)
         if x2 <= x1 or y2 <= y1:
@@ -777,10 +736,6 @@ class PlateSegmenter:
         if int(np.count_nonzero(slot_binary)) < 8:
             slot_binary = binary[y1:y2, x1:x2]
 
-<<<<<<< HEAD
-=======
-        slot_binary = PlateSegmenter._erase_slot_frame_margins(slot_binary, position=position)
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
         slot_binary = PlateSegmenter._clean_slot_character(slot_binary, position=position)
         slot_gray = gray[y1:y2, x1:x2]
         return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary, deskew=True)
@@ -843,10 +798,6 @@ class PlateSegmenter:
                 continue
             if ink < 0.055:
                 current = cv2.dilate(current, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
-<<<<<<< HEAD
-=======
-            current = PlateSegmenter._erase_slot_frame_margins(current)
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
             score = PlateSegmenter._slot_mask_score(current)
             if score > best_score:
                 best_score = score
@@ -881,15 +832,11 @@ class PlateSegmenter:
     def _clean_slot_character(slot_binary, position=None):
         if slot_binary.size == 0:
             return slot_binary
-<<<<<<< HEAD
         cleaned = slot_binary.copy()
         cleaned[:1, :] = 0
         cleaned[-1:, :] = 0
         cleaned[:, :1] = 0
         cleaned[:, -1:] = 0
-=======
-        cleaned = PlateSegmenter._erase_slot_frame_margins(slot_binary, position=position)
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
         cleaned = PlateSegmenter._remove_slot_border_lines(cleaned)
 
@@ -912,13 +859,6 @@ class PlateSegmenter:
                     continue
                 if y + h >= 0.84 * h_img and h <= 0.20 * h_img and area < 0.08 * h_img * w_img:
                     continue
-<<<<<<< HEAD
-=======
-                if position == 1 and x > 0.63 * w_img and h <= 0.38 * h_img and area < 0.10 * h_img * w_img:
-                    continue
-                if position >= 2 and x < 0.28 * w_img and h <= 0.34 * h_img and area < 0.08 * h_img * w_img:
-                    continue
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
             if w >= 0.85 * w_img and h <= 0.10 * h_img and (y <= 2 or y + h >= h_img - 2):
                 continue
             if h >= 0.94 * h_img and w <= 0.055 * w_img and (x <= 1 or x + w >= w_img - 1):
@@ -971,61 +911,10 @@ class PlateSegmenter:
         cleaned = mask.copy()
         horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(cleaned.shape[1] * 0.72)), 1)))
         edge_mask = np.zeros_like(cleaned)
-<<<<<<< HEAD
         edge_mask[:3, :] = 255
         edge_mask[-3:, :] = 255
         edge_lines = cv2.bitwise_and(horizontal, edge_mask)
         return cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
-=======
-        edge_band = max(2, int(round(cleaned.shape[0] * 0.055)))
-        edge_mask[:edge_band, :] = 255
-        edge_mask[-edge_band:, :] = 255
-        edge_lines = cv2.bitwise_and(horizontal, edge_mask)
-
-        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(14, int(cleaned.shape[0] * 0.62)))))
-        side_mask = np.zeros_like(cleaned)
-        side_band = max(2, int(round(cleaned.shape[1] * 0.10)))
-        side_mask[:, :side_band] = 255
-        side_mask[:, -side_band:] = 255
-        side_lines = cv2.bitwise_and(vertical, side_mask)
-
-        return cv2.bitwise_and(cleaned, cv2.bitwise_not(cv2.bitwise_or(edge_lines, side_lines)))
-
-    @staticmethod
-    def _erase_slot_frame_margins(mask, position=None):
-        if mask is None or mask.size == 0:
-            return mask
-        original = (mask > 0).astype(np.uint8) * 255
-        cleaned = original.copy()
-        h_img, w_img = cleaned.shape[:2]
-        if h_img < 8 or w_img < 6:
-            return cleaned
-
-        top_band = max(1, int(round(0.045 * h_img)))
-        bottom_band = max(1, int(round(0.050 * h_img)))
-        side_band = max(1, int(round((0.055 if position in (0, 6) else 0.040) * w_img)))
-
-        if np.mean(cleaned[: top_band + 1, :] > 0) > 0.065:
-            cleaned[:top_band, :] = 0
-        if np.mean(cleaned[h_img - bottom_band - 1 :, :] > 0) > 0.065:
-            cleaned[h_img - bottom_band :, :] = 0
-        if np.mean(cleaned[:, : side_band + 1] > 0) > 0.075:
-            cleaned[:, :side_band] = 0
-        if np.mean(cleaned[:, w_img - side_band - 1 :] > 0) > 0.075:
-            cleaned[:, w_img - side_band :] = 0
-
-        before = int(np.count_nonzero(original))
-        after = int(np.count_nonzero(cleaned))
-        if before > 0 and after < 0.54 * before:
-            fallback = original.copy()
-            fallback[:1, :] = 0
-            fallback[-1:, :] = 0
-            fallback[:, :1] = 0
-            fallback[:, -1:] = 0
-            return fallback
-
-        return cleaned
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -1651,11 +1540,7 @@ class LPRPipeline:
         if not candidates:
             return []
 
-<<<<<<< HEAD
         source_bias = {"layout": 0.45, "detector": -0.25, "opencv": 0.00, "opencv_partial": -0.25}
-=======
-        source_bias = {"layout": 0.55, "detector": -0.35, "opencv": 0.00, "opencv_partial": -0.25}
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
         best_name, best_chars = max(
             candidates,
             key=lambda item: self._char_sequence_score(item[1]) + source_bias.get(item[0], 0.0),
@@ -1727,77 +1612,15 @@ class LPRPipeline:
         if plate_img is None or plate_img.size == 0:
             return []
 
-<<<<<<< HEAD
         work = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
         work = PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(work)))
         work = self._rectify_text_band_from_detections(work, detections)
         work = self._deskew_plate_text_band(work)
-=======
-        src_h, src_w = plate_img.shape[:2]
-        base = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
-        scaled_detections = self._scale_detections(
-            detections,
-            src_w,
-            src_h,
-            PlateSegmenter.PLATE_W,
-            PlateSegmenter.PLATE_H,
-        )
-        work_candidates = []
-
-        def add_work(name, img, dets=None):
-            if img is None or img.size == 0:
-                return
-            work = cv2.resize(img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
-            key = work[::8, ::8].tobytes()
-            if any(existing_key == key for _, _, _, existing_key in work_candidates):
-                return
-            work_candidates.append((name, work, dets, key))
-
-        add_work("base", PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(base))), scaled_detections)
-        add_work("text_perspective", self._rectify_text_band_from_detections(base, scaled_detections), None)
-        add_work(
-            "text_then_color",
-            PlateSegmenter._tighten_plate_crop(
-                PlateSegmenter._deskew_plate(
-                    PlateSegmenter._rectify_plate_perspective(self._rectify_text_band_from_detections(base, scaled_detections))
-                )
-            ),
-            None,
-        )
-        add_work("deskewed", self._deskew_plate_text_band(base), scaled_detections)
-
-        best_chars = []
-        best_score = -1.0
-        for name, work, dets, _ in work_candidates:
-            chars, score = self._layout_chars_from_work(work, dets)
-            if name.startswith("text"):
-                score += 0.08
-            if score > best_score:
-                best_score = score
-                best_chars = chars
-        return best_chars
-
-    @staticmethod
-    def _scale_detections(detections, src_w, src_h, dst_w, dst_h):
-        if not detections or src_w <= 0 or src_h <= 0:
-            return []
-        sx = float(dst_w) / float(src_w)
-        sy = float(dst_h) / float(src_h)
-        scaled = []
-        for conf, box in detections:
-            x1, y1, x2, y2 = box
-            scaled.append((conf, (int(round(x1 * sx)), int(round(y1 * sy)), int(round(x2 * sx)), int(round(y2 * sy)))))
-        return scaled
-
-    def _layout_chars_from_work(self, work, detections=None):
-        work = cv2.resize(work, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
         gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(work, gray))
 
         rois = []
-<<<<<<< HEAD
         for roi in (
             self._text_roi_from_detections_or_plate(work, binary, detections),
             PlateSegmenter._estimate_plate_text_roi(work, binary),
@@ -1807,20 +1630,10 @@ class LPRPipeline:
                 continue
             if roi not in rois:
                 rois.append(roi)
-=======
-        if detections:
-            rois.append(self._text_roi_from_detections_or_plate(work, binary, detections))
-        rois.extend([PlateSegmenter._estimate_plate_text_roi(work, binary), self._canonical_text_roi_from_binary(binary)])
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 
         best_chars = []
         best_score = -1.0
         for roi in rois:
-<<<<<<< HEAD
-=======
-            if roi is None:
-                continue
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
             left, top, right, bottom = roi
             boxes = self._license_plate_layout_boxes(left, top, right, bottom, PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H)
             if len(boxes) != 7:
@@ -1830,11 +1643,7 @@ class LPRPipeline:
             if score > best_score:
                 best_score = score
                 best_chars = chars
-<<<<<<< HEAD
         return best_chars
-=======
-        return best_chars, best_score
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 
     @staticmethod
     def _canonical_text_roi_from_binary(binary):
@@ -1859,7 +1668,6 @@ class LPRPipeline:
             return plate_img
 
         h_img, w_img = plate_img.shape[:2]
-<<<<<<< HEAD
         centers = np.array([((x1 + x2) / 2.0, (y1 + y2) / 2.0) for x1, y1, x2, y2 in boxes], dtype=np.float32)
         xs = centers[:, 0]
         ys = centers[:, 1]
@@ -1875,57 +1683,11 @@ class LPRPipeline:
         rotated = cv2.warpAffine(
             plate_img,
             matrix,
-=======
-        xs = np.array([(x1 + x2) / 2.0 for x1, _, x2, _ in boxes], dtype=np.float32)
-        y_tops = np.array([y1 for _, y1, _, _ in boxes], dtype=np.float32)
-        y_bottoms = np.array([y2 for _, _, _, y2 in boxes], dtype=np.float32)
-        widths = np.array([x2 - x1 for x1, _, x2, _ in boxes], dtype=np.float32)
-        heights = np.array([y2 - y1 for _, y1, _, y2 in boxes], dtype=np.float32)
-        if float(np.max(xs) - np.min(xs)) < 0.35 * w_img:
-            return plate_img
-
-        median_w = max(4.0, float(np.median(widths)))
-        median_h = max(12.0, float(np.median(heights)))
-        left = max(0.0, float(np.min(xs) - 0.85 * median_w))
-        right = min(float(w_img - 1), float(np.max(xs) + 0.85 * median_w))
-        if right - left < 0.45 * w_img:
-            return plate_img
-
-        top_fit = np.polyfit(xs, y_tops, deg=1)
-        bottom_fit = np.polyfit(xs, y_bottoms, deg=1)
-        top_left = float(np.polyval(top_fit, left) - 0.24 * median_h)
-        top_right = float(np.polyval(top_fit, right) - 0.24 * median_h)
-        bottom_left = float(np.polyval(bottom_fit, left) + 0.22 * median_h)
-        bottom_right = float(np.polyval(bottom_fit, right) + 0.22 * median_h)
-
-        src = np.array(
-            [
-                [left, np.clip(top_left, 0, h_img - 2)],
-                [right, np.clip(top_right, 0, h_img - 2)],
-                [right, np.clip(bottom_right, 1, h_img - 1)],
-                [left, np.clip(bottom_left, 1, h_img - 1)],
-            ],
-            dtype=np.float32,
-        )
-        if min(bottom_left - top_left, bottom_right - top_right) < 0.24 * h_img:
-            return plate_img
-
-        dst = np.array([[0, 0], [w_img - 1, 0], [w_img - 1, h_img - 1], [0, h_img - 1]], dtype=np.float32)
-        warped = cv2.warpPerspective(
-            plate_img,
-            cv2.getPerspectiveTransform(src, dst),
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
             (w_img, h_img),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE,
         )
-<<<<<<< HEAD
         return rotated
-=======
-        if warped is None or warped.size == 0:
-            return plate_img
-        return warped
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 
     @staticmethod
     def _deskew_plate_text_band(plate_img):
@@ -2190,7 +1952,6 @@ class LPRPipeline:
                 x += slot_w
                 continue
             if char_position == 0:
-<<<<<<< HEAD
                 pad_ratio = 0.025
             elif char_position == 1:
                 pad_ratio = 0.018
@@ -2203,20 +1964,6 @@ class LPRPipeline:
             x2 = int(round(x + slot_w - pad))
             y1 = int(round(top + 0.025 * height))
             y2 = int(round(bottom - 0.020 * height))
-=======
-                pad_ratio = 0.050
-            elif char_position == 1:
-                pad_ratio = 0.035
-            elif char_position == 6:
-                pad_ratio = 0.065
-            else:
-                pad_ratio = 0.050
-            pad = max(1.0, pad_ratio * slot_w)
-            x1 = int(round(x + pad))
-            x2 = int(round(x + slot_w - pad))
-            y1 = int(round(top + 0.060 * height))
-            y2 = int(round(bottom - 0.055 * height))
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
             boxes.append((
                 max(0, min(plate_width - 1, x1)),
                 max(0, min(plate_height - 1, y1)),

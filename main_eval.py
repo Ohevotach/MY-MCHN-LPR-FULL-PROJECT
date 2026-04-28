@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import csv
 import os
 import random
@@ -146,16 +146,7 @@ def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_m
     log_prob_parts = []
     primary_sim = None
     for model in models:
-<<<<<<< HEAD
         _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
-=======
-        sim_scores = model.compute_similarity(q)
-        if template_mask is not None:
-            mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
-            if mask.dim() == 1:
-                mask = mask.unsqueeze(0)
-            sim_scores = sim_scores.masked_fill(~mask, -1e9)
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
         scores = class_free_energy_scores(sim_scores, template_labels, beta=model.beta, num_classes=num_classes, template_mask=template_mask)
         log_probs = torch.log_softmax(scores, dim=-1)
         log_prob_parts.append(log_probs)
@@ -238,34 +229,6 @@ def predict_affine_robust_hopfield(models, q, template_labels, num_classes):
     return torch.where(base_conf >= 0.72, base_pred, pooled_pred)
 
 
-<<<<<<< HEAD
-=======
-def limit_memory_per_class(memory, labels, max_per_class=24, seed=2026):
-    if max_per_class is None or int(max_per_class) <= 0:
-        return memory, labels
-    max_per_class = int(max_per_class)
-    rng = random.Random(seed)
-    selected = []
-    labels_list = labels.detach().cpu().tolist()
-    for class_idx in sorted(set(labels_list)):
-        indices = [idx for idx, label in enumerate(labels_list) if label == class_idx]
-        if len(indices) > max_per_class:
-            rng.shuffle(indices)
-            indices = indices[:max_per_class]
-        selected.extend(indices)
-    selected.sort()
-    if len(selected) == len(labels_list):
-        return memory, labels
-    index_tensor = torch.tensor(selected, dtype=torch.long, device=memory.device)
-    print(
-        "Hopfield memory cap: "
-        f"{len(labels_list)} train templates -> {len(selected)} templates "
-        f"before augmentation ({max_per_class}/class)."
-    )
-    return memory.index_select(0, index_tensor), labels.index_select(0, index_tensor)
-
-
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples, batch_size, seed):
     model = SimpleCNN(num_classes=num_classes).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -358,27 +321,12 @@ def run_robustness_evaluation(
     test_indices,
     trained_cnn,
     seed,
-<<<<<<< HEAD
-=======
-    max_hopfield_templates_per_class,
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 ):
     print("\n" + "=" * 50)
     print(f"Task 2: held-out evaluation, pollution={pollution_type}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-<<<<<<< HEAD
     hopfield_memory, hopfield_labels = augment_hopfield_memory(train_memory, train_labels)
-=======
-    hopfield_base_memory, hopfield_base_labels = limit_memory_per_class(
-        train_memory,
-        train_labels,
-        max_per_class=max_hopfield_templates_per_class,
-        seed=seed,
-    )
-    hopfield_memory, hopfield_labels = augment_hopfield_memory(hopfield_base_memory, hopfield_base_labels)
-    print(f"Augmented Hopfield memory: {hopfield_memory.shape[0]} templates.")
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     prototypes, prototype_labels = build_class_memory_from_tensors(train_memory, train_labels)
     num_classes = len(loader.idx_to_label)
 
@@ -448,7 +396,6 @@ def save_results_csv(output_dir, all_results):
     print(f"Saved CSV: {csv_path}")
 
 
-<<<<<<< HEAD
 def save_mchn_memory_artifacts(loader, train_indices, test_indices, hopfield_memory, hopfield_labels, output_dir="./saved_weights"):
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, "mchn_eval_memory_32x64.pt")
@@ -470,8 +417,6 @@ def save_mchn_memory_artifacts(loader, train_indices, test_indices, hopfield_mem
     print(f"Saved MCHN evaluation memory matrix: {save_path}")
 
 
-=======
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 def plot_all_pollution_summary(visualizer, all_results):
     method_names = list(next(iter(all_results.values())).keys())
     pollution_names = list(all_results.keys())
@@ -564,15 +509,6 @@ def parse_args():
     parser.add_argument("--cnn-train-samples", type=int, default=20000)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=2026)
-<<<<<<< HEAD
-=======
-    parser.add_argument(
-        "--max-hopfield-templates-per-class",
-        type=int,
-        default=24,
-        help="Cap MCHN train templates per class before augmentation. Use 0 for full memory if GPU RAM is large.",
-    )
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     parser.add_argument("--skip-e2e", action="store_true", default=True)
     parser.add_argument("--run-e2e", action="store_false", dest="skip_e2e")
     parser.add_argument("--data-dir", default="./data")
@@ -588,20 +524,12 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Modern Hopfield held-out evaluation, device={device}")
     os.makedirs(args.output_dir, exist_ok=True)
-<<<<<<< HEAD
-=======
-    os.makedirs(args.saved_weights_dir, exist_ok=True)
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     visualizer = MetricVisualizer(save_dir=args.output_dir)
 
     loader = TemplateLoader(
         data_roots=[os.path.join(args.data_dir, "chars2"), os.path.join(args.data_dir, "charsChinese")],
         img_size=(32, 64),
-<<<<<<< HEAD
         cache_path=os.path.join(args.output_dir, "template_cache_32x64.pt"),
-=======
-        cache_path=os.path.join(args.saved_weights_dir, "template_cache_32x64.pt"),
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     )
     if loader.memory_matrix.shape[0] == 0:
         raise RuntimeError("Template memory is empty.")
@@ -623,19 +551,8 @@ if __name__ == "__main__":
 
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-<<<<<<< HEAD
     demo_memory, demo_labels = augment_hopfield_memory(train_memory, train_labels)
     save_mchn_memory_artifacts(loader, train_indices, test_indices, demo_memory, demo_labels, args.saved_weights_dir)
-=======
-    demo_base_memory, demo_base_labels = limit_memory_per_class(
-        train_memory,
-        train_labels,
-        max_per_class=args.max_hopfield_templates_per_class,
-        seed=args.seed,
-    )
-    demo_memory, demo_labels = augment_hopfield_memory(demo_base_memory, demo_base_labels)
-    print(f"Demo Hopfield memory after augmentation: {demo_memory.shape[0]} templates.")
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     demo_models = build_hopfield_ensemble(demo_memory.to(device), device)
     run_reconstruction_demo(
         {"hopfield": demo_models, "train_memory": demo_memory.to(device), "train_labels": demo_labels.to(device)},
@@ -662,10 +579,6 @@ if __name__ == "__main__":
             test_indices=test_indices,
             trained_cnn=cnn,
             seed=args.seed,
-<<<<<<< HEAD
-=======
-            max_hopfield_templates_per_class=args.max_hopfield_templates_per_class,
->>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
         )
 
     save_results_csv(args.output_dir, all_results)
