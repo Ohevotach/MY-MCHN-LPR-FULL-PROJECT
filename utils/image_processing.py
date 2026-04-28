@@ -909,12 +909,38 @@ class PlateSegmenter:
         if mask.size == 0:
             return mask
         cleaned = mask.copy()
-        horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(cleaned.shape[1] * 0.72)), 1)))
+        h_img, w_img = cleaned.shape[:2]
+        horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(w_img * 0.66)), 1)))
         edge_mask = np.zeros_like(cleaned)
         edge_mask[:3, :] = 255
         edge_mask[-3:, :] = 255
         edge_lines = cv2.bitwise_and(horizontal, edge_mask)
-        return cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
+
+        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, int(h_img * 0.34)))))
+        side_mask = np.zeros_like(cleaned)
+        side_band = max(2, int(w_img * 0.14))
+        side_mask[:, :side_band] = 255
+        side_mask[:, -side_band:] = 255
+        edge_lines = cv2.bitwise_or(edge_lines, cv2.bitwise_and(vertical, side_mask))
+
+        cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cleaned
+        kept = np.zeros_like(cleaned)
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            near_side = x <= side_band or x + w >= w_img - side_band
+            near_top_bottom = y <= 3 or y + h >= h_img - 3
+            if near_side and h >= 0.30 * h_img and w <= 0.20 * w_img:
+                continue
+            if near_top_bottom and w >= 0.45 * w_img and h <= 0.15 * h_img:
+                continue
+            if near_side and area < 0.018 * h_img * w_img and h < 0.42 * h_img:
+                continue
+            cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
+        return kept
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -1221,11 +1247,20 @@ class PlateSegmenter:
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             area = cv2.contourArea(cnt)
+            near_left = x <= max(1, int(0.08 * cleaned.shape[1]))
+            near_right = x + w >= cleaned.shape[1] - max(1, int(0.08 * cleaned.shape[1]))
+            near_side = near_left or near_right
+            near_top = y <= max(1, int(0.06 * cleaned.shape[0]))
+            near_bottom = y + h >= cleaned.shape[0] - max(1, int(0.06 * cleaned.shape[0]))
             if area < min_area and (w <= 3 or h <= 3):
                 continue
             if w >= 0.85 * cleaned.shape[1] and h <= 4:
                 continue
             if h >= 0.85 * cleaned.shape[0] and w <= 4:
+                continue
+            if near_side and h >= 0.34 * cleaned.shape[0] and w <= 0.18 * cleaned.shape[1]:
+                continue
+            if (near_top or near_bottom) and w >= 0.45 * cleaned.shape[1] and h <= 0.14 * cleaned.shape[0]:
                 continue
             cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
         return kept
@@ -1518,14 +1553,14 @@ class LPRPipeline:
         detections = self.char_detector.detect(plate_img)
         candidates = []
         if detections:
-            layout_chars = self._segment_chars_by_layout_guidance(plate_img, detections)
-            if self.segmenter._is_usable_char_sequence(layout_chars):
-                candidates.append(("layout", layout_chars[:7]))
-
             boxes = self._postprocess_char_detections(plate_img, detections)
             chars = self._crop_chars_from_detector_boxes(plate_img, boxes)
             if self.segmenter._is_usable_char_sequence(chars):
                 candidates.append(("detector", chars[:7]))
+
+            layout_chars = self._segment_chars_by_layout_guidance(plate_img, detections)
+            if self.segmenter._is_usable_char_sequence(layout_chars):
+                candidates.append(("layout", layout_chars[:7]))
 
             fallback_chars = self.segmenter.segment_characters(plate_img)
             if self.segmenter._is_usable_char_sequence(fallback_chars):
@@ -1540,7 +1575,7 @@ class LPRPipeline:
         if not candidates:
             return []
 
-        source_bias = {"layout": 0.45, "detector": -0.25, "opencv": 0.00, "opencv_partial": -0.25}
+        source_bias = {"detector": 0.22, "layout": 0.08, "opencv": -0.05, "opencv_partial": -0.30}
         best_name, best_chars = max(
             candidates,
             key=lambda item: self._char_sequence_score(item[1]) + source_bias.get(item[0], 0.0),
@@ -1614,15 +1649,19 @@ class LPRPipeline:
 
         work = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
         work = PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(work)))
-        work = self._rectify_text_band_from_detections(work, detections)
+        work_detections = self.char_detector.detect(work) if self.char_detector.is_ready else detections
+        work_detections = work_detections or detections
+        work = self._rectify_text_band_from_detections(work, work_detections)
         work = self._deskew_plate_text_band(work)
+        redetected = self.char_detector.detect(work) if self.char_detector.is_ready else []
+        work_detections = redetected or work_detections
         gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(work, gray))
 
         rois = []
         for roi in (
-            self._text_roi_from_detections_or_plate(work, binary, detections),
+            self._text_roi_from_detections_or_plate(work, binary, work_detections),
             PlateSegmenter._estimate_plate_text_roi(work, binary),
             self._canonical_text_roi_from_binary(binary),
         ):
@@ -1678,16 +1717,67 @@ class LPRPipeline:
         angle = np.degrees(np.arctan(float(slope)))
         if abs(angle) < 1.0 or abs(angle) > 16.0:
             return plate_img
+        return self._choose_best_text_rotation(plate_img, angle)
 
+    @staticmethod
+    def _rotate_plate_image(plate_img, angle):
+        h_img, w_img = plate_img.shape[:2]
         matrix = cv2.getRotationMatrix2D((w_img / 2.0, h_img / 2.0), angle, 1.0)
-        rotated = cv2.warpAffine(
+        return cv2.warpAffine(
             plate_img,
             matrix,
             (w_img, h_img),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE,
         )
-        return rotated
+
+    @staticmethod
+    def _choose_best_text_rotation(plate_img, angle):
+        if plate_img is None or plate_img.size == 0:
+            return plate_img
+        h_img, w_img = plate_img.shape[:2]
+        candidates = [plate_img]
+        for candidate_angle in (angle, -angle, 0.5 * angle, -0.5 * angle):
+            matrix = cv2.getRotationMatrix2D((w_img / 2.0, h_img / 2.0), candidate_angle, 1.0)
+            candidates.append(
+                cv2.warpAffine(
+                    plate_img,
+                    matrix,
+                    (w_img, h_img),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+            )
+        return max(candidates, key=LPRPipeline._text_horizontal_score)
+
+    @staticmethod
+    def _text_horizontal_score(plate_img):
+        try:
+            gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+            gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+            binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(plate_img, gray))
+        except Exception:
+            return -1.0
+        roi = binary[16:106, 18:382]
+        ys, xs = np.where(roi > 0)
+        if len(xs) < 60 or len(ys) < 25:
+            return -1.0
+        slope, _ = np.polyfit(xs.astype(np.float32), ys.astype(np.float32), deg=1)
+        residual_angle = abs(float(np.degrees(np.arctan(slope))))
+        row_projection = (roi > 0).sum(axis=1).astype(np.float32)
+        col_projection = (roi > 0).sum(axis=0).astype(np.float32)
+        active_rows = np.where(row_projection > 2)[0]
+        active_cols = np.where(col_projection > 1)[0]
+        if len(active_rows) == 0 or len(active_cols) == 0:
+            return -1.0
+        row_span = active_rows[-1] - active_rows[0] + 1
+        col_span = active_cols[-1] - active_cols[0] + 1
+        slope_score = 1.0 - min(residual_angle / 12.0, 1.0)
+        compact_score = 1.0 - min(abs(row_span - 72.0) / 55.0, 1.0)
+        span_score = min(col_span / 300.0, 1.0)
+        density = float(np.mean(roi > 0))
+        density_score = 1.0 - min(abs(density - 0.16) / 0.20, 1.0)
+        return 0.42 * slope_score + 0.24 * compact_score + 0.22 * span_score + 0.12 * density_score
 
     @staticmethod
     def _deskew_plate_text_band(plate_img):
@@ -1715,14 +1805,7 @@ class LPRPipeline:
             angle += 90.0
         if abs(angle) < 1.2 or abs(angle) > 14.0:
             return work
-        matrix = cv2.getRotationMatrix2D((PlateSegmenter.PLATE_W / 2.0, PlateSegmenter.PLATE_H / 2.0), angle, 1.0)
-        return cv2.warpAffine(
-            work,
-            matrix,
-            (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
+        return LPRPipeline._choose_best_text_rotation(work, angle)
 
     def _text_roi_from_detections_or_plate(self, plate_img, binary, detections):
         det_boxes = self._postprocess_char_detections(plate_img, detections)
@@ -1993,15 +2076,26 @@ class LPRPipeline:
     @staticmethod
     def _crop_chars_from_detector_boxes(plate_img, boxes):
         chars = []
-        for idx, box in enumerate(sorted(boxes, key=lambda item: (item[0] + item[2]) / 2.0)[:7]):
+        ordered = sorted(boxes, key=lambda item: (item[0] + item[2]) / 2.0)[:7]
+        centers = [0.5 * (box[0] + box[2]) for box in ordered]
+        split_left = [0 for _ in ordered]
+        split_right = [plate_img.shape[1] for _ in ordered]
+        for idx in range(len(ordered) - 1):
+            split = int(round(0.5 * (centers[idx] + centers[idx + 1])))
+            split_right[idx] = split
+            split_left[idx + 1] = split
+
+        for idx, box in enumerate(ordered):
             x1, y1, x2, y2 = box
             bw, bh = x2 - x1, y2 - y1
-            pad_x = max(1, int(0.10 * bw))
-            pad_y = max(1, int(0.10 * bh))
-            x1 = max(0, x1 - pad_x)
+            pad_x = max(1, int((0.06 if idx else 0.08) * bw))
+            pad_y = max(1, int(0.08 * bh))
+            x1 = max(split_left[idx], x1 - pad_x)
             y1 = max(0, y1 - pad_y)
-            x2 = min(plate_img.shape[1], x2 + pad_x)
+            x2 = min(split_right[idx], x2 + pad_x)
             y2 = min(plate_img.shape[0], y2 + pad_y)
+            if x2 - x1 < 4 or y2 - y1 < 8:
+                continue
             crop = plate_img[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
