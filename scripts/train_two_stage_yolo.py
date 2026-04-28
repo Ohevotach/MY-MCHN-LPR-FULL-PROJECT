@@ -19,7 +19,10 @@ def main():
     parser.add_argument("--char-imgsz", type=int, default=416)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--device", default=None)
+<<<<<<< HEAD
     parser.add_argument("--save-dir", default="./saved_weights")
+=======
+>>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     args = parser.parse_args()
 
     base = [
@@ -29,8 +32,11 @@ def main():
         args.model,
         "--batch",
         str(args.batch),
+<<<<<<< HEAD
         "--save-dir",
         args.save_dir,
+=======
+>>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     ]
     if args.device is not None:
         base += ["--device", args.device]

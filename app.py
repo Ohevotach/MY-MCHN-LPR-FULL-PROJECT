@@ -46,6 +46,7 @@ def is_kaggle_runtime():
     return os.path.exists("/kaggle/working") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 
 
+<<<<<<< HEAD
 def default_cache_path():
     cache_dir = "/kaggle/working/mchn_cache" if is_kaggle_runtime() else os.path.join(os.getcwd(), "results", "cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -70,6 +71,21 @@ def save_mchn_memory_artifacts(loader, augmented_memory, augmented_labels, save_
         save_path,
     )
     print(f"Saved MCHN memory matrix: {save_path}")
+=======
+def saved_weights_dir():
+    path = os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights")
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def default_cache_path():
+    explicit = os.environ.get("MCHN_TEMPLATE_CACHE")
+    if explicit:
+        return explicit
+    return os.path.join(saved_weights_dir(), "template_cache_32x64.pt")
+>>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 
 
 def build_template_masks(loader, labels, device):
@@ -211,6 +227,32 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
     return fused, first_sim, first_retrieved
 
 
+<<<<<<< HEAD
+=======
+def raw_template_class_scores(q, template_mask=None):
+    q_centered = q - q.mean(dim=-1, keepdim=True)
+    qn = F.normalize(q_centered, p=2, dim=-1)
+    sim_scores = torch.matmul(qn, raw_memory_for_scores.t())
+    if template_mask is not None:
+        mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        sim_scores = sim_scores.masked_fill(~mask, -1e9)
+
+    labels = template_labels.to(sim_scores.device)
+    scores = []
+    for class_idx in range(len(loader.idx_to_label)):
+        class_mask = labels == class_idx
+        if template_mask is not None and template_mask.dim() == 1:
+            class_mask = class_mask & template_mask.to(labels.device)
+        if int(class_mask.sum().item()) == 0:
+            scores.append(sim_scores.new_full((sim_scores.shape[0],), -1e9))
+        else:
+            scores.append(torch.max(sim_scores[:, class_mask], dim=-1).values)
+    return torch.stack(scores, dim=-1)
+
+
+>>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 def tensor_to_rgb_image(tensor):
     arr = tensor.detach().cpu().view(64, 32).numpy()
     arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
@@ -360,6 +402,40 @@ def robust_char_query_variants(tensor_img):
     return torch.cat(unique, dim=0)
 
 
+<<<<<<< HEAD
+=======
+def score_query_variant_quality(q):
+    if q.dim() == 1:
+        q = q.unsqueeze(0)
+    imgs = q.detach().cpu().view(-1, 64, 32).numpy()
+    scores = []
+    for img in imgs:
+        fg = img > max(0.05, float(img.mean() + 0.15 * img.std()))
+        ink = float(np.mean(fg))
+        rows = np.where(fg.sum(axis=1) > 0)[0]
+        cols = np.where(fg.sum(axis=0) > 0)[0]
+        if len(rows) == 0 or len(cols) == 0:
+            scores.append(0.05)
+            continue
+        h = (rows[-1] - rows[0] + 1) / 64.0
+        w = (cols[-1] - cols[0] + 1) / 32.0
+        border = np.concatenate([fg[0, :], fg[-1, :], fg[:, 0], fg[:, -1]])
+        side_touch = max(float(np.mean(fg[:, :2])), float(np.mean(fg[:, -2:])))
+        vertical_touch = max(float(np.mean(fg[:2, :])), float(np.mean(fg[-2:, :])))
+        contours, _ = cv2.findContours((fg.astype(np.uint8) * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        ink_score = 1.0 - min(abs(ink - 0.22) / 0.30, 1.0)
+        h_score = 1.0 - min(abs(h - 0.74) / 0.42, 1.0)
+        w_score = 1.0 - min(abs(w - 0.48) / 0.48, 1.0)
+        border_penalty = min(float(np.mean(border)) / 0.18, 1.0)
+        cut_penalty = 0.5 * min(side_touch / 0.16, 1.0) + 0.25 * min(vertical_touch / 0.16, 1.0)
+        component_penalty = min(max(0, len(contours) - 5) * 0.08, 0.35)
+        score = 0.34 * ink_score + 0.28 * h_score + 0.22 * w_score + 0.16 - 0.34 * border_penalty - cut_penalty - component_penalty
+        scores.append(max(0.05, min(1.0, score)))
+    return torch.tensor(scores, dtype=q.dtype, device=q.device)
+
+
+>>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 def _keep_likely_character_components(binary):
     work = (binary > 0).astype(np.uint8) * 255
     contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -412,9 +488,15 @@ if loader.memory_matrix.shape[0] == 0:
     raise RuntimeError("Template memory is empty. Please check ./data/chars2 and ./data/charsChinese.")
 
 memory, template_labels = augment_hopfield_memory(loader.memory_matrix, loader.labels)
+<<<<<<< HEAD
 save_mchn_memory_artifacts(loader, memory, template_labels)
 memory = memory.to(device)
 template_labels = template_labels.to(device)
+=======
+memory = memory.to(device)
+template_labels = template_labels.to(device)
+raw_memory_for_scores = F.normalize(memory - memory.mean(dim=-1, keepdim=True), p=2, dim=-1)
+>>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
 mchn_models = build_hopfield_ensemble(memory, device)
 pipeline = LPRPipeline()
 chinese_mask, alnum_mask, plate_tail_mask, letter_mask, digit_mask = build_template_masks(loader, template_labels, device)
@@ -449,6 +531,7 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False):
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
+<<<<<<< HEAD
     # End-to-end crops are less template-like than folder samples. Blend
     # consensus with a small best-variant vote so a clean, well-normalized crop
     # is not drowned out by harsher preprocessing variants.
@@ -457,6 +540,47 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False):
     pooled_scores = 0.62 * mean_scores + 0.38 * max_scores
     class_idx = int(torch.argmax(pooled_scores).item())
     variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
+=======
+    # End-to-end crops produce several cleaned variants. Weight them by simple
+    # crop quality so border-heavy or over-eroded variants cannot dominate a
+    # clear character.
+    quality = score_query_variant_quality(q).clamp_min(0.05)
+    variant_probs = torch.softmax(class_scores, dim=-1)
+    variant_conf, variant_pred = torch.max(variant_probs, dim=-1)
+    sorted_probs = torch.sort(variant_probs, dim=-1, descending=True).values
+    margins = sorted_probs[:, 0] - sorted_probs[:, 1] if sorted_probs.shape[1] > 1 else sorted_probs[:, 0]
+    variant_reliability = (0.55 * quality + 0.35 * variant_conf + 0.10 * margins).clamp_min(0.05)
+    weighted_scores = class_scores + torch.log(variant_reliability).unsqueeze(1)
+    pooled_scores = torch.logsumexp(weighted_scores, dim=0) - torch.log(torch.sum(variant_reliability))
+
+    raw_scores = raw_template_class_scores(q, template_mask=template_mask)
+    raw_log_probs = torch.log_softmax(12.0 * raw_scores, dim=-1)
+    raw_pooled_scores = torch.logsumexp(
+        raw_log_probs + torch.log(variant_reliability).unsqueeze(1),
+        dim=0,
+    ) - torch.log(torch.sum(variant_reliability))
+    pooled_scores = torch.logsumexp(
+        torch.stack(
+            [
+                pooled_scores + torch.log(pooled_scores.new_tensor(0.74)),
+                raw_pooled_scores + torch.log(raw_pooled_scores.new_tensor(0.26)),
+            ],
+            dim=0,
+        ),
+        dim=0,
+    )
+
+    best_variant_idx = int(torch.argmax(variant_reliability * (0.70 * variant_conf + 0.30 * margins)).item())
+    best_variant_class = int(variant_pred[best_variant_idx].item())
+    pooled_class = int(torch.argmax(pooled_scores).item())
+    pooled_prob = torch.softmax(pooled_scores, dim=-1)[pooled_class].item()
+    best_variant_prob = float(variant_probs[best_variant_idx, best_variant_class].item())
+    if best_variant_prob >= pooled_prob + 0.08 and float(quality[best_variant_idx].item()) >= 0.42:
+        class_idx = best_variant_class
+    else:
+        class_idx = pooled_class
+    variant_idx = int(torch.argmax(class_scores[:, class_idx] + 0.25 * raw_log_probs[:, class_idx]).item())
+>>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)
     prob = torch.softmax(pooled_scores, dim=-1)[class_idx].item()
     best_q = q[variant_idx : variant_idx + 1]

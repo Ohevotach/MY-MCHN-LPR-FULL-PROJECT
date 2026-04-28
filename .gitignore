@@ -3,4 +3,13 @@ results/
 __pycache__/
 *.pyc
 .gradio/
+<<<<<<< HEAD
 *.pem
+=======
+*.pem
+saved_weights/*.pt
+saved_weights/*.onnx
+saved_weights/*.csv
+saved_weights/*.yaml
+!saved_weights/README.md
+>>>>>>> 049f4e4ed3456bfaa618da80df38b05d7d2f1d5b
