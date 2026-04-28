@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 from pathlib import Path
 
 import yaml
@@ -16,6 +17,8 @@ def parse_args():
     parser.add_argument("--name", default="train")
     parser.add_argument("--device", default=None, help="Examples: 0, cpu. Leave unset for auto.")
     parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--save-artifacts-dir", default="./saved_weights")
+    parser.add_argument("--artifact-role", choices=["auto", "plate", "char"], default="auto")
     return parser.parse_args()
 
 
@@ -45,6 +48,10 @@ def main():
     if args.device is not None:
         train_kwargs["device"] = args.device
     model.train(**train_kwargs)
+    save_dir = getattr(getattr(model, "trainer", None), "save_dir", None)
+    if save_dir is None:
+        save_dir = Path(args.project) / args.name
+    copy_training_artifacts(Path(save_dir), args)
 
 
 def check_yolo_dataset(yaml_path):
@@ -74,6 +81,46 @@ def list_images(path):
     if not path.exists():
         return []
     return [p for p in path.rglob("*") if p.suffix.lower() in exts]
+
+
+def infer_artifact_role(args):
+    if args.artifact_role != "auto":
+        return args.artifact_role
+    text = f"{args.name} {args.data}".lower()
+    if "char" in text:
+        return "char"
+    if "plate" in text or "license" in text:
+        return "plate"
+    return "model"
+
+
+def copy_training_artifacts(save_dir, args):
+    role = infer_artifact_role(args)
+    out_dir = Path(args.save_artifacts_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = []
+    weights_dir = save_dir / "weights"
+    for src_name, suffix in (("best.pt", "best.pt"), ("last.pt", "last.pt")):
+        src = weights_dir / src_name
+        if src.is_file():
+            dst = out_dir / f"{role}_{suffix}"
+            shutil.copy2(src, dst)
+            copied.append(dst)
+
+    for src_name in ("args.yaml", "results.csv"):
+        src = save_dir / src_name
+        if src.is_file():
+            dst = out_dir / f"{role}_{src_name}"
+            shutil.copy2(src, dst)
+            copied.append(dst)
+
+    if copied:
+        print("Saved reusable training artifacts:")
+        for path in copied:
+            print(f"  - {path}")
+    else:
+        print(f"Warning: no reusable training artifacts found under {save_dir}")
 
 
 if __name__ == "__main__":

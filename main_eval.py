@@ -492,6 +492,7 @@ def parse_args():
     parser.add_argument("--run-e2e", action="store_false", dest="skip_e2e")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./results")
+    parser.add_argument("--saved-weights-dir", default="./saved_weights")
     return parser.parse_args()
 
 
@@ -502,12 +503,13 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Modern Hopfield held-out evaluation, device={device}")
     os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.saved_weights_dir, exist_ok=True)
     visualizer = MetricVisualizer(save_dir=args.output_dir)
 
     loader = TemplateLoader(
         data_roots=[os.path.join(args.data_dir, "chars2"), os.path.join(args.data_dir, "charsChinese")],
         img_size=(32, 64),
-        cache_path=os.path.join(args.output_dir, "template_cache_32x64.pt"),
+        cache_path=os.path.join(args.saved_weights_dir, "template_cache_32x64.pt"),
     )
     if loader.memory_matrix.shape[0] == 0:
         raise RuntimeError("Template memory is empty.")

@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .gradio/
 *.pem
+saved_weights/*.pt
+saved_weights/*.onnx
+saved_weights/*.csv
+saved_weights/*.yaml
+!saved_weights/README.md

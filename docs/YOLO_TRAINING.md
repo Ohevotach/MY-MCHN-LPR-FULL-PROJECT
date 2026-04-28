@@ -130,6 +130,22 @@ If validation precision is high but recall is low, add more images with small/ti
 
 ## 4. Run App
 
+The app now auto-loads reusable artifacts from:
+
+```text
+saved_weights/plate_best.pt
+saved_weights/char_best.pt
+saved_weights/template_cache_32x64.pt
+```
+
+After training on Kaggle, collect the latest artifacts with:
+
+```bash
+python scripts/collect_saved_weights.py --include-last --include-kaggle-cache
+```
+
+Download the `saved_weights` folder. On the next Kaggle run, put that folder back in the project root to avoid retraining. For continued YOLO training, use `saved_weights/plate_last.pt` or `saved_weights/char_last.pt` as `--model`.
+
 ```bash
 export PLATE_DETECTOR_WEIGHTS=./runs/yolo/plate_yolo11n/weights/best.pt
 export CHAR_DETECTOR_WEIGHTS=./runs/yolo/char_yolo11n_real/weights/best.pt

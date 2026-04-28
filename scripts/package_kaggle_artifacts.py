@@ -5,6 +5,10 @@ from pathlib import Path
 
 
 DEFAULT_PATTERNS = [
+    "saved_weights/*.pt",
+    "saved_weights/*.onnx",
+    "saved_weights/*.yaml",
+    "saved_weights/*.csv",
     "runs/**/weights/best.pt",
     "runs/**/weights/last.pt",
     "runs/**/*.yaml",

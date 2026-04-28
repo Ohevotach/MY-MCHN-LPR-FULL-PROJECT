@@ -46,10 +46,19 @@ def is_kaggle_runtime():
     return os.path.exists("/kaggle/working") or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
 
 
+def saved_weights_dir():
+    path = os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights")
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def default_cache_path():
-    cache_dir = "/kaggle/working/mchn_cache" if is_kaggle_runtime() else os.path.join(os.getcwd(), "results", "cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, "template_cache_32x64.pt")
+    explicit = os.environ.get("MCHN_TEMPLATE_CACHE")
+    if explicit:
+        return explicit
+    return os.path.join(saved_weights_dir(), "template_cache_32x64.pt")
 
 
 def build_template_masks(loader, labels, device):
@@ -189,6 +198,29 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
         first_sim.new_tensor(float(len(log_prob_parts)))
     )
     return fused, first_sim, first_retrieved
+
+
+def raw_template_class_scores(q, template_mask=None):
+    q_centered = q - q.mean(dim=-1, keepdim=True)
+    qn = F.normalize(q_centered, p=2, dim=-1)
+    sim_scores = torch.matmul(qn, raw_memory_for_scores.t())
+    if template_mask is not None:
+        mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        sim_scores = sim_scores.masked_fill(~mask, -1e9)
+
+    labels = template_labels.to(sim_scores.device)
+    scores = []
+    for class_idx in range(len(loader.idx_to_label)):
+        class_mask = labels == class_idx
+        if template_mask is not None and template_mask.dim() == 1:
+            class_mask = class_mask & template_mask.to(labels.device)
+        if int(class_mask.sum().item()) == 0:
+            scores.append(sim_scores.new_full((sim_scores.shape[0],), -1e9))
+        else:
+            scores.append(torch.max(sim_scores[:, class_mask], dim=-1).values)
+    return torch.stack(scores, dim=-1)
 
 
 def tensor_to_rgb_image(tensor):
@@ -425,6 +457,7 @@ if loader.memory_matrix.shape[0] == 0:
 memory, template_labels = augment_hopfield_memory(loader.memory_matrix, loader.labels)
 memory = memory.to(device)
 template_labels = template_labels.to(device)
+raw_memory_for_scores = F.normalize(memory - memory.mean(dim=-1, keepdim=True), p=2, dim=-1)
 mchn_models = build_hopfield_ensemble(memory, device)
 pipeline = LPRPipeline()
 chinese_mask, alnum_mask, plate_tail_mask, letter_mask, digit_mask = build_template_masks(loader, template_labels, device)
@@ -471,6 +504,23 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False):
     weighted_scores = class_scores + torch.log(variant_reliability).unsqueeze(1)
     pooled_scores = torch.logsumexp(weighted_scores, dim=0) - torch.log(torch.sum(variant_reliability))
 
+    raw_scores = raw_template_class_scores(q, template_mask=template_mask)
+    raw_log_probs = torch.log_softmax(12.0 * raw_scores, dim=-1)
+    raw_pooled_scores = torch.logsumexp(
+        raw_log_probs + torch.log(variant_reliability).unsqueeze(1),
+        dim=0,
+    ) - torch.log(torch.sum(variant_reliability))
+    pooled_scores = torch.logsumexp(
+        torch.stack(
+            [
+                pooled_scores + torch.log(pooled_scores.new_tensor(0.74)),
+                raw_pooled_scores + torch.log(raw_pooled_scores.new_tensor(0.26)),
+            ],
+            dim=0,
+        ),
+        dim=0,
+    )
+
     best_variant_idx = int(torch.argmax(variant_reliability * (0.70 * variant_conf + 0.30 * margins)).item())
     best_variant_class = int(variant_pred[best_variant_idx].item())
     pooled_class = int(torch.argmax(pooled_scores).item())
@@ -480,7 +530,7 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False):
         class_idx = best_variant_class
     else:
         class_idx = pooled_class
-    variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
+    variant_idx = int(torch.argmax(class_scores[:, class_idx] + 0.25 * raw_log_probs[:, class_idx]).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)
     prob = torch.softmax(pooled_scores, dim=-1)[class_idx].item()
     best_q = q[variant_idx : variant_idx + 1]

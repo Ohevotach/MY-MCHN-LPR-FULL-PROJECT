@@ -93,6 +93,10 @@ class PlateDetector:
     def _find_default_weights(role="plate"):
         if role == "char":
             candidates = [
+                os.path.join(os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights"), "char_best.pt"),
+                os.path.join(os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights"), "char_last.pt"),
+                "./saved_weights/char_best.pt",
+                "./saved_weights/char_last.pt",
                 "./runs/yolo/char_yolo11n_real/weights/best.pt",
                 "./runs/yolo/char_yolo11n/weights/best.pt",
                 "./runs/yolo/char_yolo11n_synth/weights/best.pt",
@@ -102,6 +106,10 @@ class PlateDetector:
             name_hints = ("char", "character")
         else:
             candidates = [
+                os.path.join(os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights"), "plate_best.pt"),
+                os.path.join(os.environ.get("SAVED_WEIGHTS_DIR", "./saved_weights"), "plate_last.pt"),
+                "./saved_weights/plate_best.pt",
+                "./saved_weights/plate_last.pt",
                 "./runs/yolo/plate_yolo11n_ccpd_base/weights/best.pt",
                 "./runs/yolo/plate_yolo11n/weights/best.pt",
                 "./runs/detect/plate_yolo11n_ccpd_base/weights/best.pt",
@@ -855,6 +863,10 @@ class PlateSegmenter:
                     continue
                 if y + h >= 0.84 * h_img and h <= 0.20 * h_img and area < 0.08 * h_img * w_img:
                     continue
+                if position == 1 and x > 0.63 * w_img and h <= 0.38 * h_img and area < 0.10 * h_img * w_img:
+                    continue
+                if position >= 2 and x < 0.28 * w_img and h <= 0.34 * h_img and area < 0.08 * h_img * w_img:
+                    continue
             if w >= 0.85 * w_img and h <= 0.10 * h_img and (y <= 2 or y + h >= h_img - 2):
                 continue
             if h >= 0.94 * h_img and w <= 0.055 * w_img and (x <= 1 or x + w >= w_img - 1):
@@ -925,7 +937,8 @@ class PlateSegmenter:
     def _erase_slot_frame_margins(mask, position=None):
         if mask is None or mask.size == 0:
             return mask
-        cleaned = (mask > 0).astype(np.uint8) * 255
+        original = (mask > 0).astype(np.uint8) * 255
+        cleaned = original.copy()
         h_img, w_img = cleaned.shape[:2]
         if h_img < 8 or w_img < 6:
             return cleaned
@@ -934,14 +947,24 @@ class PlateSegmenter:
         bottom_band = max(1, int(round(0.050 * h_img)))
         side_band = max(1, int(round((0.055 if position in (0, 6) else 0.040) * w_img)))
 
-        if np.mean(cleaned[: top_band + 1, :] > 0) > 0.10:
+        if np.mean(cleaned[: top_band + 1, :] > 0) > 0.065:
             cleaned[:top_band, :] = 0
-        if np.mean(cleaned[h_img - bottom_band - 1 :, :] > 0) > 0.10:
+        if np.mean(cleaned[h_img - bottom_band - 1 :, :] > 0) > 0.065:
             cleaned[h_img - bottom_band :, :] = 0
-        if np.mean(cleaned[:, : side_band + 1] > 0) > 0.12:
+        if np.mean(cleaned[:, : side_band + 1] > 0) > 0.075:
             cleaned[:, :side_band] = 0
-        if np.mean(cleaned[:, w_img - side_band - 1 :] > 0) > 0.12:
+        if np.mean(cleaned[:, w_img - side_band - 1 :] > 0) > 0.075:
             cleaned[:, w_img - side_band :] = 0
+
+        before = int(np.count_nonzero(original))
+        after = int(np.count_nonzero(cleaned))
+        if before > 0 and after < 0.54 * before:
+            fallback = original.copy()
+            fallback[:1, :] = 0
+            fallback[-1:, :] = 0
+            fallback[:, :1] = 0
+            fallback[:, -1:] = 0
+            return fallback
 
         return cleaned
 
@@ -1569,7 +1592,7 @@ class LPRPipeline:
         if not candidates:
             return []
 
-        source_bias = {"layout": 0.45, "detector": -0.25, "opencv": 0.00, "opencv_partial": -0.25}
+        source_bias = {"layout": 0.55, "detector": -0.35, "opencv": 0.00, "opencv_partial": -0.25}
         best_name, best_chars = max(
             candidates,
             key=lambda item: self._char_sequence_score(item[1]) + source_bias.get(item[0], 0.0),
@@ -1641,28 +1664,78 @@ class LPRPipeline:
         if plate_img is None or plate_img.size == 0:
             return []
 
-        work = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
-        work = PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(work)))
-        work = self._rectify_text_band_from_detections(work, detections)
-        work = self._deskew_plate_text_band(work)
+        src_h, src_w = plate_img.shape[:2]
+        base = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+        scaled_detections = self._scale_detections(
+            detections,
+            src_w,
+            src_h,
+            PlateSegmenter.PLATE_W,
+            PlateSegmenter.PLATE_H,
+        )
+        work_candidates = []
+
+        def add_work(name, img, dets=None):
+            if img is None or img.size == 0:
+                return
+            work = cv2.resize(img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+            key = work[::8, ::8].tobytes()
+            if any(existing_key == key for _, _, _, existing_key in work_candidates):
+                return
+            work_candidates.append((name, work, dets, key))
+
+        add_work("base", PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(base))), scaled_detections)
+        add_work("text_perspective", self._rectify_text_band_from_detections(base, scaled_detections), None)
+        add_work(
+            "text_then_color",
+            PlateSegmenter._tighten_plate_crop(
+                PlateSegmenter._deskew_plate(
+                    PlateSegmenter._rectify_plate_perspective(self._rectify_text_band_from_detections(base, scaled_detections))
+                )
+            ),
+            None,
+        )
+        add_work("deskewed", self._deskew_plate_text_band(base), scaled_detections)
+
+        best_chars = []
+        best_score = -1.0
+        for name, work, dets, _ in work_candidates:
+            chars, score = self._layout_chars_from_work(work, dets)
+            if name.startswith("text"):
+                score += 0.08
+            if score > best_score:
+                best_score = score
+                best_chars = chars
+        return best_chars
+
+    @staticmethod
+    def _scale_detections(detections, src_w, src_h, dst_w, dst_h):
+        if not detections or src_w <= 0 or src_h <= 0:
+            return []
+        sx = float(dst_w) / float(src_w)
+        sy = float(dst_h) / float(src_h)
+        scaled = []
+        for conf, box in detections:
+            x1, y1, x2, y2 = box
+            scaled.append((conf, (int(round(x1 * sx)), int(round(y1 * sy)), int(round(x2 * sx)), int(round(y2 * sy)))))
+        return scaled
+
+    def _layout_chars_from_work(self, work, detections=None):
+        work = cv2.resize(work, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
         gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(work, gray))
 
         rois = []
-        for roi in (
-            self._text_roi_from_detections_or_plate(work, binary, detections),
-            PlateSegmenter._estimate_plate_text_roi(work, binary),
-            self._canonical_text_roi_from_binary(binary),
-        ):
-            if roi is None:
-                continue
-            if roi not in rois:
-                rois.append(roi)
+        if detections:
+            rois.append(self._text_roi_from_detections_or_plate(work, binary, detections))
+        rois.extend([PlateSegmenter._estimate_plate_text_roi(work, binary), self._canonical_text_roi_from_binary(binary)])
 
         best_chars = []
         best_score = -1.0
         for roi in rois:
+            if roi is None:
+                continue
             left, top, right, bottom = roi
             boxes = self._license_plate_layout_boxes(left, top, right, bottom, PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H)
             if len(boxes) != 7:
@@ -1672,7 +1745,7 @@ class LPRPipeline:
             if score > best_score:
                 best_score = score
                 best_chars = chars
-        return best_chars
+        return best_chars, best_score
 
     @staticmethod
     def _canonical_text_roi_from_binary(binary):
@@ -1697,26 +1770,51 @@ class LPRPipeline:
             return plate_img
 
         h_img, w_img = plate_img.shape[:2]
-        centers = np.array([((x1 + x2) / 2.0, (y1 + y2) / 2.0) for x1, y1, x2, y2 in boxes], dtype=np.float32)
-        xs = centers[:, 0]
-        ys = centers[:, 1]
+        xs = np.array([(x1 + x2) / 2.0 for x1, _, x2, _ in boxes], dtype=np.float32)
+        y_tops = np.array([y1 for _, y1, _, _ in boxes], dtype=np.float32)
+        y_bottoms = np.array([y2 for _, _, _, y2 in boxes], dtype=np.float32)
+        widths = np.array([x2 - x1 for x1, _, x2, _ in boxes], dtype=np.float32)
+        heights = np.array([y2 - y1 for _, y1, _, y2 in boxes], dtype=np.float32)
         if float(np.max(xs) - np.min(xs)) < 0.35 * w_img:
             return plate_img
 
-        slope, _ = np.polyfit(xs, ys, deg=1)
-        angle = np.degrees(np.arctan(float(slope)))
-        if abs(angle) < 1.0 or abs(angle) > 16.0:
+        median_w = max(4.0, float(np.median(widths)))
+        median_h = max(12.0, float(np.median(heights)))
+        left = max(0.0, float(np.min(xs) - 0.85 * median_w))
+        right = min(float(w_img - 1), float(np.max(xs) + 0.85 * median_w))
+        if right - left < 0.45 * w_img:
             return plate_img
 
-        matrix = cv2.getRotationMatrix2D((w_img / 2.0, h_img / 2.0), angle, 1.0)
-        rotated = cv2.warpAffine(
+        top_fit = np.polyfit(xs, y_tops, deg=1)
+        bottom_fit = np.polyfit(xs, y_bottoms, deg=1)
+        top_left = float(np.polyval(top_fit, left) - 0.24 * median_h)
+        top_right = float(np.polyval(top_fit, right) - 0.24 * median_h)
+        bottom_left = float(np.polyval(bottom_fit, left) + 0.22 * median_h)
+        bottom_right = float(np.polyval(bottom_fit, right) + 0.22 * median_h)
+
+        src = np.array(
+            [
+                [left, np.clip(top_left, 0, h_img - 2)],
+                [right, np.clip(top_right, 0, h_img - 2)],
+                [right, np.clip(bottom_right, 1, h_img - 1)],
+                [left, np.clip(bottom_left, 1, h_img - 1)],
+            ],
+            dtype=np.float32,
+        )
+        if min(bottom_left - top_left, bottom_right - top_right) < 0.24 * h_img:
+            return plate_img
+
+        dst = np.array([[0, 0], [w_img - 1, 0], [w_img - 1, h_img - 1], [0, h_img - 1]], dtype=np.float32)
+        warped = cv2.warpPerspective(
             plate_img,
-            matrix,
+            cv2.getPerspectiveTransform(src, dst),
             (w_img, h_img),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE,
         )
-        return rotated
+        if warped is None or warped.size == 0:
+            return plate_img
+        return warped
 
     @staticmethod
     def _deskew_plate_text_band(plate_img):
