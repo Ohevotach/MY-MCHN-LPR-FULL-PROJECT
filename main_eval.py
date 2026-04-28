@@ -146,7 +146,12 @@ def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_m
     log_prob_parts = []
     primary_sim = None
     for model in models:
-        _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
+        sim_scores = model.compute_similarity(q)
+        if template_mask is not None:
+            mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            sim_scores = sim_scores.masked_fill(~mask, -1e9)
         scores = class_free_energy_scores(sim_scores, template_labels, beta=model.beta, num_classes=num_classes, template_mask=template_mask)
         log_probs = torch.log_softmax(scores, dim=-1)
         log_prob_parts.append(log_probs)
@@ -227,6 +232,31 @@ def predict_affine_robust_hopfield(models, q, template_labels, num_classes):
     pooled_scores = torch.logsumexp(scores, dim=1) - torch.log(scores.new_tensor(float(variants_per_sample)))
     pooled_pred = torch.argmax(pooled_scores, dim=-1)
     return torch.where(base_conf >= 0.72, base_pred, pooled_pred)
+
+
+def limit_memory_per_class(memory, labels, max_per_class=24, seed=2026):
+    if max_per_class is None or int(max_per_class) <= 0:
+        return memory, labels
+    max_per_class = int(max_per_class)
+    rng = random.Random(seed)
+    selected = []
+    labels_list = labels.detach().cpu().tolist()
+    for class_idx in sorted(set(labels_list)):
+        indices = [idx for idx, label in enumerate(labels_list) if label == class_idx]
+        if len(indices) > max_per_class:
+            rng.shuffle(indices)
+            indices = indices[:max_per_class]
+        selected.extend(indices)
+    selected.sort()
+    if len(selected) == len(labels_list):
+        return memory, labels
+    index_tensor = torch.tensor(selected, dtype=torch.long, device=memory.device)
+    print(
+        "Hopfield memory cap: "
+        f"{len(labels_list)} train templates -> {len(selected)} templates "
+        f"before augmentation ({max_per_class}/class)."
+    )
+    return memory.index_select(0, index_tensor), labels.index_select(0, index_tensor)
 
 
 def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples, batch_size, seed):
@@ -321,12 +351,20 @@ def run_robustness_evaluation(
     test_indices,
     trained_cnn,
     seed,
+    max_hopfield_templates_per_class,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2: held-out evaluation, pollution={pollution_type}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    hopfield_memory, hopfield_labels = augment_hopfield_memory(train_memory, train_labels)
+    hopfield_base_memory, hopfield_base_labels = limit_memory_per_class(
+        train_memory,
+        train_labels,
+        max_per_class=max_hopfield_templates_per_class,
+        seed=seed,
+    )
+    hopfield_memory, hopfield_labels = augment_hopfield_memory(hopfield_base_memory, hopfield_base_labels)
+    print(f"Augmented Hopfield memory: {hopfield_memory.shape[0]} templates.")
     prototypes, prototype_labels = build_class_memory_from_tensors(train_memory, train_labels)
     num_classes = len(loader.idx_to_label)
 
@@ -488,6 +526,12 @@ def parse_args():
     parser.add_argument("--cnn-train-samples", type=int, default=20000)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--max-hopfield-templates-per-class",
+        type=int,
+        default=24,
+        help="Cap MCHN train templates per class before augmentation. Use 0 for full memory if GPU RAM is large.",
+    )
     parser.add_argument("--skip-e2e", action="store_true", default=True)
     parser.add_argument("--run-e2e", action="store_false", dest="skip_e2e")
     parser.add_argument("--data-dir", default="./data")
@@ -531,7 +575,14 @@ if __name__ == "__main__":
 
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    demo_memory, demo_labels = augment_hopfield_memory(train_memory, train_labels)
+    demo_base_memory, demo_base_labels = limit_memory_per_class(
+        train_memory,
+        train_labels,
+        max_per_class=args.max_hopfield_templates_per_class,
+        seed=args.seed,
+    )
+    demo_memory, demo_labels = augment_hopfield_memory(demo_base_memory, demo_base_labels)
+    print(f"Demo Hopfield memory after augmentation: {demo_memory.shape[0]} templates.")
     demo_models = build_hopfield_ensemble(demo_memory.to(device), device)
     run_reconstruction_demo(
         {"hopfield": demo_models, "train_memory": demo_memory.to(device), "train_labels": demo_labels.to(device)},
@@ -558,6 +609,7 @@ if __name__ == "__main__":
             test_indices=test_indices,
             trained_cnn=cnn,
             seed=args.seed,
+            max_hopfield_templates_per_class=args.max_hopfield_templates_per_class,
         )
 
     save_results_csv(args.output_dir, all_results)
