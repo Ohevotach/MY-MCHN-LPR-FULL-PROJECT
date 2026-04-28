@@ -269,20 +269,20 @@ def _strip_character_frame_lines(binary):
     cleaned = work.copy()
     h_img, w_img = cleaned.shape[:2]
     contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    side_band = max(2, int(0.14 * w_img))
+    side_band = 2
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         area = cv2.contourArea(cnt)
         near_side = x <= side_band or x + w >= w_img - side_band
         near_top_bottom = y <= 2 or y + h >= h_img - 2
-        if near_side and h >= 0.30 * h_img and w <= 0.22 * w_img:
+        if near_side and h >= 0.62 * h_img and w <= 0.12 * w_img:
             cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
         elif near_top_bottom and w >= 0.55 * w_img and h <= 0.12 * h_img:
             cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
-        elif (near_side or near_top_bottom) and area < 0.018 * h_img * w_img:
+        elif (near_side or near_top_bottom) and area < 0.008 * h_img * w_img:
             cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
 
-    vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 22)))
+    vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 34)))
     side_mask = np.zeros_like(cleaned)
     side_mask[:, :side_band] = 255
     side_mask[:, -side_band:] = 255
@@ -325,7 +325,7 @@ def robust_char_query_variants(tensor_img):
     base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
     base_clean = normalize_char_image(base)
 
-    variants = [base_clean]
+    variants = [base, base_clean]
     blurred = cv2.GaussianBlur(base, (3, 3), 0)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(otsu > 0) > 0.55:
@@ -456,7 +456,7 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False):
     # is not drowned out by harsher preprocessing variants.
     mean_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
     max_scores = torch.max(class_scores, dim=0).values
-    pooled_scores = 0.35 * mean_scores + 0.65 * max_scores
+    pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
     class_idx = int(torch.argmax(pooled_scores).item())
     variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)

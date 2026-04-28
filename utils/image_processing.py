@@ -916,31 +916,14 @@ class PlateSegmenter:
         edge_mask[-3:, :] = 255
         edge_lines = cv2.bitwise_and(horizontal, edge_mask)
 
-        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, int(h_img * 0.34)))))
+        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(24, int(h_img * 0.62)))))
         side_mask = np.zeros_like(cleaned)
-        side_band = max(2, int(w_img * 0.14))
+        side_band = 2
         side_mask[:, :side_band] = 255
         side_mask[:, -side_band:] = 255
         edge_lines = cv2.bitwise_or(edge_lines, cv2.bitwise_and(vertical, side_mask))
 
-        cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
-        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return cleaned
-        kept = np.zeros_like(cleaned)
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = cv2.contourArea(cnt)
-            near_side = x <= side_band or x + w >= w_img - side_band
-            near_top_bottom = y <= 3 or y + h >= h_img - 3
-            if near_side and h >= 0.30 * h_img and w <= 0.20 * w_img:
-                continue
-            if near_top_bottom and w >= 0.45 * w_img and h <= 0.15 * h_img:
-                continue
-            if near_side and area < 0.018 * h_img * w_img and h < 0.42 * h_img:
-                continue
-            cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
-        return kept
+        return cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -1247,8 +1230,8 @@ class PlateSegmenter:
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             area = cv2.contourArea(cnt)
-            near_left = x <= max(1, int(0.08 * cleaned.shape[1]))
-            near_right = x + w >= cleaned.shape[1] - max(1, int(0.08 * cleaned.shape[1]))
+            near_left = x <= 1
+            near_right = x + w >= cleaned.shape[1] - 1
             near_side = near_left or near_right
             near_top = y <= max(1, int(0.06 * cleaned.shape[0]))
             near_bottom = y + h >= cleaned.shape[0] - max(1, int(0.06 * cleaned.shape[0]))
@@ -1258,7 +1241,7 @@ class PlateSegmenter:
                 continue
             if h >= 0.85 * cleaned.shape[0] and w <= 4:
                 continue
-            if near_side and h >= 0.34 * cleaned.shape[0] and w <= 0.18 * cleaned.shape[1]:
+            if near_side and h >= 0.72 * cleaned.shape[0] and w <= 0.10 * cleaned.shape[1]:
                 continue
             if (near_top or near_bottom) and w >= 0.45 * cleaned.shape[1] and h <= 0.14 * cleaned.shape[0]:
                 continue
@@ -1295,14 +1278,20 @@ class PlateSegmenter:
             mask = cv2.resize(mask.astype(np.uint8), (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
             ys, xs = np.where(mask > 0)
             if len(xs) > 0 and len(ys) > 0:
-                pad_x = max(1, int(0.10 * (xs.max() - xs.min() + 1)))
-                pad_y = max(1, int(0.08 * (ys.max() - ys.min() + 1)))
+                mask_w = xs.max() - xs.min() + 1
+                mask_h = ys.max() - ys.min() + 1
+                pad_x = max(2, int(0.22 * mask_w))
+                pad_y = max(2, int(0.16 * mask_h))
                 x1 = max(0, int(xs.min()) - pad_x)
                 x2 = min(crop.shape[1], int(xs.max()) + pad_x + 1)
                 y1 = max(0, int(ys.min()) - pad_y)
                 y2 = min(crop.shape[0], int(ys.max()) + pad_y + 1)
-                crop = crop[y1:y2, x1:x2]
-                crop_mask = mask[y1:y2, x1:x2]
+                # If thresholding finds only a thin fragment, keep the full slot.
+                # Cropping tightly around a broken mask is the main reason clear
+                # end-to-end characters lose strokes before Hopfield matching.
+                if mask_w >= 0.22 * crop.shape[1] and mask_h >= 0.35 * crop.shape[0]:
+                    crop = crop[y1:y2, x1:x2]
+                    crop_mask = mask[y1:y2, x1:x2]
 
         if crop.size == 0:
             return canvas
@@ -1384,7 +1373,7 @@ class PlateSegmenter:
             bg_pixels = enhanced[dilated == 0]
             background = float(np.percentile(bg_pixels, 65)) if bg_pixels.size else float(np.percentile(enhanced, 35))
             signal = np.clip(base - background + 18.0, 0, 255)
-            if 0.01 <= float(np.mean(dilated > 0)) <= 0.75:
+            if 0.035 <= float(np.mean(dilated > 0)) <= 0.78:
                 signal[dilated == 0] = 0
         else:
             background = float(np.percentile(enhanced, 45))
@@ -1553,14 +1542,14 @@ class LPRPipeline:
         detections = self.char_detector.detect(plate_img)
         candidates = []
         if detections:
+            layout_chars = self._segment_chars_by_layout_guidance(plate_img, detections)
+            if self.segmenter._is_usable_char_sequence(layout_chars):
+                candidates.append(("layout", layout_chars[:7]))
+
             boxes = self._postprocess_char_detections(plate_img, detections)
             chars = self._crop_chars_from_detector_boxes(plate_img, boxes)
             if self.segmenter._is_usable_char_sequence(chars):
                 candidates.append(("detector", chars[:7]))
-
-            layout_chars = self._segment_chars_by_layout_guidance(plate_img, detections)
-            if self.segmenter._is_usable_char_sequence(layout_chars):
-                candidates.append(("layout", layout_chars[:7]))
 
             fallback_chars = self.segmenter.segment_characters(plate_img)
             if self.segmenter._is_usable_char_sequence(fallback_chars):
@@ -1575,7 +1564,7 @@ class LPRPipeline:
         if not candidates:
             return []
 
-        source_bias = {"detector": 0.22, "layout": 0.08, "opencv": -0.05, "opencv_partial": -0.30}
+        source_bias = {"layout": 0.35, "opencv": 0.05, "detector": -0.18, "opencv_partial": -0.30}
         best_name, best_chars = max(
             candidates,
             key=lambda item: self._char_sequence_score(item[1]) + source_bias.get(item[0], 0.0),
@@ -1649,12 +1638,9 @@ class LPRPipeline:
 
         work = cv2.resize(plate_img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
         work = PlateSegmenter._tighten_plate_crop(PlateSegmenter._deskew_plate(PlateSegmenter._rectify_plate_perspective(work)))
-        work_detections = self.char_detector.detect(work) if self.char_detector.is_ready else detections
-        work_detections = work_detections or detections
+        work_detections = detections
         work = self._rectify_text_band_from_detections(work, work_detections)
         work = self._deskew_plate_text_band(work)
-        redetected = self.char_detector.detect(work) if self.char_detector.is_ready else []
-        work_detections = redetected or work_detections
         gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = PlateSegmenter._prepare_character_binary(PlateSegmenter._make_character_mask(work, gray))
@@ -2035,13 +2021,13 @@ class LPRPipeline:
                 x += slot_w
                 continue
             if char_position == 0:
-                pad_ratio = 0.025
+                pad_ratio = 0.010
             elif char_position == 1:
-                pad_ratio = 0.018
+                pad_ratio = 0.010
             elif char_position == 6:
-                pad_ratio = 0.035
+                pad_ratio = 0.018
             else:
-                pad_ratio = 0.055
+                pad_ratio = 0.025
             pad = max(1.0, pad_ratio * slot_w)
             x1 = int(round(x + pad))
             x2 = int(round(x + slot_w - pad))
@@ -2088,11 +2074,12 @@ class LPRPipeline:
         for idx, box in enumerate(ordered):
             x1, y1, x2, y2 = box
             bw, bh = x2 - x1, y2 - y1
-            pad_x = max(1, int((0.06 if idx else 0.08) * bw))
-            pad_y = max(1, int(0.08 * bh))
-            x1 = max(split_left[idx], x1 - pad_x)
+            pad_x = max(2, int((0.16 if idx else 0.20) * bw))
+            pad_y = max(2, int(0.14 * bh))
+            guard = max(2, int(0.08 * bw))
+            x1 = max(0, split_left[idx] - guard, x1 - pad_x)
             y1 = max(0, y1 - pad_y)
-            x2 = min(split_right[idx], x2 + pad_x)
+            x2 = min(plate_img.shape[1], split_right[idx] + guard, x2 + pad_x)
             y2 = min(plate_img.shape[0], y2 + pad_y)
             if x2 - x1 < 4 or y2 - y1 < 8:
                 continue
