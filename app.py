@@ -197,6 +197,50 @@ def tensor_to_rgb_image(tensor):
     return cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
 
 
+def query_variant_quality(arr):
+    binary = (arr > 0).astype(np.uint8)
+    ink_count = int(np.count_nonzero(binary))
+    if ink_count <= 0:
+        return 0.01
+
+    h_img, w_img = binary.shape[:2]
+    ink = ink_count / float(max(1, h_img * w_img))
+    ys, xs = np.where(binary > 0)
+    bbox_w = int(xs.max() - xs.min() + 1)
+    bbox_h = int(ys.max() - ys.min() + 1)
+
+    ink_score = 1.0 - min(abs(ink - 0.20) / 0.32, 1.0)
+    height_score = min(bbox_h / max(1.0, 0.70 * h_img), 1.0)
+    width_ratio = bbox_w / max(1.0, w_img)
+    width_score = 1.0 - min(abs(width_ratio - 0.46) / 0.48, 1.0)
+
+    edge_band_x = max(2, int(round(0.10 * w_img)))
+    edge_band_y = max(2, int(round(0.06 * h_img)))
+    edge_pixels = np.count_nonzero(binary[:, :edge_band_x]) + np.count_nonzero(binary[:, -edge_band_x:])
+    edge_pixels += np.count_nonzero(binary[:edge_band_y, :]) + np.count_nonzero(binary[-edge_band_y:, :])
+    edge_penalty = min(edge_pixels / float(max(1, ink_count)), 1.0)
+
+    contours, _ = cv2.findContours((binary * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    component_penalty = min(max(0, len(contours) - 5) * 0.08, 0.40)
+
+    col_sum = binary.sum(axis=0)
+    row_sum = binary.sum(axis=1)
+    side_line = max(float(np.max(col_sum[:edge_band_x])), float(np.max(col_sum[-edge_band_x:]))) / max(1.0, h_img)
+    edge_row_line = max(float(np.max(row_sum[:edge_band_y])), float(np.max(row_sum[-edge_band_y:]))) / max(1.0, w_img)
+    line_penalty = max(side_line, edge_row_line)
+
+    score = (
+        0.34 * ink_score
+        + 0.28 * height_score
+        + 0.18 * width_score
+        + 0.20
+        - 0.26 * edge_penalty
+        - 0.22 * line_penalty
+        - component_penalty
+    )
+    return float(np.clip(score, 0.03, 1.0))
+
+
 def normalize_char_image(arr):
     arr = np.clip(arr, 0, 255).astype(np.uint8)
     if arr.shape != (64, 32):
@@ -247,13 +291,16 @@ def _strip_character_frame_lines(binary):
         work = cv2.resize(work, (32, 64), interpolation=cv2.INTER_NEAREST)
 
     cleaned = work.copy()
+    original_count = int(np.count_nonzero(cleaned))
     h_img, w_img = cleaned.shape[:2]
     contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         area = cv2.contourArea(cnt)
-        near_side = x <= 2 or x + w >= w_img - 2
-        near_top_bottom = y <= 2 or y + h >= h_img - 2
+        side_band = max(3, int(round(0.12 * w_img)))
+        row_band = max(3, int(round(0.06 * h_img)))
+        near_side = x <= side_band or x + w >= w_img - side_band
+        near_top_bottom = y <= row_band or y + h >= h_img - row_band
         if near_side and h >= 0.42 * h_img and w <= 0.16 * w_img:
             cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
         elif near_top_bottom and w >= 0.55 * w_img and h <= 0.12 * h_img:
@@ -261,17 +308,21 @@ def _strip_character_frame_lines(binary):
         elif (near_side or near_top_bottom) and area < 0.010 * h_img * w_img:
             cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
 
-    vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30)))
+    vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 28)))
     side_mask = np.zeros_like(cleaned)
-    side_mask[:, :3] = 255
-    side_mask[:, -3:] = 255
+    side_band = max(3, int(round(0.14 * w_img)))
+    side_mask[:, :side_band] = 255
+    side_mask[:, -side_band:] = 255
     cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(cv2.bitwise_and(vertical, side_mask)))
 
     horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (18, 1)))
     edge_mask = np.zeros_like(cleaned)
-    edge_mask[:3, :] = 255
-    edge_mask[-3:, :] = 255
+    row_band = max(3, int(round(0.06 * h_img)))
+    edge_mask[:row_band, :] = 255
+    edge_mask[-row_band:, :] = 255
     cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(cv2.bitwise_and(horizontal, edge_mask)))
+    if original_count and np.count_nonzero(cleaned) < max(4, int(0.35 * original_count)):
+        return work
     return cleaned
 
 
@@ -297,13 +348,23 @@ def affine_char_variants(tensor):
     return torch.cat(unique, dim=0)
 
 
-def robust_char_query_variants(tensor_img):
+def robust_char_query_variants(tensor_img, return_quality=False):
     if tensor_img.dim() == 2:
         tensor_img = tensor_img.unsqueeze(0)
+    raw = tensor_img.detach().cpu()
+    if raw.dim() == 3:
+        raw = raw[0]
+    raw_arr = np.clip(raw.reshape(raw.shape[-2], raw.shape[-1]).numpy() * 255, 0, 255).astype(np.uint8)
+    if raw_arr.shape != (64, 32):
+        raw_arr = cv2.resize(raw_arr, (32, 64), interpolation=cv2.INTER_NEAREST)
+
     normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
     base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
 
-    variants = [base, normalize_char_image(base)]
+    _, raw_binary = cv2.threshold(raw_arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(raw_binary > 0) > 0.55:
+        raw_binary = cv2.bitwise_not(raw_binary)
+    variants = [normalize_char_image(raw_arr), normalize_char_image(_strip_character_frame_lines(raw_binary)), base, normalize_char_image(base)]
     blurred = cv2.GaussianBlur(base, (3, 3), 0)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(otsu > 0) > 0.55:
@@ -322,6 +383,7 @@ def robust_char_query_variants(tensor_img):
     variants.append(normalize_char_image(_strip_character_frame_lines(otsu)))
 
     unique = []
+    qualities = []
     seen = set()
     for item in variants:
         if item is None or item.size == 0:
@@ -335,9 +397,14 @@ def robust_char_query_variants(tensor_img):
             continue
         seen.add(key)
         unique.append(torch.tensor(item, dtype=torch.float32).view(1, -1) / 255.0)
+        qualities.append(query_variant_quality(item))
     if not unique:
         unique.append(normalized.view(1, -1))
-    return torch.cat(unique, dim=0)
+        qualities.append(0.20)
+    q = torch.cat(unique, dim=0)
+    if return_quality:
+        return q, torch.tensor(qualities, dtype=torch.float32)
+    return q
 
 
 def _keep_likely_character_components(binary):
@@ -424,18 +491,22 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False):
     else:
         tensor_img = tensor.view(1, 64, 32)
     with torch.no_grad():
-        q = robust_char_query_variants(tensor_img).to(device)
+        q, variant_quality = robust_char_query_variants(tensor_img, return_quality=True)
+        q = q.to(device)
+        variant_quality = variant_quality.to(device).clamp_min(1e-3)
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
     # End-to-end crops are less template-like than folder samples. Blend
-    # consensus with a small best-variant vote so a clean, well-normalized crop
-    # is not drowned out by harsher preprocessing variants.
-    mean_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
-    max_scores = torch.max(class_scores, dim=0).values
-    pooled_scores = 0.62 * mean_scores + 0.38 * max_scores
+    # quality-weighted consensus with a small best-variant vote. This prevents
+    # frame-heavy or over-eroded preprocessing variants from dominating MCHN.
+    log_weights = torch.log(variant_quality / variant_quality.sum().clamp_min(1e-6)).unsqueeze(-1)
+    mean_scores = torch.logsumexp(class_scores + log_weights, dim=0)
+    quality_bias = 0.25 * torch.log(variant_quality).unsqueeze(-1)
+    max_scores = torch.max(class_scores + quality_bias, dim=0).values
+    pooled_scores = 0.70 * mean_scores + 0.30 * max_scores
     class_idx = int(torch.argmax(pooled_scores).item())
-    variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
+    variant_idx = int(torch.argmax(class_scores[:, class_idx] + 0.35 * torch.log(variant_quality)).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)
     prob = torch.softmax(pooled_scores, dim=-1)[class_idx].item()
     best_q = q[variant_idx : variant_idx + 1]

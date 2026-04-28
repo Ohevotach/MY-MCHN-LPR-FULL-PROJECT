@@ -728,7 +728,7 @@ class PlateSegmenter:
 
         slot_binary = PlateSegmenter._clean_slot_character(slot_binary, position=position)
         slot_gray = gray[y1:y2, x1:x2]
-        return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary, deskew=True)
+        return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary, deskew=True, position=position)
 
     @staticmethod
     def _local_character_mask(slot_bgr, slot_gray):
@@ -816,7 +816,30 @@ class PlateSegmenter:
         ink_score = 1.0 - min(abs(ink - 0.22) / 0.24, 1.0)
         component_penalty = min(max(0, len(contours) - 3) * 0.12, 0.45)
         main_area_ratio = max(areas) / max(1.0, sum(areas))
-        return 0.34 * height_score + 0.24 * ink_score + 0.18 * width_score + 0.24 * main_area_ratio - component_penalty
+
+        edge_band_x = max(2, int(round(0.12 * w_img)))
+        edge_band_y = max(2, int(round(0.08 * h_img)))
+        edge_pixels = np.count_nonzero(mask[:, :edge_band_x]) + np.count_nonzero(mask[:, -edge_band_x:])
+        edge_pixels += np.count_nonzero(mask[:edge_band_y, :]) + np.count_nonzero(mask[-edge_band_y:, :])
+        edge_penalty = min(edge_pixels / max(1.0, np.count_nonzero(mask)), 1.0)
+
+        col_sum = (mask > 0).sum(axis=0)
+        row_sum = (mask > 0).sum(axis=1)
+        side_line = 0.0
+        if edge_band_x > 0:
+            side_line = max(float(np.max(col_sum[:edge_band_x])), float(np.max(col_sum[-edge_band_x:]))) / max(1.0, h_img)
+        edge_row_line = max(float(np.max(row_sum[:edge_band_y])), float(np.max(row_sum[-edge_band_y:]))) / max(1.0, w_img)
+        line_penalty = max(side_line, edge_row_line)
+
+        return (
+            0.34 * height_score
+            + 0.24 * ink_score
+            + 0.18 * width_score
+            + 0.24 * main_area_ratio
+            - component_penalty
+            - 0.22 * edge_penalty
+            - 0.26 * line_penalty
+        )
 
     @staticmethod
     def _clean_slot_character(slot_binary, position=None):
@@ -868,6 +891,9 @@ class PlateSegmenter:
             cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
         if np.count_nonzero(kept) < 0.45 * np.count_nonzero(cleaned):
             return cleaned
+        line_cleaned = PlateSegmenter._remove_slot_border_lines(kept)
+        if np.count_nonzero(line_cleaned) >= 0.45 * np.count_nonzero(kept):
+            kept = line_cleaned
         return PlateSegmenter._suppress_isolated_slot_noise(kept, position)
 
     @staticmethod
@@ -899,12 +925,46 @@ class PlateSegmenter:
         if mask.size == 0:
             return mask
         cleaned = mask.copy()
-        horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(cleaned.shape[1] * 0.72)), 1)))
+        h_img, w_img = cleaned.shape[:2]
+
+        horizontal = cv2.morphologyEx(
+            cleaned,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(w_img * 0.70)), 1)),
+        )
         edge_mask = np.zeros_like(cleaned)
-        edge_mask[:3, :] = 255
-        edge_mask[-3:, :] = 255
+        y_band = max(3, int(round(0.08 * h_img)))
+        edge_mask[:y_band, :] = 255
+        edge_mask[-y_band:, :] = 255
         edge_lines = cv2.bitwise_and(horizontal, edge_mask)
-        return cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
+        cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
+
+        vertical = cv2.morphologyEx(
+            cleaned,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, int(h_img * 0.50)))),
+        )
+        side_mask = np.zeros_like(cleaned)
+        x_band = max(3, int(round(0.16 * w_img)))
+        side_mask[:, :x_band] = 255
+        side_mask[:, -x_band:] = 255
+        side_lines = cv2.bitwise_and(vertical, side_mask)
+        cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(side_lines))
+
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            near_side = x <= max(1, x_band // 2) or x + w >= w_img - max(1, x_band // 2)
+            near_top_bottom = y <= max(1, y_band // 2) or y + h >= h_img - max(1, y_band // 2)
+            if near_side and h >= 0.42 * h_img and w <= 0.18 * w_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif near_top_bottom and w >= 0.54 * w_img and h <= 0.14 * h_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif (near_side or near_top_bottom) and area < 0.012 * h_img * w_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+
+        return cleaned
 
     @classmethod
     def _tighten_plate_crop(cls, plate_img):
@@ -1237,7 +1297,7 @@ class PlateSegmenter:
         return PlateSegmenter._deskew_char_canvas(canvas)
 
     @staticmethod
-    def _resize_gray_char_canvas(gray_crop, mask=None, deskew=True):
+    def _resize_gray_char_canvas(gray_crop, mask=None, deskew=True, position=None):
         canvas = np.zeros((64, 32), dtype=np.uint8)
         if gray_crop is None or gray_crop.size == 0:
             return canvas
@@ -1248,10 +1308,15 @@ class PlateSegmenter:
         crop_mask = None
         if mask is not None and mask.size:
             mask = cv2.resize(mask.astype(np.uint8), (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+            original_mask = mask.copy()
+            mask = PlateSegmenter._remove_slot_border_lines(mask)
+            mask = PlateSegmenter._suppress_isolated_slot_noise(mask, position=position)
+            if np.count_nonzero(mask) < max(5, int(0.25 * np.count_nonzero(original_mask))):
+                mask = original_mask
             ys, xs = np.where(mask > 0)
             if len(xs) > 0 and len(ys) > 0:
-                pad_x = max(1, int(0.10 * (xs.max() - xs.min() + 1)))
-                pad_y = max(1, int(0.08 * (ys.max() - ys.min() + 1)))
+                pad_x = max(1, int(0.08 * (xs.max() - xs.min() + 1)))
+                pad_y = max(1, int(0.06 * (ys.max() - ys.min() + 1)))
                 x1 = max(0, int(xs.min()) - pad_x)
                 x2 = min(crop.shape[1], int(xs.max()) + pad_x + 1)
                 y1 = max(0, int(ys.min()) - pad_y)
@@ -1262,6 +1327,10 @@ class PlateSegmenter:
         if crop.size == 0:
             return canvas
         crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask)
+        if crop_mask is not None and crop_mask.size:
+            crop_mask = cv2.resize(crop_mask.astype(np.uint8), (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+            support = cv2.dilate(crop_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+            crop[support == 0] = 0
         h, w = crop.shape[:2]
         scale = min(26.0 / max(1, w), 56.0 / max(1, h))
         new_w = max(1, min(30, int(round(w * scale))))
@@ -1998,7 +2067,7 @@ class LPRPipeline:
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
             binary = PlateSegmenter._local_character_mask(crop, gray)
             binary = PlateSegmenter._clean_slot_character(binary, position=idx)
-            chars.append(PlateSegmenter._resize_gray_char_canvas(gray, binary, deskew=True))
+            chars.append(PlateSegmenter._resize_gray_char_canvas(gray, binary, deskew=True, position=idx))
         return chars
     @staticmethod
     def _locate_from_ccpd_filename(img, path):
