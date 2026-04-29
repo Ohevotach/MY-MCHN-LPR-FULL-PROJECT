@@ -236,7 +236,25 @@ def recognize_char(char_img, models, loader, template_labels, masks, device, pos
     return top_labels[0], top_labels
 
 
-def recognize_plate_chars(chars, truth_len, models, loader, template_labels, masks, device):
+def build_class_prototypes(memory, labels, num_classes, device):
+    prototypes = torch.zeros((num_classes, memory.shape[1]), dtype=torch.float32, device=device)
+    counts = torch.zeros(num_classes, dtype=torch.float32, device=device)
+    labels = labels.to(device=device, dtype=torch.long)
+    for class_idx in range(num_classes):
+        mask = labels == class_idx
+        if bool(mask.any().item()):
+            prototypes[class_idx] = memory[mask].float().mean(dim=0)
+            counts[class_idx] = float(mask.sum().item())
+    prototypes = torch.nn.functional.normalize(prototypes, p=2, dim=-1)
+    return prototypes, counts
+
+
+def prototype_shape_scores(q, class_prototypes):
+    q_norm = torch.nn.functional.normalize(q.float(), p=2, dim=-1)
+    return torch.matmul(q_norm, class_prototypes.t())
+
+
+def recognize_plate_chars(chars, truth_len, models, loader, template_labels, masks, device, class_prototypes=None):
     queries = []
     spans = []
     mask_rows = []
@@ -265,6 +283,12 @@ def recognize_plate_chars(chars, truth_len, models, loader, template_labels, mas
         mean_scores = torch.logsumexp(scores, dim=0) - torch.log(scores.new_tensor(float(scores.shape[0])))
         max_scores = torch.max(scores, dim=0).values
         pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+        if class_prototypes is not None:
+            proto_scores = prototype_shape_scores(q_batch[start:end], class_prototypes)
+            proto_scores = torch.max(proto_scores, dim=0).values
+            proto_scores = proto_scores.masked_fill(torch.isinf(pooled_scores), -1e9)
+            weight = 0.32 if len(pred_parts) == 0 else 0.22
+            pooled_scores = (1.0 - weight) * pooled_scores + weight * proto_scores
         pooled_scores = apply_position_prior(pooled_scores, loader, position=len(pred_parts))
         _, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
         top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
@@ -478,6 +502,7 @@ def evaluate(args):
     template_labels = template_labels.to(device)
     models = build_hopfield_ensemble(memory, device)
     cache_model_memories(models)
+    class_prototypes, _ = build_class_prototypes(memory, template_labels, len(loader.idx_to_label), device)
     masks = build_template_masks(loader, template_labels, device)
     if not rows:
         raise RuntimeError("No evaluation plates left after calibration/max-images filtering.")
@@ -502,7 +527,7 @@ def evaluate(args):
             if not os.path.isabs(image_path):
                 image_path = os.path.join(ROOT_DIR, image_path)
             truth = item["plate_text"]
-            img = cv2.imread(image_path)
+            img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 raise FileNotFoundError(image_path)
             polluted = apply_plate_pollution(img, pollution, severity, rng)
@@ -516,7 +541,16 @@ def evaluate(args):
             char_ok = 0
             if len(chars) == len(truth):
                 segmentation_success += 1
-            batch_preds, batch_top3 = recognize_plate_chars(chars, len(truth), models, loader, template_labels, masks, device)
+            batch_preds, batch_top3 = recognize_plate_chars(
+                chars,
+                len(truth),
+                models,
+                loader,
+                template_labels,
+                masks,
+                device,
+                class_prototypes=class_prototypes,
+            )
             for pos, (pred, top3) in enumerate(zip(batch_preds, batch_top3)):
                 pred_parts.append(pred)
                 top3_parts.append("/".join(str(item) for item in top3))
