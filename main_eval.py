@@ -205,27 +205,52 @@ def normalize_char_array(arr):
     return canvas
 
 
-def build_affine_query_variants(q):
+def build_affine_query_variants(q, variant_level="light"):
     tensors = []
     for row in q.detach().cpu().view(-1, 64, 32).numpy():
         base = normalize_char_array(row * 255.0)
         variants = [base]
-        for angle in (-14, -8, 8, 14):
-            matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
-            variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
-        for shear in (-0.16, -0.08, 0.08, 0.16):
-            matrix = np.array([[1.0, shear, -shear * 32.0], [0.0, 1.0, 0.0]], dtype=np.float32)
-            variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+        if variant_level == "none":
+            pass
+        elif variant_level == "light":
+            for angle in (-8, 8):
+                matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
+                variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+        elif variant_level == "medium":
+            for angle in (-10, 10):
+                matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
+                variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+            for shear in (-0.10, 0.10):
+                matrix = np.array([[1.0, shear, -shear * 32.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+                variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+        elif variant_level == "full":
+            for angle in (-14, -8, 8, 14):
+                matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
+                variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+            for shear in (-0.16, -0.08, 0.08, 0.16):
+                matrix = np.array([[1.0, shear, -shear * 32.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+                variants.append(normalize_char_array(cv2.warpAffine(base, matrix, (32, 64), flags=cv2.INTER_NEAREST, borderValue=0)))
+        else:
+            raise ValueError(f"Unsupported affine variant level: {variant_level}")
         tensors.extend(torch.tensor(item, dtype=torch.float32).view(1, -1) / 255.0 for item in variants)
-    return torch.cat(tensors, dim=0), 9
+    variants_per_sample = {
+        "none": 1,
+        "light": 3,
+        "medium": 5,
+        "full": 9,
+    }[variant_level]
+    return torch.cat(tensors, dim=0), variants_per_sample
 
 
-def predict_affine_robust_hopfield(models, q, template_labels, num_classes):
+def predict_affine_robust_hopfield(models, q, template_labels, num_classes, variant_level="light"):
     base_scores, _ = ensemble_hopfield_scores(models, q, template_labels, num_classes)
     base_probs = torch.softmax(base_scores, dim=-1)
     base_conf, base_pred = torch.max(base_probs, dim=-1)
 
-    q_variants, variants_per_sample = build_affine_query_variants(q)
+    if variant_level == "none":
+        return base_pred
+
+    q_variants, variants_per_sample = build_affine_query_variants(q, variant_level=variant_level)
     q_variants = q_variants.to(q.device)
     scores, _ = ensemble_hopfield_scores(models, q_variants, template_labels, num_classes)
     scores = scores.view(q.shape[0], variants_per_sample, num_classes)
@@ -369,6 +394,8 @@ def run_robustness_evaluation(
     test_indices,
     trained_cnn,
     seed,
+    include_affine_robust=False,
+    affine_variant_level="light",
 ):
     print("\n" + "=" * 50)
     print(f"Task 2: held-out evaluation, pollution={pollution_type}...")
@@ -379,20 +406,31 @@ def run_robustness_evaluation(
     num_classes = len(loader.idx_to_label)
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
-    traditional_hopfield = TraditionalHopfieldNetwork(train_memory, train_labels, steps=8).to(device)
+    # The classical Hopfield baseline has limited storage capacity. Using every
+    # template as a memory pattern causes severe cross-talk on 64x32 character
+    # vectors, so the thesis baseline stores one prototype per class.
+    traditional_hopfield = TraditionalHopfieldNetwork(prototypes, prototype_labels, steps=8).to(device)
 
     def make_methods():
-        return {
+        methods = {
             "Modern Hopfield": lambda q: torch.argmax(
                 predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
             ),
             "Traditional Hopfield": lambda q: traditional_hopfield.predict(q),
-            "Affine-robust Hopfield": lambda q: predict_affine_robust_hopfield(hopfield_models, q, hopfield_labels, num_classes),
             "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
             "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
         }
+        if include_affine_robust:
+            methods["Affine-robust Hopfield"] = lambda q: predict_affine_robust_hopfield(
+                hopfield_models,
+                q,
+                hopfield_labels,
+                num_classes,
+                variant_level=affine_variant_level,
+            )
+        return methods
 
     def make_score_methods():
         return {
@@ -743,6 +781,8 @@ def parse_args():
     parser.add_argument("--cnn-train-samples", type=int, default=20000)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--include-affine-robust", action="store_true", help="Also evaluate the slow affine-query Hopfield variant.")
+    parser.add_argument("--affine-variant-level", default="light", choices=["none", "light", "medium", "full"])
     parser.add_argument("--skip-ablation", action="store_true")
     parser.add_argument("--ablation-samples", type=int, default=1000)
     parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
@@ -817,6 +857,8 @@ if __name__ == "__main__":
             test_indices=test_indices,
             trained_cnn=cnn,
             seed=args.seed,
+            include_affine_robust=args.include_affine_robust,
+            affine_variant_level=args.affine_variant_level,
         )
 
     save_results_csv(args.output_dir, all_results)

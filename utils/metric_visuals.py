@@ -15,7 +15,17 @@ class MetricVisualizer:
             os.makedirs(self.save_dir)
             
         font_path = '/kaggle/working/SimHei.ttf'
-        self.zh_font = FontProperties(fname=font_path) if os.path.exists(font_path) else FontProperties()
+        self.has_zh_font = os.path.exists(font_path)
+        self.zh_font = FontProperties(fname=font_path) if self.has_zh_font else FontProperties()
+
+    def _safe_plot_labels(self, labels):
+        if self.has_zh_font:
+            return [str(label) for label in labels]
+        safe_labels = []
+        for idx, label in enumerate(labels):
+            text = str(label)
+            safe_labels.append(f"C{idx}" if any(ord(ch) > 127 for ch in text) else text)
+        return safe_labels
 
     def _tensor_to_img(self, tensor):
         arr = tensor.detach().cpu().numpy()
@@ -35,7 +45,8 @@ class MetricVisualizer:
                 ax.axis('off')
                 if i == 0: ax.set_title(titles[j])
                 if j == 0 and labels:
-                    ax.text(-12, 32, str(labels[i]), fontsize=14, color='blue', va='center', fontproperties=self.zh_font)
+                    safe_labels = self._safe_plot_labels(labels)
+                    ax.text(-12, 32, safe_labels[i], fontsize=14, color='blue', va='center', fontproperties=self.zh_font)
 
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
@@ -155,13 +166,14 @@ class MetricVisualizer:
             labels = labels[:max_labels]
             data = data[:max_labels, :max_labels]
             label_count = max_labels
+        plot_labels = self._safe_plot_labels(labels)
 
         fig_size = max(8, min(20, 0.32 * label_count + 4))
         plt.figure(figsize=(fig_size, fig_size))
         plt.imshow(data, aspect="auto", cmap="Blues", vmin=0, vmax=100 if normalize else None)
         plt.colorbar(label="Recall (%)" if normalize else "Count")
-        plt.xticks(range(label_count), labels, rotation=90, fontsize=7, fontproperties=self.zh_font)
-        plt.yticks(range(label_count), labels, fontsize=7, fontproperties=self.zh_font)
+        plt.xticks(range(label_count), plot_labels, rotation=90, fontsize=7, fontproperties=self.zh_font)
+        plt.yticks(range(label_count), plot_labels, fontsize=7, fontproperties=self.zh_font)
         plt.xlabel("Predicted")
         plt.ylabel("Ground Truth")
         plt.title(title)
