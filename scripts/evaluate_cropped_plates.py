@@ -8,15 +8,19 @@ from collections import defaultdict
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from dataset.lp_dataset import TemplateLoader, normalize_char_tensor
-from main_eval import augment_hopfield_memory, build_hopfield_ensemble, class_free_energy_scores
+from main_eval import augment_hopfield_memory, build_hopfield_ensemble
 from utils.image_processing import PlateSegmenter
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 
 POLLUTIONS = ["none", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
@@ -165,9 +169,33 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
     parts = []
     for model in models:
         _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
-        scores = class_free_energy_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
+        scores = fast_class_free_energy_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
         parts.append(torch.log_softmax(scores, dim=-1))
     return torch.logsumexp(torch.stack(parts, dim=0), dim=0) - torch.log(q.new_tensor(float(len(parts))))
+
+
+def fast_class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
+    scaled = beta * sim_scores
+    labels = template_labels.to(device=sim_scores.device, dtype=torch.long)
+    if template_mask is not None:
+        mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        scaled = scaled.masked_fill(~mask, -1e9)
+
+    try:
+        out = scaled.new_full((scaled.shape[0], num_classes), -1e9)
+        expanded_labels = labels.view(1, -1).expand(scaled.shape[0], -1)
+        return out.scatter_reduce(1, expanded_labels, scaled, reduce="amax", include_self=True)
+    except Exception:
+        scores = []
+        for class_idx in range(num_classes):
+            class_mask = labels == class_idx
+            if int(class_mask.sum().item()) == 0:
+                scores.append(scaled.new_full((scaled.shape[0],), -1e9))
+            else:
+                scores.append(torch.max(scaled[:, class_mask], dim=-1).values)
+        return torch.stack(scores, dim=-1)
 
 
 def recognize_char(char_img, models, loader, template_labels, masks, device, position):
@@ -181,6 +209,21 @@ def recognize_char(char_img, models, loader, template_labels, masks, device, pos
         top_values, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
     top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
     return top_labels[0], top_labels
+
+
+def iter_with_progress(items, enabled=True, desc=None):
+    if enabled and tqdm is not None:
+        return tqdm(items, desc=desc, leave=False)
+    return items
+
+
+def evaluation_grid(pollutions, severities):
+    grid = []
+    for pollution in pollutions:
+        current_severities = [0.0] if pollution == "none" else severities
+        for severity in current_severities:
+            grid.append((pollution, float(severity)))
+    return grid
 
 
 def apply_plate_pollution(img, pollution, severity, rng):
@@ -260,6 +303,30 @@ def edit_distance(a, b):
     return dp[-1]
 
 
+def save_debug_case(output_dir, debug_index, pollution, severity, plate, chars):
+    debug_dir = os.path.join(output_dir, "cropped_plate_debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    plate_vis = cv2.resize(plate, (400, 120))
+    if plate_vis.ndim == 2:
+        plate_vis = cv2.cvtColor(plate_vis, cv2.COLOR_GRAY2BGR)
+    char_tiles = []
+    for char_img in chars[:7]:
+        tile = cv2.resize(char_img, (48, 96), interpolation=cv2.INTER_NEAREST)
+        if tile.ndim == 2:
+            tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
+        char_tiles.append(tile)
+    while len(char_tiles) < 7:
+        char_tiles.append(np.zeros((96, 48, 3), dtype=np.uint8))
+    separator = np.full((96, 4, 3), 230, dtype=np.uint8)
+    char_row = char_tiles[0]
+    for tile in char_tiles[1:]:
+        char_row = np.hstack([char_row, separator, tile])
+    char_row = cv2.copyMakeBorder(char_row, 8, 0, 0, max(0, plate_vis.shape[1] - char_row.shape[1]), cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    montage = np.vstack([plate_vis, char_row[:, : plate_vis.shape[1]]])
+    filename = f"debug_{debug_index:03d}_{pollution}_{severity:.2f}.jpg"
+    cv2.imwrite(os.path.join(debug_dir, filename), montage)
+
+
 def evaluate(args):
     os.makedirs(args.output_dir, exist_ok=True)
     rng = np.random.default_rng(args.seed)
@@ -285,77 +352,116 @@ def evaluate(args):
 
     pollutions = POLLUTIONS if args.pollution == "all" else [args.pollution]
     severities = [float(item) for item in args.severities.split(",")]
+    grid = evaluation_grid(pollutions, severities)
     detail_rows = []
+    char_rows = []
     position_stats = defaultdict(lambda: {"correct": 0, "total": 0, "top3": 0})
+    debug_saved = 0
 
-    for pollution in pollutions:
-        for severity in severities:
-            total_chars = correct_chars = top3_chars = plate_correct = segmentation_success = edit_sum = 0
-            for item in rows:
-                image_path = item["image_path"]
-                if not os.path.isabs(image_path):
-                    image_path = os.path.join(ROOT_DIR, image_path)
-                truth = item["plate_text"]
-                img = cv2.imread(image_path)
-                if img is None:
-                    raise FileNotFoundError(image_path)
-                polluted = apply_plate_pollution(img, pollution, severity, rng)
-                plate = cv2.resize(polluted, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
-                chars = segmenter.segment_characters(plate)
-                pred_parts = []
-                top3_ok = 0
-                char_ok = 0
-                if len(chars) == len(truth):
-                    segmentation_success += 1
-                for pos, char_img in enumerate(chars[: len(truth)]):
-                    pred, top3 = recognize_char(char_img, models, loader, template_labels, masks, device, pos)
-                    pred_parts.append(pred)
-                    correct = pred == truth[pos]
-                    in_top3 = truth[pos] in top3
-                    char_ok += int(correct)
-                    top3_ok += int(in_top3)
-                    key = (pollution, severity, pos + 1)
-                    position_stats[key]["correct"] += int(correct)
-                    position_stats[key]["top3"] += int(in_top3)
-                    position_stats[key]["total"] += 1
-                pred_text = "".join(pred_parts)
-                total_chars += len(truth)
-                correct_chars += char_ok
-                top3_chars += top3_ok
-                plate_correct += int(pred_text == truth)
-                dist = edit_distance(pred_text, truth)
-                edit_sum += dist
-                detail_rows.append(
+    print(f"Evaluation plan: {len(rows)} plates x {len(grid)} pollution/severity settings.")
+    if args.pollution == "all":
+        print("Note: pollution=none is evaluated once at severity=0.00; other pollution types keep all severity levels.")
+
+    for pollution, severity in grid:
+        total_chars = correct_chars = top3_chars = plate_correct = segmentation_success = edit_sum = 0
+        desc = f"{pollution} {severity:.2f}"
+        for image_idx, item in enumerate(iter_with_progress(rows, enabled=not args.no_progress, desc=desc), start=1):
+            image_path = item["image_path"]
+            if not os.path.isabs(image_path):
+                image_path = os.path.join(ROOT_DIR, image_path)
+            truth = item["plate_text"]
+            img = cv2.imread(image_path)
+            if img is None:
+                raise FileNotFoundError(image_path)
+            polluted = apply_plate_pollution(img, pollution, severity, rng)
+            plate = cv2.resize(polluted, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+            chars = segmenter.segment_characters(plate)
+            pred_parts = []
+            top3_parts = []
+            correct_flags = []
+            top3_flags = []
+            top3_ok = 0
+            char_ok = 0
+            if len(chars) == len(truth):
+                segmentation_success += 1
+            for pos, char_img in enumerate(chars[: len(truth)]):
+                pred, top3 = recognize_char(char_img, models, loader, template_labels, masks, device, pos)
+                pred_parts.append(pred)
+                top3_parts.append("/".join(str(item) for item in top3))
+                correct = pred == truth[pos]
+                in_top3 = truth[pos] in top3
+                correct_flags.append("1" if correct else "0")
+                top3_flags.append("1" if in_top3 else "0")
+                char_ok += int(correct)
+                top3_ok += int(in_top3)
+                key = (pollution, severity, pos + 1)
+                position_stats[key]["correct"] += int(correct)
+                position_stats[key]["top3"] += int(in_top3)
+                position_stats[key]["total"] += 1
+                char_rows.append(
                     {
                         "pollution": pollution,
                         "severity": f"{severity:.2f}",
                         "image_path": os.path.relpath(image_path, ROOT_DIR),
-                        "truth": truth,
-                        "pred": pred_text,
+                        "position": pos + 1,
+                        "truth": truth[pos],
+                        "pred": pred,
+                        "top3": "/".join(str(item) for item in top3),
+                        "correct": int(correct),
+                        "top3_hit": int(in_top3),
                         "segmented_count": len(chars),
-                        "char_correct": char_ok,
-                        "char_total": len(truth),
-                        "top3_correct": top3_ok,
-                        "plate_correct": int(pred_text == truth),
-                        "edit_distance": dist,
                     }
                 )
-            image_count = len(rows)
-            print(
-                f"{pollution:12s} severity={severity:.2f} | "
-                f"seg={segmentation_success / image_count * 100:.2f}% | "
-                f"char={correct_chars / total_chars * 100:.2f}% | "
-                f"plate={plate_correct / image_count * 100:.2f}% | "
-                f"top3={top3_chars / total_chars * 100:.2f}%"
+            pred_text = "".join(pred_parts)
+            total_chars += len(truth)
+            correct_chars += char_ok
+            top3_chars += top3_ok
+            plate_correct += int(pred_text == truth)
+            dist = edit_distance(pred_text, truth)
+            edit_sum += dist
+            if args.debug_samples > 0 and debug_saved < args.debug_samples and (pred_text != truth or len(chars) != len(truth)):
+                save_debug_case(args.output_dir, debug_saved + 1, pollution, severity, plate, chars)
+                debug_saved += 1
+            detail_rows.append(
+                {
+                    "pollution": pollution,
+                    "severity": f"{severity:.2f}",
+                    "image_path": os.path.relpath(image_path, ROOT_DIR),
+                    "truth": truth,
+                    "pred": pred_text,
+                    "pred_chars": " ".join(pred_parts),
+                    "top3_by_position": " | ".join(top3_parts),
+                    "correct_by_position": "".join(correct_flags),
+                    "top3_by_position_hit": "".join(top3_flags),
+                    "segmented_count": len(chars),
+                    "char_correct": char_ok,
+                    "char_total": len(truth),
+                    "top3_correct": top3_ok,
+                    "plate_correct": int(pred_text == truth),
+                    "edit_distance": dist,
+                }
             )
+        image_count = len(rows)
+        print(
+            f"{pollution:12s} severity={severity:.2f} | "
+            f"seg={segmentation_success / image_count * 100:.2f}% | "
+            f"char={correct_chars / total_chars * 100:.2f}% | "
+            f"plate={plate_correct / image_count * 100:.2f}% | "
+            f"top3={top3_chars / total_chars * 100:.2f}%"
+        )
 
     summary_path = os.path.join(args.output_dir, "cropped_plate_summary.csv")
     details_path = os.path.join(args.output_dir, "cropped_plate_details.csv")
+    char_details_path = os.path.join(args.output_dir, "cropped_plate_char_details.csv")
     position_path = os.path.join(args.output_dir, "cropped_plate_position_accuracy.csv")
     with open(details_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(detail_rows[0].keys()))
         writer.writeheader()
         writer.writerows(detail_rows)
+    with open(char_details_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(char_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(char_rows)
 
     summary = defaultdict(lambda: {"images": 0, "seg": 0, "char_ok": 0, "char_total": 0, "top3": 0, "plate": 0, "edit": 0})
     for row in detail_rows:
@@ -401,7 +507,10 @@ def evaluate(args):
             )
     print(f"Saved summary: {summary_path}")
     print(f"Saved details: {details_path}")
+    print(f"Saved char details: {char_details_path}")
     print(f"Saved position accuracy: {position_path}")
+    if args.debug_samples > 0:
+        print(f"Saved debug montages: {os.path.join(args.output_dir, 'cropped_plate_debug')}")
 
 
 def parse_args():
@@ -414,6 +523,8 @@ def parse_args():
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
+    parser.add_argument("--debug-samples", type=int, default=12, help="Save this many failed plate segmentation/recognition montages.")
     return parser.parse_args()
 
 

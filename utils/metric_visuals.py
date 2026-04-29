@@ -7,6 +7,41 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 
+CHINESE_LABEL_TO_PINYIN = {
+    "京": "zh_jing",
+    "津": "zh_jin",
+    "冀": "zh_ji",
+    "晋": "zh_jin1",
+    "蒙": "zh_meng",
+    "辽": "zh_liao",
+    "吉": "zh_ji1",
+    "黑": "zh_hei",
+    "沪": "zh_hu",
+    "苏": "zh_su",
+    "浙": "zh_zhe",
+    "皖": "zh_wan",
+    "闽": "zh_min",
+    "赣": "zh_gan",
+    "鲁": "zh_lu",
+    "豫": "zh_yu",
+    "鄂": "zh_e",
+    "湘": "zh_xiang",
+    "粤": "zh_yue",
+    "桂": "zh_gui1",
+    "琼": "zh_qiong",
+    "渝": "zh_yu1",
+    "川": "zh_chuan",
+    "贵": "zh_gui",
+    "云": "zh_yun",
+    "藏": "zh_zang",
+    "陕": "zh_shan",
+    "甘": "zh_gan1",
+    "青": "zh_qing",
+    "宁": "zh_ning",
+    "新": "zh_xin",
+}
+
+
 class MetricVisualizer:
     def __init__(self, img_size=(32, 64), save_dir="./results"):
         self.img_w, self.img_h = img_size
@@ -21,7 +56,7 @@ class MetricVisualizer:
     def _safe_plot_labels(self, labels):
         if self.has_zh_font:
             return [str(label) for label in labels]
-        return [str(label) for label in labels]
+        return [CHINESE_LABEL_TO_PINYIN.get(str(label), str(label)) for label in labels]
 
     def _tensor_to_img(self, tensor):
         arr = tensor.detach().cpu().numpy()

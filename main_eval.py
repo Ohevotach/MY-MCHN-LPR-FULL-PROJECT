@@ -1088,6 +1088,18 @@ def parse_args():
     parser.add_argument("--ablation-severity", type=float, default=0.6)
     parser.add_argument("--skip-e2e", action="store_true", default=True)
     parser.add_argument("--run-e2e", action="store_false", dest="skip_e2e")
+    parser.add_argument(
+        "--save-mchn-memory",
+        action="store_true",
+        default=True,
+        help="Save the large augmented MCHN evaluation memory artifact. Enabled by default for reproducible experiment artifacts.",
+    )
+    parser.add_argument(
+        "--skip-save-mchn-memory",
+        action="store_false",
+        dest="save_mchn_memory",
+        help="Skip the large MCHN memory artifact when storage or Kaggle upload size is limited.",
+    )
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./results")
     parser.add_argument("--saved-weights-dir", default="./saved_weights")
@@ -1135,7 +1147,10 @@ if __name__ == "__main__":
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
     demo_memory, demo_labels = augment_hopfield_memory(train_memory, train_labels)
-    save_mchn_memory_artifacts(loader, train_indices, test_indices, demo_memory, demo_labels, args.saved_weights_dir)
+    if args.save_mchn_memory:
+        save_mchn_memory_artifacts(loader, train_indices, test_indices, demo_memory, demo_labels, args.saved_weights_dir)
+    else:
+        print("Skipping large MCHN evaluation memory artifact. Use --save-mchn-memory if you need it.")
     demo_models = build_hopfield_ensemble(demo_memory.to(device), device)
     run_reconstruction_demo(
         {"hopfield": demo_models, "train_memory": demo_memory.to(device), "train_labels": demo_labels.to(device)},
