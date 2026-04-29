@@ -704,6 +704,7 @@ def save_confusion_reports(
             filename=f"confusion_{pollution_type}_{safe_name}.png",
         )
         save_top_confusions_csv(visualizer.save_dir, pollution_type, safe_name, matrix, label_names)
+        save_group_accuracy_csv(visualizer.save_dir, pollution_type, safe_name, matrix, label_names)
         print(f"Saved confusion report: {matrix_path}")
 
 
@@ -726,6 +727,35 @@ def save_top_confusions_csv(output_dir, pollution_type, method_name, matrix, lab
         for wrong_count, true_total, true_label, pred_label in pairs[:top_n]:
             writer.writerow([wrong_count, true_total, true_label, pred_label, f"{wrong_count / max(true_total, 1):.4f}"])
     print(f"Saved top confusions CSV: {csv_path}")
+
+
+def label_group(label):
+    text = str(label)
+    if len(text) == 1 and text.isdigit():
+        return "digit"
+    if len(text) == 1 and "A" <= text <= "Z":
+        return "letter"
+    return "chinese"
+
+
+def save_group_accuracy_csv(output_dir, pollution_type, method_name, matrix, label_names):
+    groups = {}
+    for idx, label in enumerate(label_names):
+        group = label_group(label)
+        if group not in groups:
+            groups[group] = {"correct": 0, "total": 0}
+        groups[group]["correct"] += int(matrix[idx, idx])
+        groups[group]["total"] += int(matrix[idx].sum())
+
+    csv_path = os.path.join(output_dir, f"group_accuracy_{pollution_type}_{method_name}.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pollution", "method", "group", "correct", "total", "accuracy"])
+        for group in ("chinese", "letter", "digit"):
+            values = groups.get(group, {"correct": 0, "total": 0})
+            accuracy = 100.0 * values["correct"] / max(values["total"], 1)
+            writer.writerow([pollution_type, method_name, group, values["correct"], values["total"], f"{accuracy:.4f}"])
+    print(f"Saved group accuracy CSV: {csv_path}")
 
 
 def save_mchn_memory_artifacts(loader, train_indices, test_indices, hopfield_memory, hopfield_labels, output_dir="./saved_weights"):
@@ -772,18 +802,41 @@ def plot_all_pollution_summary(visualizer, all_results):
         title="Held-out mean accuracy across severities",
         filename="summary_mean_accuracy_heatmap.png",
     )
-    visualizer.plot_method_pollution_curves(
-        SEVERITIES,
-        all_results,
-        method_name="Modern Hopfield",
-        filename="mchn_pollution_severity_curves.png",
-    )
-    visualizer.plot_method_pollution_curves(
-        SEVERITIES,
-        all_results,
-        method_name="Affine-robust Hopfield",
-        filename="affine_robust_mchn_pollution_severity_curves.png",
-    )
+    for method_name, filename in (
+        ("Modern Hopfield", "mchn_pollution_severity_curves.png"),
+        ("Affine-robust Hopfield", "affine_robust_mchn_pollution_severity_curves.png"),
+    ):
+        if any(method_name in method_results for method_results in all_results.values()):
+            visualizer.plot_method_pollution_curves(
+                SEVERITIES,
+                all_results,
+                method_name=method_name,
+                filename=filename,
+            )
+
+
+def save_summary_ranking_csv(output_dir, all_results):
+    csv_path = os.path.join(output_dir, "summary_method_ranking.csv")
+    rows = []
+    for pollution, method_results in all_results.items():
+        for method, values in method_results.items():
+            rows.append(
+                {
+                    "pollution": pollution,
+                    "method": method,
+                    "final_accuracy": values[-1],
+                    "mean_accuracy": sum(values) / max(len(values), 1),
+                    "min_accuracy": min(values),
+                    "max_accuracy": max(values),
+                }
+            )
+    rows.sort(key=lambda row: (row["pollution"], -row["mean_accuracy"]))
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["pollution", "method", "final_accuracy", "mean_accuracy", "min_accuracy", "max_accuracy"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: f"{value:.4f}" if isinstance(value, float) else value for key, value in row.items()})
+    print(f"Saved summary ranking CSV: {csv_path}")
 
 
 def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weather", max_images=3):
@@ -933,6 +986,7 @@ if __name__ == "__main__":
         )
 
     save_results_csv(args.output_dir, all_results)
+    save_summary_ranking_csv(args.output_dir, all_results)
     if args.pollution == "all":
         plot_all_pollution_summary(visualizer, all_results)
 
