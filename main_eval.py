@@ -18,6 +18,19 @@ from utils.metric_visuals import MetricVisualizer
 
 
 SEVERITIES = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8]
+METHOD_ORDER = [
+    "Modern Hopfield",
+    "Affine-robust Hopfield",
+    "Balanced Traditional Hopfield",
+    "CNN",
+    "Nearest Neighbor",
+    "Euclidean NN",
+    "Class Prototype",
+]
+
+
+def order_method_results(results):
+    return {name: results[name] for name in METHOD_ORDER if name in results}
 
 
 class SimpleCNN(nn.Module):
@@ -494,7 +507,7 @@ def run_robustness_evaluation(
                 num_classes,
                 variant_level=affine_variant_level,
             )
-        return methods
+        return order_method_results(methods)
 
     def make_score_methods():
         return {
@@ -625,7 +638,7 @@ def run_class_balanced_evaluation(
                 num_classes,
                 variant_level=affine_variant_level,
             )
-        return methods
+        return order_method_results(methods)
 
     results = {name: [] for name in make_methods()}
     for severity in SEVERITIES:
@@ -909,7 +922,9 @@ def save_mchn_memory_artifacts(loader, train_indices, test_indices, hopfield_mem
 
 
 def plot_all_pollution_summary(visualizer, all_results, prefix=""):
-    method_names = list(next(iter(all_results.values())).keys())
+    available_methods = list(next(iter(all_results.values())).keys())
+    method_names = [name for name in METHOD_ORDER if name in available_methods]
+    method_names.extend(name for name in available_methods if name not in method_names)
     pollution_names = list(all_results.keys())
     final_matrix = []
     mean_matrix = []

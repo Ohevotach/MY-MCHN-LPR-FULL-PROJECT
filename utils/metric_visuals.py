@@ -31,6 +31,33 @@ class MetricVisualizer:
         arr = tensor.detach().cpu().numpy()
         return arr.reshape((self.img_h, self.img_w))
 
+    @staticmethod
+    def _ordered_method_items(model_results):
+        priority = [
+            "Modern Hopfield",
+            "Affine-robust Hopfield",
+            "Balanced Traditional Hopfield",
+            "CNN",
+            "Nearest Neighbor",
+            "Euclidean NN",
+            "Class Prototype",
+        ]
+        items = list(model_results.items())
+        order = {name: idx for idx, name in enumerate(priority)}
+        return sorted(items, key=lambda item: order.get(item[0], len(order) + items.index(item)))
+
+    @staticmethod
+    def _method_color(name, fallback):
+        if name == "Modern Hopfield":
+            return "#e74c3c"
+        if name == "Affine-robust Hopfield":
+            return "#c0392b"
+        return fallback
+
+    @staticmethod
+    def _method_linewidth(name):
+        return 2.8 if name == "Modern Hopfield" else 1.7
+
     def plot_reconstruction_grid(self, clean_qs, polluted_qs, reconstructed_zs, labels=None, filename="mchn_reconstruction_demo.png"):
         num_samples = min(clean_qs.shape[0], 5) 
         fig, axes = plt.subplots(nrows=num_samples, ncols=3, figsize=(8, 2 * num_samples))
@@ -70,10 +97,10 @@ class MetricVisualizer:
         styles = ["o-", "s--", "^--", "d--", "x--", "v--", "p--"]
         colors = ["#e74c3c", "#2c7fb8", "#7f8c8d", "#27ae60", "#8e44ad", "#d35400", "#16a085"]
 
-        for i, (name, values) in enumerate(model_results.items()):
+        for i, (name, values) in enumerate(self._ordered_method_items(model_results)):
             style = styles[i % len(styles)]
-            color = colors[i % len(colors)]
-            linewidth = 2.4 if i == 0 else 1.7
+            color = self._method_color(name, colors[i % len(colors)])
+            linewidth = self._method_linewidth(name)
             plt.plot(severities, values, style, color=color, linewidth=linewidth, label=name)
 
         plt.title(f"Accuracy vs. {pollution_type}", fontsize=14)
@@ -138,9 +165,9 @@ class MetricVisualizer:
         plt.close()
 
     def plot_final_severity_bar(self, final_scores, pollution_type, severity, filename):
-        names = list(final_scores.keys())
+        names = [name for name, _ in self._ordered_method_items(final_scores)]
         values = [final_scores[name] for name in names]
-        colors = ["#e74c3c"] + ["#7f8c8d"] * max(0, len(names) - 1)
+        colors = [self._method_color(name, "#7f8c8d") for name in names]
 
         plt.figure(figsize=(9, 5))
         bars = plt.bar(names, values, color=colors)
