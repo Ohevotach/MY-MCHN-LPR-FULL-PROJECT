@@ -683,8 +683,44 @@ class PlateSegmenter:
             char_position += 1
             x += slot_w
 
+        boxes = self._refine_geometry_boxes_by_projection(binary, boxes)
         chars = [self._crop_slot_char(plate_img, gray, binary, box, idx) for idx, box in enumerate(boxes)]
         return chars, boxes
+
+    @staticmethod
+    def _refine_geometry_boxes_by_projection(binary, boxes):
+        if not boxes or len(boxes) != 7:
+            return boxes
+        refined = [[int(x), int(y), int(w), int(h)] for x, y, w, h in boxes]
+        col_sum = (binary > 0).sum(axis=0).astype(np.float32)
+        if col_sum.size == 0 or float(np.max(col_sum)) <= 0:
+            return boxes
+
+        for idx in range(len(refined) - 1):
+            left_box = refined[idx]
+            right_box = refined[idx + 1]
+            left_end = left_box[0] + left_box[2]
+            right_start = right_box[0]
+            expected = int(round((left_end + right_start) / 2.0))
+            local_w = max(8, int(0.18 * min(left_box[2], right_box[2])))
+            search_left = max(left_box[0] + int(0.55 * left_box[2]), expected - local_w)
+            search_right = min(right_box[0] + int(0.45 * right_box[2]), expected + local_w)
+            if search_right <= search_left + 2:
+                continue
+            profile = col_sum[search_left : search_right + 1]
+            if profile.size < 3:
+                continue
+            smoothed = np.convolve(profile, np.ones(3, dtype=np.float32) / 3.0, mode="same")
+            valley = int(search_left + np.argmin(smoothed))
+            min_gap = 2
+            if valley <= left_box[0] + min_gap or valley >= right_box[0] + right_box[2] - min_gap:
+                continue
+            left_box[2] = max(4, valley - left_box[0] - 1)
+            new_right_start = valley + 1
+            right_end = right_box[0] + right_box[2]
+            right_box[0] = new_right_start
+            right_box[2] = max(4, right_end - new_right_start)
+        return [(x, y, w, h) for x, y, w, h in refined]
 
     @classmethod
     def _estimate_plate_text_roi(cls, plate_img, binary):
@@ -877,7 +913,7 @@ class PlateSegmenter:
             cleaned[: max(1, int(0.04 * cleaned.shape[0])), :] = 0
             cleaned[-max(1, int(0.04 * cleaned.shape[0])) :, :] = 0
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
-        cleaned = PlateSegmenter._remove_slot_border_lines(cleaned)
+        cleaned = PlateSegmenter._remove_slot_border_lines(cleaned, position=position)
         cleaned = PlateSegmenter._trim_slot_edge_artifacts(cleaned, position=position)
 
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -901,7 +937,7 @@ class PlateSegmenter:
                     continue
             if w >= 0.85 * w_img and h <= 0.10 * h_img and (y <= 2 or y + h >= h_img - 2):
                 continue
-            if h >= 0.94 * h_img and w <= 0.055 * w_img and (x <= 1 or x + w >= w_img - 1):
+            if position in {0, 6} and h >= 0.94 * h_img and w <= 0.055 * w_img and (x <= 1 or x + w >= w_img - 1):
                 continue
             if (x <= 1 or x + w >= w_img - 1) and h < 0.30 * h_img and area < 2.4 * min_area:
                 continue
@@ -972,7 +1008,7 @@ class PlateSegmenter:
         return kept
 
     @staticmethod
-    def _remove_slot_border_lines(mask):
+    def _remove_slot_border_lines(mask, position=None):
         if mask.size == 0:
             return mask
         cleaned = mask.copy()
@@ -984,12 +1020,13 @@ class PlateSegmenter:
         edge_mask[-band_y:, :] = 255
         edge_lines = cv2.bitwise_and(horizontal, edge_mask)
 
-        vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(24, int(h_img * 0.62)))))
-        side_mask = np.zeros_like(cleaned)
-        side_band = max(2, int(0.08 * w_img))
-        side_mask[:, :side_band] = 255
-        side_mask[:, -side_band:] = 255
-        edge_lines = cv2.bitwise_or(edge_lines, cv2.bitwise_and(vertical, side_mask))
+        if position in {0, 6}:
+            vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(24, int(h_img * 0.62)))))
+            side_mask = np.zeros_like(cleaned)
+            side_band = max(2, int(0.08 * w_img))
+            side_mask[:, :side_band] = 255
+            side_mask[:, -side_band:] = 255
+            edge_lines = cv2.bitwise_or(edge_lines, cv2.bitwise_and(vertical, side_mask))
 
         return cv2.bitwise_and(cleaned, cv2.bitwise_not(edge_lines))
 
@@ -1437,14 +1474,12 @@ class PlateSegmenter:
                 elif touches_right and w <= 6 and h >= 26 and area < 0.12 * 64 * 32:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
             elif position == 6:
-                if near_right and w <= 8 and h >= 26:
+                if touches_right and w <= 4 and h >= 40:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
                 elif upper_or_lower_edge and w >= 14 and h <= 7:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
             else:
                 if upper_or_lower_edge and w >= 18 and h <= 6:
-                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
-                elif (touches_left or touches_right) and w <= 4 and h >= 38:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
         if np.count_nonzero(remove_mask) > 0:
             cleaned[remove_mask > 0] = 0

@@ -265,11 +265,64 @@ def recognize_plate_chars(chars, truth_len, models, loader, template_labels, mas
         mean_scores = torch.logsumexp(scores, dim=0) - torch.log(scores.new_tensor(float(scores.shape[0])))
         max_scores = torch.max(scores, dim=0).values
         pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+        pooled_scores = apply_position_prior(pooled_scores, loader, position=len(pred_parts))
         _, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
         top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
         pred_parts.append(top_labels[0])
         top3_parts.append(top_labels)
     return pred_parts, top3_parts
+
+
+def apply_position_prior(scores, loader, position):
+    """Light plate-layout prior for Chinese blue plates.
+
+    Position constraints already mask impossible groups. This prior only nudges
+    visually ambiguous tail positions where real plates are digit-heavy; it is
+    intentionally weak so MCHN similarity remains the main decision signal.
+    """
+    if position < 2:
+        return scores
+    digit_bonus_by_pos = {2: 0.18, 3: 0.12, 4: 0.08, 5: 0.14, 6: 0.08}
+    bonus = digit_bonus_by_pos.get(position, 0.0)
+    if bonus <= 0:
+        return scores
+    adjusted = scores.clone()
+    for class_idx, label in loader.idx_to_label.items():
+        if str(label).isdigit():
+            adjusted[int(class_idx)] += bonus
+    return adjusted
+
+
+def build_plate_calibration_memory(rows, segmenter, loader):
+    tensors = []
+    labels = []
+    used_plates = 0
+    for item in rows:
+        image_path = item["image_path"]
+        if not os.path.isabs(image_path):
+            image_path = os.path.join(ROOT_DIR, image_path)
+        img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        plate = cv2.resize(img, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+        chars = segmenter.segment_characters(plate)
+        truth = item["plate_text"]
+        if len(chars) < len(truth):
+            continue
+        added = 0
+        for char_img, label in zip(chars[: len(truth)], truth):
+            if label not in loader.label_to_idx:
+                continue
+            tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
+            tensor = normalize_char_tensor(tensor, img_size=(32, 64)).view(-1)
+            tensors.append(tensor)
+            labels.append(int(loader.label_to_idx[label]))
+            added += 1
+        if added == len(truth):
+            used_plates += 1
+    if not tensors:
+        return None, None, 0
+    return torch.stack(tensors, dim=0), torch.tensor(labels, dtype=torch.long), used_plates
 
 
 def iter_with_progress(items, enabled=True, desc=None):
@@ -402,16 +455,32 @@ def evaluate(args):
         img_size=(32, 64),
         cache_path=os.path.join(args.output_dir, "cropped_plate_template_cache_32x64.pt"),
     )
+    segmenter = PlateSegmenter()
+    rows = read_labels(args.labels_csv)
+    if args.calibration_count > 0:
+        calibration_rows = rows[: args.calibration_count]
+        eval_rows = rows[args.calibration_count :]
+        plate_memory, plate_labels, used_plates = build_plate_calibration_memory(calibration_rows, segmenter, loader)
+        if plate_memory is not None:
+            loader.memory_matrix = torch.cat([loader.memory_matrix, plate_memory], dim=0)
+            loader.labels = torch.cat([loader.labels, plate_labels], dim=0)
+            print(
+                f"Added cropped-plate calibration memory: {plate_memory.shape[0]} characters "
+                f"from {used_plates}/{len(calibration_rows)} plates. Evaluation excludes calibration plates."
+            )
+        else:
+            print("Warning: no cropped-plate calibration characters were added.")
+        rows = eval_rows
+    if args.max_images:
+        rows = rows[: args.max_images]
     memory, template_labels = augment_hopfield_memory(loader.memory_matrix, loader.labels)
     memory = memory.to(device)
     template_labels = template_labels.to(device)
     models = build_hopfield_ensemble(memory, device)
     cache_model_memories(models)
     masks = build_template_masks(loader, template_labels, device)
-    segmenter = PlateSegmenter()
-    rows = read_labels(args.labels_csv)
-    if args.max_images:
-        rows = rows[: args.max_images]
+    if not rows:
+        raise RuntimeError("No evaluation plates left after calibration/max-images filtering.")
 
     pollutions = POLLUTIONS if args.pollution == "all" else [args.pollution]
     severities = [float(item) for item in args.severities.split(",")]
@@ -585,6 +654,12 @@ def parse_args():
     parser.add_argument("--pollution", default="all", choices=["all", "mixed", *POLLUTIONS])
     parser.add_argument("--severities", default="0.0,0.1,0.2,0.4,0.6,0.8")
     parser.add_argument("--max-images", type=int, default=0)
+    parser.add_argument(
+        "--calibration-count",
+        type=int,
+        default=0,
+        help="Use the first N clean cropped plates as MCHN real-domain calibration memory and exclude them from evaluation.",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
