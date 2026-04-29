@@ -389,6 +389,7 @@ def save_debug_case(output_dir, debug_index, pollution, severity, plate, chars):
 
 
 def evaluate(args):
+    args.output_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(args.output_dir, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     random.seed(args.seed)
@@ -580,6 +581,7 @@ def parse_args():
     parser.add_argument("--labels-csv", default="./plate_eval/labels.csv")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./results")
+    parser.add_argument("--run-name", default="cropped_plate_eval", help="Subfolder under output-dir for cropped-plate evaluation artifacts.")
     parser.add_argument("--pollution", default="all", choices=["all", "mixed", *POLLUTIONS])
     parser.add_argument("--severities", default="0.0,0.1,0.2,0.4,0.6,0.8")
     parser.add_argument("--max-images", type=int, default=0)

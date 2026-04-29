@@ -671,10 +671,10 @@ class PlateSegmenter:
             if i == 2:
                 x += slot_w
                 continue
-            pad_ratio = 0.010 if char_position == 0 else 0.020 if char_position == 1 else 0.020 if char_position == 6 else 0.050
+            pad_ratio = 0.006 if char_position == 0 else 0.020 if char_position == 1 else 0.012 if char_position == 6 else 0.050
             pad = int(max(1, slot_w * pad_ratio))
-            extra_left = 5 if char_position == 0 else 3 if char_position in (1, 6) else 1
-            extra_right = 5 if char_position in (0, 1, 6) else 1
+            extra_left = 0 if char_position == 0 else 3 if char_position in (1, 6) else 1
+            extra_right = 3 if char_position == 0 else 4 if char_position in (1, 6) else 1
             x1 = int(round(x + pad - extra_left))
             x2 = int(round(x + slot_w - pad + extra_right))
             y1 = int(round(top + 0.01 * height))
@@ -837,6 +837,16 @@ class PlateSegmenter:
         cleaned[-1:, :] = 0
         cleaned[:, :1] = 0
         cleaned[:, -1:] = 0
+        if position == 0:
+            border_w = max(2, int(0.07 * cleaned.shape[1]))
+            cleaned[:, :border_w] = 0
+            cleaned[: max(1, int(0.04 * cleaned.shape[0])), :] = 0
+            cleaned[-max(1, int(0.04 * cleaned.shape[0])) :, :] = 0
+        elif position == 6:
+            border_w = max(2, int(0.07 * cleaned.shape[1]))
+            cleaned[:, -border_w:] = 0
+            cleaned[: max(1, int(0.04 * cleaned.shape[0])), :] = 0
+            cleaned[-max(1, int(0.04 * cleaned.shape[0])) :, :] = 0
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
         cleaned = PlateSegmenter._remove_slot_border_lines(cleaned)
 
