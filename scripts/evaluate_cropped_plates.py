@@ -168,10 +168,35 @@ def robust_char_query_variants(char_img):
 def ensemble_scores(models, q, template_labels, num_classes, template_mask=None):
     parts = []
     for model in models:
-        _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
+        sim_scores = compute_cached_similarity(model, q)
+        if template_mask is not None:
+            mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            sim_scores = sim_scores.masked_fill(~mask, -1e9)
         scores = fast_class_free_energy_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
         parts.append(torch.log_softmax(scores, dim=-1))
     return torch.logsumexp(torch.stack(parts, dim=0), dim=0) - torch.log(q.new_tensor(float(len(parts))))
+
+
+def cache_model_memories(models):
+    for model in models:
+        with torch.no_grad():
+            model._cached_memory_for_similarity = model._memory_for_similarity()
+
+
+def compute_cached_similarity(model, q):
+    q_sim = model._query_for_similarity(q)
+    m_sim = getattr(model, "_cached_memory_for_similarity", None)
+    if m_sim is None:
+        m_sim = model._memory_for_similarity()
+    if model.metric == "dot":
+        return torch.matmul(q_sim, m_sim.t())
+    if model.metric == "manhattan":
+        return -torch.cdist(q_sim, m_sim, p=1.0)
+    if model.metric == "euclidean":
+        return -torch.cdist(q_sim, m_sim, p=2.0)
+    raise ValueError(f"Unsupported metric: {model.metric}")
 
 
 def fast_class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
@@ -209,6 +234,42 @@ def recognize_char(char_img, models, loader, template_labels, masks, device, pos
         top_values, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
     top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
     return top_labels[0], top_labels
+
+
+def recognize_plate_chars(chars, truth_len, models, loader, template_labels, masks, device):
+    queries = []
+    spans = []
+    mask_rows = []
+    start = 0
+    for pos, char_img in enumerate(chars[:truth_len]):
+        q = robust_char_query_variants(char_img)
+        end = start + q.shape[0]
+        queries.append(q)
+        spans.append((start, end))
+        position_mask = plate_position_mask(pos, masks).detach().cpu()
+        mask_rows.extend([position_mask] * q.shape[0])
+        start = end
+
+    if not queries:
+        return [], []
+
+    q_batch = torch.cat(queries, dim=0).to(device)
+    template_mask = torch.stack(mask_rows, dim=0).to(device)
+    with torch.no_grad():
+        all_scores = ensemble_scores(models, q_batch, template_labels, len(loader.idx_to_label), template_mask=template_mask)
+
+    pred_parts = []
+    top3_parts = []
+    for start, end in spans:
+        scores = all_scores[start:end]
+        mean_scores = torch.logsumexp(scores, dim=0) - torch.log(scores.new_tensor(float(scores.shape[0])))
+        max_scores = torch.max(scores, dim=0).values
+        pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+        _, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
+        top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
+        pred_parts.append(top_labels[0])
+        top3_parts.append(top_labels)
+    return pred_parts, top3_parts
 
 
 def iter_with_progress(items, enabled=True, desc=None):
@@ -344,6 +405,7 @@ def evaluate(args):
     memory = memory.to(device)
     template_labels = template_labels.to(device)
     models = build_hopfield_ensemble(memory, device)
+    cache_model_memories(models)
     masks = build_template_masks(loader, template_labels, device)
     segmenter = PlateSegmenter()
     rows = read_labels(args.labels_csv)
@@ -384,8 +446,8 @@ def evaluate(args):
             char_ok = 0
             if len(chars) == len(truth):
                 segmentation_success += 1
-            for pos, char_img in enumerate(chars[: len(truth)]):
-                pred, top3 = recognize_char(char_img, models, loader, template_labels, masks, device, pos)
+            batch_preds, batch_top3 = recognize_plate_chars(chars, len(truth), models, loader, template_labels, masks, device)
+            for pos, (pred, top3) in enumerate(zip(batch_preds, batch_top3)):
                 pred_parts.append(pred)
                 top3_parts.append("/".join(str(item) for item in top3))
                 correct = pred == truth[pos]
