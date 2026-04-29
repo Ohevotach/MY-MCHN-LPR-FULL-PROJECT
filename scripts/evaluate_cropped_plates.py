@@ -1,0 +1,421 @@
+import argparse
+import csv
+import os
+import random
+import sys
+from collections import defaultdict
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from dataset.lp_dataset import TemplateLoader, normalize_char_tensor
+from main_eval import augment_hopfield_memory, build_hopfield_ensemble, class_free_energy_scores
+from utils.image_processing import PlateSegmenter
+
+
+POLLUTIONS = ["none", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
+DEFAULT_SEVERITIES = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8]
+
+
+def is_chinese_label(label):
+    text = str(label)
+    return text.startswith("zh_") or (len(text) == 1 and "\u4e00" <= text <= "\u9fff")
+
+
+def build_template_masks(loader, labels, device):
+    chinese_mask = torch.zeros(labels.numel(), dtype=torch.bool, device=device)
+    letter_mask = torch.zeros_like(chinese_mask)
+    digit_mask = torch.zeros_like(chinese_mask)
+    for idx, label_idx in enumerate(labels.detach().cpu().tolist()):
+        label = str(loader.idx_to_label[int(label_idx)])
+        if is_chinese_label(label):
+            chinese_mask[idx] = True
+        elif len(label) == 1 and "A" <= label <= "Z":
+            letter_mask[idx] = True
+        elif len(label) == 1 and label.isdigit():
+            digit_mask[idx] = True
+    alnum_mask = letter_mask | digit_mask
+    plate_tail_mask = alnum_mask.clone()
+    for idx, label_idx in enumerate(labels.detach().cpu().tolist()):
+        if str(loader.idx_to_label[int(label_idx)]) in {"I", "O"}:
+            plate_tail_mask[idx] = False
+    return chinese_mask, letter_mask, plate_tail_mask, alnum_mask
+
+
+def plate_position_mask(position, masks):
+    chinese_mask, letter_mask, plate_tail_mask, alnum_mask = masks
+    if position == 0:
+        return chinese_mask
+    if position == 1 and bool(letter_mask.any().item()):
+        return letter_mask
+    return plate_tail_mask if bool(plate_tail_mask.any().item()) else alnum_mask
+
+
+def normalize_char_image(arr):
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.shape != (64, 32):
+        arr = cv2.resize(arr, (32, 64), interpolation=cv2.INTER_NEAREST)
+    _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binary > 0) > 0.55:
+        binary = cv2.bitwise_not(binary)
+    binary = strip_character_frame_lines(binary)
+    ys, xs = np.where(binary > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return binary
+    crop = binary[max(0, ys.min() - 1) : min(64, ys.max() + 2), max(0, xs.min() - 1) : min(32, xs.max() + 2)]
+    h, w = crop.shape[:2]
+    scale = min(26.0 / max(1, w), 56.0 / max(1, h))
+    new_w = max(1, min(30, int(round(w * scale))))
+    new_h = max(1, min(62, int(round(h * scale))))
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    canvas = np.zeros((64, 32), dtype=np.uint8)
+    y = (64 - new_h) // 2
+    x = (32 - new_w) // 2
+    canvas[y : y + new_h, x : x + new_w] = resized
+    return canvas
+
+
+def strip_character_frame_lines(binary):
+    work = (binary > 0).astype(np.uint8) * 255
+    if work.shape != (64, 32):
+        work = cv2.resize(work, (32, 64), interpolation=cv2.INTER_NEAREST)
+    cleaned = work.copy()
+    h_img, w_img = cleaned.shape[:2]
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = cv2.contourArea(cnt)
+        near_side = x <= 2 or x + w >= w_img - 2
+        near_top_bottom = y <= 2 or y + h >= h_img - 2
+        if near_side and h >= 0.62 * h_img and w <= 0.12 * w_img:
+            cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+        elif near_top_bottom and w >= 0.55 * w_img and h <= 0.12 * h_img:
+            cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+        elif (near_side or near_top_bottom) and area < 0.008 * h_img * w_img:
+            cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+    return cleaned
+
+
+def keep_likely_character_components(binary):
+    work = (binary > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return work
+    h_img, w_img = work.shape[:2]
+    center_x = w_img / 2.0
+    scored = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = cv2.contourArea(cnt)
+        if area < max(3, 0.004 * h_img * w_img):
+            continue
+        center_score = 1.0 - min(abs((x + w / 2.0) - center_x) / max(center_x, 1.0), 1.0)
+        height_score = min(h / max(1.0, 0.55 * h_img), 1.0)
+        scored.append((area + 20.0 * center_score + 25.0 * height_score, cnt))
+    if not scored:
+        return work
+    scored.sort(key=lambda item: item[0], reverse=True)
+    kept = np.zeros_like(work)
+    for _, cnt in scored[:4]:
+        cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
+    return kept
+
+
+def robust_char_query_variants(char_img):
+    tensor_img = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
+    normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
+    base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
+    blurred = cv2.GaussianBlur(base, (3, 3), 0)
+    _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(otsu > 0) > 0.55:
+        otsu = cv2.bitwise_not(otsu)
+
+    candidates = [
+        base,
+        normalize_char_image(base),
+        normalize_char_image(otsu),
+        normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))),
+        normalize_char_image(cv2.medianBlur(otsu, 3)),
+        normalize_char_image(keep_likely_character_components(otsu)),
+    ]
+    unique = []
+    seen = set()
+    for item in candidates:
+        item = normalize_char_image(item)
+        ink = float(np.mean(item > 0))
+        if ink < 0.01 or ink > 0.70:
+            continue
+        key = item.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(torch.tensor(item, dtype=torch.float32).view(1, -1) / 255.0)
+    if not unique:
+        unique.append(normalized.view(1, -1))
+    return torch.cat(unique, dim=0)
+
+
+def ensemble_scores(models, q, template_labels, num_classes, template_mask=None):
+    parts = []
+    for model in models:
+        _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
+        scores = class_free_energy_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
+        parts.append(torch.log_softmax(scores, dim=-1))
+    return torch.logsumexp(torch.stack(parts, dim=0), dim=0) - torch.log(q.new_tensor(float(len(parts))))
+
+
+def recognize_char(char_img, models, loader, template_labels, masks, device, position):
+    q = robust_char_query_variants(char_img).to(device)
+    template_mask = plate_position_mask(position, masks)
+    with torch.no_grad():
+        scores = ensemble_scores(models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask)
+        mean_scores = torch.logsumexp(scores, dim=0) - torch.log(scores.new_tensor(float(scores.shape[0])))
+        max_scores = torch.max(scores, dim=0).values
+        pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+        top_values, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
+    top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
+    return top_labels[0], top_labels
+
+
+def apply_plate_pollution(img, pollution, severity, rng):
+    severity = float(max(0.0, min(1.0, severity)))
+    if pollution == "none" or severity <= 0.0:
+        return img.copy()
+    if pollution == "mixed":
+        choices = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
+        count = 1 if severity < 0.35 else 2 if severity < 0.7 else 3
+        out = img.copy()
+        for name in rng.sample(choices, count):
+            out = apply_plate_pollution(out, name, severity, rng)
+        return out
+
+    out = img.copy()
+    h, w = out.shape[:2]
+    if pollution == "mask":
+        for _ in range(1 + int(3 * severity)):
+            bw = rng.randint(max(6, int(w * 0.06)), max(8, int(w * (0.12 + 0.18 * severity))))
+            bh = rng.randint(max(5, int(h * 0.10)), max(6, int(h * (0.18 + 0.22 * severity))))
+            x = rng.randint(0, max(0, w - bw))
+            y = rng.randint(0, max(0, h - bh))
+            color = (0, 0, 0) if rng.random() < 0.65 else (255, 255, 255)
+            cv2.rectangle(out, (x, y), (x + bw, y + bh), color, thickness=-1)
+        return out
+    if pollution == "noise":
+        sigma = 8 + 55 * severity
+        noise = rng.normal(0, sigma, out.shape).astype(np.float32)
+        return np.clip(out.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    if pollution == "salt_pepper":
+        prob = 0.005 + 0.12 * severity
+        mask = rng.random(out.shape[:2])
+        out[mask < prob / 2] = 0
+        out[(mask >= prob / 2) & (mask < prob)] = 255
+        return out
+    if pollution == "blur":
+        kernel = int(3 + 10 * severity)
+        kernel = kernel + 1 if kernel % 2 == 0 else kernel
+        return cv2.GaussianBlur(out, (kernel, kernel), 0)
+    if pollution == "fog":
+        fog = np.full_like(out, 255)
+        return cv2.addWeighted(out, 1.0 - (0.12 + 0.55 * severity), fog, 0.12 + 0.55 * severity, 0)
+    if pollution == "dirt":
+        for _ in range(1 + int(5 * severity)):
+            radius = rng.randint(max(3, int(h * 0.04)), max(4, int(h * (0.08 + 0.15 * severity))))
+            x = rng.randint(0, max(0, w - 1))
+            y = rng.randint(0, max(0, h - 1))
+            color = tuple(int(v) for v in rng.integers(20, 90, size=3))
+            cv2.circle(out, (x, y), radius, color, thickness=-1)
+        return out
+    if pollution == "affine":
+        angle = rng.uniform(-8, 8) * severity
+        shear = rng.uniform(-0.12, 0.12) * severity
+        matrix = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+        matrix[0, 1] += shear
+        return cv2.warpAffine(out, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    raise ValueError(f"Unsupported pollution: {pollution}")
+
+
+def read_labels(labels_csv):
+    rows = []
+    with open(labels_csv, "r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append({"image_path": row["image_path"], "plate_text": row["plate_text"].strip()})
+    return rows
+
+
+def edit_distance(a, b):
+    dp = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        prev = dp[0]
+        dp[0] = i
+        for j, cb in enumerate(b, start=1):
+            cur = dp[j]
+            dp[j] = min(dp[j] + 1, dp[j - 1] + 1, prev + (0 if ca == cb else 1))
+            prev = cur
+    return dp[-1]
+
+
+def evaluate(args):
+    os.makedirs(args.output_dir, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(f"Cropped-plate MCHN evaluation, device={device}")
+
+    loader = TemplateLoader(
+        [os.path.join(args.data_dir, "chars2"), os.path.join(args.data_dir, "charsChinese")],
+        img_size=(32, 64),
+        cache_path=os.path.join(args.output_dir, "cropped_plate_template_cache_32x64.pt"),
+    )
+    memory, template_labels = augment_hopfield_memory(loader.memory_matrix, loader.labels)
+    memory = memory.to(device)
+    template_labels = template_labels.to(device)
+    models = build_hopfield_ensemble(memory, device)
+    masks = build_template_masks(loader, template_labels, device)
+    segmenter = PlateSegmenter()
+    rows = read_labels(args.labels_csv)
+    if args.max_images:
+        rows = rows[: args.max_images]
+
+    pollutions = POLLUTIONS if args.pollution == "all" else [args.pollution]
+    severities = [float(item) for item in args.severities.split(",")]
+    detail_rows = []
+    position_stats = defaultdict(lambda: {"correct": 0, "total": 0, "top3": 0})
+
+    for pollution in pollutions:
+        for severity in severities:
+            total_chars = correct_chars = top3_chars = plate_correct = segmentation_success = edit_sum = 0
+            for item in rows:
+                image_path = item["image_path"]
+                if not os.path.isabs(image_path):
+                    image_path = os.path.join(ROOT_DIR, image_path)
+                truth = item["plate_text"]
+                img = cv2.imread(image_path)
+                if img is None:
+                    raise FileNotFoundError(image_path)
+                polluted = apply_plate_pollution(img, pollution, severity, rng)
+                plate = cv2.resize(polluted, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+                chars = segmenter.segment_characters(plate)
+                pred_parts = []
+                top3_ok = 0
+                char_ok = 0
+                if len(chars) == len(truth):
+                    segmentation_success += 1
+                for pos, char_img in enumerate(chars[: len(truth)]):
+                    pred, top3 = recognize_char(char_img, models, loader, template_labels, masks, device, pos)
+                    pred_parts.append(pred)
+                    correct = pred == truth[pos]
+                    in_top3 = truth[pos] in top3
+                    char_ok += int(correct)
+                    top3_ok += int(in_top3)
+                    key = (pollution, severity, pos + 1)
+                    position_stats[key]["correct"] += int(correct)
+                    position_stats[key]["top3"] += int(in_top3)
+                    position_stats[key]["total"] += 1
+                pred_text = "".join(pred_parts)
+                total_chars += len(truth)
+                correct_chars += char_ok
+                top3_chars += top3_ok
+                plate_correct += int(pred_text == truth)
+                dist = edit_distance(pred_text, truth)
+                edit_sum += dist
+                detail_rows.append(
+                    {
+                        "pollution": pollution,
+                        "severity": f"{severity:.2f}",
+                        "image_path": os.path.relpath(image_path, ROOT_DIR),
+                        "truth": truth,
+                        "pred": pred_text,
+                        "segmented_count": len(chars),
+                        "char_correct": char_ok,
+                        "char_total": len(truth),
+                        "top3_correct": top3_ok,
+                        "plate_correct": int(pred_text == truth),
+                        "edit_distance": dist,
+                    }
+                )
+            image_count = len(rows)
+            print(
+                f"{pollution:12s} severity={severity:.2f} | "
+                f"seg={segmentation_success / image_count * 100:.2f}% | "
+                f"char={correct_chars / total_chars * 100:.2f}% | "
+                f"plate={plate_correct / image_count * 100:.2f}% | "
+                f"top3={top3_chars / total_chars * 100:.2f}%"
+            )
+
+    summary_path = os.path.join(args.output_dir, "cropped_plate_summary.csv")
+    details_path = os.path.join(args.output_dir, "cropped_plate_details.csv")
+    position_path = os.path.join(args.output_dir, "cropped_plate_position_accuracy.csv")
+    with open(details_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(detail_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(detail_rows)
+
+    summary = defaultdict(lambda: {"images": 0, "seg": 0, "char_ok": 0, "char_total": 0, "top3": 0, "plate": 0, "edit": 0})
+    for row in detail_rows:
+        key = (row["pollution"], row["severity"])
+        summary[key]["images"] += 1
+        summary[key]["seg"] += int(row["segmented_count"] == row["char_total"])
+        summary[key]["char_ok"] += int(row["char_correct"])
+        summary[key]["char_total"] += int(row["char_total"])
+        summary[key]["top3"] += int(row["top3_correct"])
+        summary[key]["plate"] += int(row["plate_correct"])
+        summary[key]["edit"] += int(row["edit_distance"])
+    with open(summary_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pollution", "severity", "image_count", "segmentation_success", "char_accuracy", "top3_accuracy", "plate_accuracy", "mean_edit_distance"])
+        for (pollution, severity), stat in sorted(summary.items()):
+            writer.writerow(
+                [
+                    pollution,
+                    severity,
+                    stat["images"],
+                    f"{stat['seg'] / stat['images']:.4f}",
+                    f"{stat['char_ok'] / stat['char_total']:.4f}",
+                    f"{stat['top3'] / stat['char_total']:.4f}",
+                    f"{stat['plate'] / stat['images']:.4f}",
+                    f"{stat['edit'] / stat['images']:.4f}",
+                ]
+            )
+    with open(position_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pollution", "severity", "position", "correct", "top3_correct", "total", "accuracy", "top3_accuracy"])
+        for (pollution, severity, position), stat in sorted(position_stats.items()):
+            writer.writerow(
+                [
+                    pollution,
+                    f"{severity:.2f}",
+                    position,
+                    stat["correct"],
+                    stat["top3"],
+                    stat["total"],
+                    f"{stat['correct'] / stat['total']:.4f}",
+                    f"{stat['top3'] / stat['total']:.4f}",
+                ]
+            )
+    print(f"Saved summary: {summary_path}")
+    print(f"Saved details: {details_path}")
+    print(f"Saved position accuracy: {position_path}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate MCHN on clean cropped plates with synthetic pollution.")
+    parser.add_argument("--labels-csv", default="./plate_eval/labels.csv")
+    parser.add_argument("--data-dir", default="./data")
+    parser.add_argument("--output-dir", default="./results")
+    parser.add_argument("--pollution", default="all", choices=["all", "mixed", *POLLUTIONS])
+    parser.add_argument("--severities", default="0.0,0.1,0.2,0.4,0.6,0.8")
+    parser.add_argument("--max-images", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--cpu", action="store_true")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    evaluate(parse_args())
