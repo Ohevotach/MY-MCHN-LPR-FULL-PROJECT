@@ -661,7 +661,7 @@ class PlateSegmenter:
 
         # Chinese plates have a wider province character, a letter, a separator,
         # then five alphanumeric characters. These ratios are intentionally broad.
-        ratios = np.array([1.10, 0.95, 0.22, 0.95, 0.95, 0.95, 0.95, 0.95], dtype=np.float32)
+        ratios = np.array([1.02, 0.95, 0.28, 0.95, 0.95, 0.95, 0.95, 0.95], dtype=np.float32)
         unit = width / float(ratios.sum())
         x = float(left)
         boxes = []
@@ -671,10 +671,10 @@ class PlateSegmenter:
             if i == 2:
                 x += slot_w
                 continue
-            pad_ratio = 0.006 if char_position == 0 else 0.020 if char_position == 1 else 0.012 if char_position == 6 else 0.050
+            pad_ratio = 0.028 if char_position == 0 else 0.025 if char_position == 1 else 0.030 if char_position == 6 else 0.050
             pad = int(max(1, slot_w * pad_ratio))
-            extra_left = 0 if char_position == 0 else 3 if char_position in (1, 6) else 1
-            extra_right = 3 if char_position == 0 else 4 if char_position in (1, 6) else 1
+            extra_left = -2 if char_position == 0 else 2 if char_position in (1, 6) else 1
+            extra_right = -3 if char_position == 0 else 2 if char_position == 6 else 3 if char_position == 1 else 1
             x1 = int(round(x + pad - extra_left))
             x2 = int(round(x + slot_w - pad + extra_right))
             y1 = int(round(top + 0.01 * height))
@@ -725,7 +725,12 @@ class PlateSegmenter:
     @staticmethod
     def _crop_slot_char(plate_img, gray, binary, box, position=None):
         x, y, w, h = box
-        pad_x = max(1, int(round(w * (0.10 if position == 0 else 0.07))))
+        if position == 0:
+            pad_x = max(1, int(round(w * 0.025)))
+        elif position == 6:
+            pad_x = max(1, int(round(w * 0.030)))
+        else:
+            pad_x = max(1, int(round(w * 0.055)))
         pad_y = max(1, int(round(h * 0.08)))
         x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
         x2, y2 = min(binary.shape[1], x + w + pad_x), min(binary.shape[0], y + h + pad_y)
@@ -738,7 +743,7 @@ class PlateSegmenter:
 
         slot_binary = PlateSegmenter._clean_slot_character(slot_binary, position=position)
         slot_gray = gray[y1:y2, x1:x2]
-        return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary, deskew=True)
+        return PlateSegmenter._resize_gray_char_canvas(slot_gray, slot_binary, deskew=True, position=position)
 
     @staticmethod
     def _local_character_mask(slot_bgr, slot_gray):
@@ -849,6 +854,7 @@ class PlateSegmenter:
             cleaned[-max(1, int(0.04 * cleaned.shape[0])) :, :] = 0
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
         cleaned = PlateSegmenter._remove_slot_border_lines(cleaned)
+        cleaned = PlateSegmenter._trim_slot_edge_artifacts(cleaned, position=position)
 
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -891,6 +897,33 @@ class PlateSegmenter:
         return PlateSegmenter._suppress_isolated_slot_noise(kept, position)
 
     @staticmethod
+    def _trim_slot_edge_artifacts(mask, position=None):
+        if mask.size == 0:
+            return mask
+        cleaned = mask.copy()
+        h_img, w_img = cleaned.shape[:2]
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cleaned
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            touches_left = x <= max(1, int(0.035 * w_img))
+            touches_right = x + w >= w_img - max(1, int(0.035 * w_img))
+            near_top_bottom = y <= 0.10 * h_img or y + h >= 0.90 * h_img
+            if position == 0 and touches_left and h >= 0.70 * h_img and w <= 0.18 * w_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif position == 0 and touches_right and h >= 0.42 * h_img and w <= 0.16 * w_img and area < 0.12 * h_img * w_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif position == 6 and touches_right and h >= 0.62 * h_img and w <= 0.20 * w_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif (touches_left or touches_right) and h >= 0.82 * h_img and w <= 0.08 * w_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif near_top_bottom and w >= 0.52 * w_img and h <= 0.16 * h_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+        return cleaned
+
+    @staticmethod
     def _suppress_isolated_slot_noise(mask, position=None):
         if mask.size == 0 or position == 0:
             return mask
@@ -922,13 +955,14 @@ class PlateSegmenter:
         h_img, w_img = cleaned.shape[:2]
         horizontal = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(w_img * 0.66)), 1)))
         edge_mask = np.zeros_like(cleaned)
-        edge_mask[:3, :] = 255
-        edge_mask[-3:, :] = 255
+        band_y = max(3, int(0.12 * h_img))
+        edge_mask[:band_y, :] = 255
+        edge_mask[-band_y:, :] = 255
         edge_lines = cv2.bitwise_and(horizontal, edge_mask)
 
         vertical = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(24, int(h_img * 0.62)))))
         side_mask = np.zeros_like(cleaned)
-        side_band = 2
+        side_band = max(2, int(0.08 * w_img))
         side_mask[:, :side_band] = 255
         side_mask[:, -side_band:] = 255
         edge_lines = cv2.bitwise_or(edge_lines, cv2.bitwise_and(vertical, side_mask))
@@ -1275,7 +1309,7 @@ class PlateSegmenter:
         return PlateSegmenter._deskew_char_canvas(canvas)
 
     @staticmethod
-    def _resize_gray_char_canvas(gray_crop, mask=None, deskew=True):
+    def _resize_gray_char_canvas(gray_crop, mask=None, deskew=True, position=None):
         canvas = np.zeros((64, 32), dtype=np.uint8)
         if gray_crop is None or gray_crop.size == 0:
             return canvas
@@ -1290,8 +1324,13 @@ class PlateSegmenter:
             if len(xs) > 0 and len(ys) > 0:
                 mask_w = xs.max() - xs.min() + 1
                 mask_h = ys.max() - ys.min() + 1
-                pad_x = max(2, int(0.22 * mask_w))
-                pad_y = max(2, int(0.16 * mask_h))
+                if position == 0:
+                    pad_x = max(1, int(0.10 * mask_w))
+                elif position == 6:
+                    pad_x = max(1, int(0.12 * mask_w))
+                else:
+                    pad_x = max(2, int(0.18 * mask_w))
+                pad_y = max(1, int(0.12 * mask_h))
                 x1 = max(0, int(xs.min()) - pad_x)
                 x2 = min(crop.shape[1], int(xs.max()) + pad_x + 1)
                 y1 = max(0, int(ys.min()) - pad_y)
@@ -1305,7 +1344,10 @@ class PlateSegmenter:
 
         if crop.size == 0:
             return canvas
-        crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask)
+        if crop_mask is not None and 0.015 <= float(np.mean(crop_mask > 0)) <= 0.72:
+            crop = crop_mask
+        else:
+            crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask)
         h, w = crop.shape[:2]
         scale = min(26.0 / max(1, w), 56.0 / max(1, h))
         new_w = max(1, min(30, int(round(w * scale))))
@@ -1314,10 +1356,54 @@ class PlateSegmenter:
         y = (64 - new_h) // 2
         x = (32 - new_w) // 2
         canvas[y : y + new_h, x : x + new_w] = resized
-        return PlateSegmenter._deskew_char_canvas(canvas) if deskew else canvas
+        canvas = PlateSegmenter._clean_resized_char_canvas(canvas, position=position)
+        return PlateSegmenter._deskew_char_canvas(canvas, position=position) if deskew else canvas
 
     @staticmethod
-    def _deskew_char_canvas(char_img):
+    def _clean_resized_char_canvas(char_img, position=None):
+        if char_img is None or char_img.size == 0:
+            return char_img
+        cleaned = char_img.copy()
+        if cleaned.shape != (64, 32):
+            cleaned = cv2.resize(cleaned, (32, 64), interpolation=cv2.INTER_LINEAR)
+        binary = (cleaned > max(8, int(np.mean(cleaned) + 0.20 * np.std(cleaned)))).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cleaned
+        remove_mask = np.zeros_like(binary)
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            touches_left = x <= 2
+            touches_right = x + w >= 30
+            near_right = x + w >= 27
+            lower_half = y >= 24
+            upper_or_lower_edge = y <= 4 or y + h >= 60
+            if position == 0:
+                if touches_left and h >= 26 and w <= 8:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+                elif lower_half and x <= 8 and w >= 12 and h <= 34 and area < 0.18 * 64 * 32:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+                elif lower_half and x <= 8 and w <= 4 and area <= 2.0:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+                elif touches_right and w <= 6 and h >= 26 and area < 0.12 * 64 * 32:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+            elif position == 6:
+                if near_right and w <= 8 and h >= 26:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+                elif upper_or_lower_edge and w >= 14 and h <= 7:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+            else:
+                if upper_or_lower_edge and w >= 18 and h <= 6:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+                elif (touches_left or touches_right) and w <= 4 and h >= 38:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+        if np.count_nonzero(remove_mask) > 0:
+            cleaned[remove_mask > 0] = 0
+        return cleaned
+
+    @staticmethod
+    def _deskew_char_canvas(char_img, position=None):
         if char_img is None or char_img.size == 0:
             return char_img
         img = char_img.copy()
@@ -1327,13 +1413,13 @@ class PlateSegmenter:
         binary = (img > threshold).astype(np.uint8) * 255
         ys, xs = np.where(binary > 0)
         if len(xs) < 12 or len(ys) < 12:
-            return img
+            return PlateSegmenter._clean_resized_char_canvas(img, position=position)
 
         coords = np.column_stack([xs, ys]).astype(np.float32)
         rect = cv2.minAreaRect(coords)
         rw, rh = rect[1]
         if rw <= 1 or rh <= 1:
-            return img
+            return PlateSegmenter._clean_resized_char_canvas(img, position=position)
         angle = rect[2]
         if rw > rh:
             angle += 90.0
@@ -1342,14 +1428,14 @@ class PlateSegmenter:
         if angle < -45.0:
             angle += 90.0
         if abs(angle) < 3.0 or abs(angle) > 24.0:
-            return img
+            return PlateSegmenter._clean_resized_char_canvas(img, position=position)
 
         matrix = cv2.getRotationMatrix2D((16, 32), angle, 1.0)
         rotated = cv2.warpAffine(img, matrix, (32, 64), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        return PlateSegmenter._recenter_char_canvas(rotated)
+        return PlateSegmenter._recenter_char_canvas(rotated, position=position)
 
     @staticmethod
-    def _recenter_char_canvas(char_img):
+    def _recenter_char_canvas(char_img, position=None):
         canvas = np.zeros((64, 32), dtype=np.uint8)
         if char_img is None or char_img.size == 0:
             return canvas
@@ -1369,7 +1455,7 @@ class PlateSegmenter:
         y = (64 - new_h) // 2
         x = (32 - new_w) // 2
         canvas[y : y + new_h, x : x + new_w] = resized
-        return canvas
+        return PlateSegmenter._clean_resized_char_canvas(canvas, position=position)
 
     @staticmethod
     def _foreground_gray_signal(gray_crop, mask=None):
