@@ -27,10 +27,47 @@ METHOD_ORDER = [
     "Euclidean NN",
     "Class Prototype",
 ]
+CHINESE_LABEL_TO_PINYIN = {
+    "京": "zh_jing",
+    "津": "zh_jin",
+    "冀": "zh_ji",
+    "晋": "zh_jin1",
+    "蒙": "zh_meng",
+    "辽": "zh_liao",
+    "吉": "zh_ji1",
+    "黑": "zh_hei",
+    "沪": "zh_hu",
+    "苏": "zh_su",
+    "浙": "zh_zhe",
+    "皖": "zh_wan",
+    "闽": "zh_min",
+    "赣": "zh_gan",
+    "鲁": "zh_lu",
+    "豫": "zh_yu",
+    "鄂": "zh_e",
+    "湘": "zh_xiang",
+    "粤": "zh_yue",
+    "桂": "zh_gui1",
+    "琼": "zh_qiong",
+    "渝": "zh_yu1",
+    "川": "zh_chuan",
+    "贵": "zh_gui",
+    "云": "zh_yun",
+    "藏": "zh_zang",
+    "陕": "zh_shan",
+    "甘": "zh_gan1",
+    "青": "zh_qing",
+    "宁": "zh_ning",
+    "新": "zh_xin",
+}
 
 
 def order_method_results(results):
     return {name: results[name] for name in METHOD_ORDER if name in results}
+
+
+def display_label(label):
+    return CHINESE_LABEL_TO_PINYIN.get(str(label), str(label))
 
 
 class SimpleCNN(nn.Module):
@@ -828,7 +865,7 @@ def save_confusion_reports(
         pin_memory=device.type == "cuda",
     )
     true_labels, predictions = collect_prediction_outputs(selected_methods, test_loader, device)
-    label_names = [str(idx_to_label[i]) for i in range(len(idx_to_label))]
+    label_names = [display_label(idx_to_label[i]) for i in range(len(idx_to_label))]
 
     for method_name, pred_labels in predictions.items():
         safe_name = method_name.lower().replace(" ", "_").replace("-", "_")

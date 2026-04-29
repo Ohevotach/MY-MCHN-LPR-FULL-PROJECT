@@ -21,11 +21,7 @@ class MetricVisualizer:
     def _safe_plot_labels(self, labels):
         if self.has_zh_font:
             return [str(label) for label in labels]
-        safe_labels = []
-        for idx, label in enumerate(labels):
-            text = str(label)
-            safe_labels.append(f"C{idx}" if any(ord(ch) > 127 for ch in text) else text)
-        return safe_labels
+        return [str(label) for label in labels]
 
     def _tensor_to_img(self, tensor):
         arr = tensor.detach().cpu().numpy()
