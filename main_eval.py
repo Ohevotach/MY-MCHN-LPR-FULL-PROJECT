@@ -406,17 +406,23 @@ def run_robustness_evaluation(
     num_classes = len(loader.idx_to_label)
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
-    # The classical Hopfield baseline has limited storage capacity. Using every
-    # template as a memory pattern causes severe cross-talk on 64x32 character
-    # vectors, so the thesis baseline stores one prototype per class.
-    traditional_hopfield = TraditionalHopfieldNetwork(prototypes, prototype_labels, steps=8).to(device)
+    # Classical Hopfield is kept as a fair thesis baseline. Character images are
+    # sparse, so the implementation balances patterns before Hebbian storage and
+    # stores one prototype per class to avoid background-dominated cross-talk.
+    traditional_hopfield = TraditionalHopfieldNetwork(
+        prototypes,
+        prototype_labels,
+        steps=6,
+        center_patterns=True,
+        retrieval_weight=0.35,
+    ).to(device)
 
     def make_methods():
         methods = {
             "Modern Hopfield": lambda q: torch.argmax(
                 predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
             ),
-            "Traditional Hopfield": lambda q: traditional_hopfield.predict(q),
+            "Balanced Traditional Hopfield": lambda q: traditional_hopfield.predict(q),
             "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
             "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
@@ -488,7 +494,7 @@ def run_robustness_evaluation(
         batch_size,
         device,
         severity=SEVERITIES[-1],
-        method_names=("Modern Hopfield", "Traditional Hopfield", "CNN"),
+        method_names=("Modern Hopfield", "Balanced Traditional Hopfield", "CNN"),
     )
     return results
 
