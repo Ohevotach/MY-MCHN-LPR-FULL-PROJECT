@@ -271,7 +271,7 @@ def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples,
         seed=seed,
         sample_indices=train_indices,
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=device.type == "cuda")
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
@@ -326,6 +326,44 @@ def evaluate_topk_score_methods(score_methods, test_loader, device, topk=(1, 3))
         name: {k: 100.0 * value / max(total, 1) for k, value in values.items()}
         for name, values in correct.items()
     }
+
+
+def evaluate_methods_with_topk(methods, score_methods, test_loader, device, topk=(3,)):
+    correct = {name: 0 for name in methods}
+    topk_correct = {name: {k: 0 for k in topk} for name in score_methods}
+    total = 0
+    with torch.no_grad():
+        for q, _, labels in test_loader:
+            q = q.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            score_cache = {}
+            for name, scorer in score_methods.items():
+                score_cache[name] = scorer(q)
+
+            for name, predictor in methods.items():
+                if name in score_cache:
+                    pred = torch.argmax(score_cache[name], dim=-1)
+                else:
+                    pred = predictor(q)
+                correct[name] += (pred == labels).sum().item()
+
+            if topk:
+                max_k = max(topk)
+                for name, scores in score_cache.items():
+                    _, pred = torch.topk(scores, k=min(max_k, scores.shape[-1]), dim=-1)
+                    for k in topk:
+                        kk = min(k, pred.shape[-1])
+                        topk_correct[name][k] += pred[:, :kk].eq(labels.unsqueeze(1)).any(dim=1).sum().item()
+
+            total += labels.size(0)
+
+    accs = {name: 100.0 * value / max(total, 1) for name, value in correct.items()}
+    topk_accs = {
+        name: {k: 100.0 * value / max(total, 1) for k, value in values.items()}
+        for name, values in topk_correct.items()
+    }
+    return accs, topk_accs
 
 
 def collect_prediction_outputs(methods, test_loader, device):
@@ -396,6 +434,8 @@ def run_robustness_evaluation(
     seed,
     include_affine_robust=False,
     affine_variant_level="light",
+    save_confusion=False,
+    num_workers=0,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2: held-out evaluation, pollution={pollution_type}...")
@@ -419,15 +459,15 @@ def run_robustness_evaluation(
 
     def make_methods():
         methods = {
-            "Modern Hopfield": lambda q: torch.argmax(
-                predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
-            ),
             "Balanced Traditional Hopfield": lambda q: traditional_hopfield.predict(q),
-            "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
             "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
         }
+        methods["Modern Hopfield"] = lambda q: torch.argmax(
+            predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
+        )
+        methods["CNN"] = lambda q: torch.argmax(trained_cnn(q), dim=-1)
         if include_affine_robust:
             methods["Affine-robust Hopfield"] = lambda q: predict_affine_robust_hopfield(
                 hopfield_models,
@@ -455,9 +495,14 @@ def run_robustness_evaluation(
             seed=seed,
             sample_indices=test_indices,
         )
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-        accs = evaluate_methods(make_methods(), test_loader, device)
-        topk_accs = evaluate_topk_score_methods(make_score_methods(), test_loader, device, topk=(3,))
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=max(0, int(num_workers)),
+            pin_memory=device.type == "cuda",
+        )
+        accs, topk_accs = evaluate_methods_with_topk(make_methods(), make_score_methods(), test_loader, device, topk=(3,))
         for name, acc in accs.items():
             results[name].append(acc)
         for name, values in topk_accs.items():
@@ -484,18 +529,20 @@ def run_robustness_evaluation(
         filename=f"robustness_{pollution_type}_methods_final_bar.png",
     )
     save_topk_results_csv(visualizer.save_dir, pollution_type, top3_results)
-    save_confusion_reports(
-        visualizer,
-        pollution_type,
-        loader.idx_to_label,
-        make_methods(),
-        loader,
-        test_indices,
-        batch_size,
-        device,
-        severity=SEVERITIES[-1],
-        method_names=("Modern Hopfield", "Balanced Traditional Hopfield", "CNN"),
-    )
+    if save_confusion:
+        save_confusion_reports(
+            visualizer,
+            pollution_type,
+            loader.idx_to_label,
+            make_methods(),
+            loader,
+            test_indices,
+            batch_size,
+            device,
+            severity=SEVERITIES[-1],
+            method_names=("Modern Hopfield", "Balanced Traditional Hopfield", "CNN"),
+            num_workers=num_workers,
+        )
     return results
 
 
@@ -617,6 +664,7 @@ def save_confusion_reports(
     device,
     severity,
     method_names=("Modern Hopfield",),
+    num_workers=0,
 ):
     selected_methods = {name: methods[name] for name in method_names if name in methods}
     if not selected_methods:
@@ -630,7 +678,13 @@ def save_confusion_reports(
         seed=3026,
         sample_indices=test_indices,
     )
-    test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+        pin_memory=device.type == "cuda",
+    )
     true_labels, predictions = collect_prediction_outputs(selected_methods, test_loader, device)
     label_names = [str(idx_to_label[i]) for i in range(len(idx_to_label))]
 
@@ -789,6 +843,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--include-affine-robust", action="store_true", help="Also evaluate the slow affine-query Hopfield variant.")
     parser.add_argument("--affine-variant-level", default="light", choices=["none", "light", "medium", "full"])
+    parser.add_argument("--save-confusion", action="store_true", default=True, help="Save confusion matrices for each pollution.")
+    parser.add_argument("--skip-confusion", action="store_false", dest="save_confusion", help="Skip confusion matrices for a faster exploratory run.")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers. Use 2 on Kaggle if CPU preprocessing is the bottleneck.")
     parser.add_argument("--skip-ablation", action="store_true")
     parser.add_argument("--ablation-samples", type=int, default=1000)
     parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
@@ -807,6 +864,12 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Modern Hopfield held-out evaluation, device={device}")
+    if torch.cuda.is_available():
+        print(f"CUDA devices visible: {torch.cuda.device_count()} (single-process evaluation uses cuda:0).")
+    if args.save_confusion:
+        print("Confusion reports are enabled; this adds an extra evaluation pass per pollution.")
+    if args.include_affine_robust:
+        print(f"Affine-robust Hopfield enabled with variant level: {args.affine_variant_level}.")
     os.makedirs(args.output_dir, exist_ok=True)
     visualizer = MetricVisualizer(save_dir=args.output_dir)
 
@@ -865,6 +928,8 @@ if __name__ == "__main__":
             seed=args.seed,
             include_affine_robust=args.include_affine_robust,
             affine_variant_level=args.affine_variant_level,
+            save_confusion=args.save_confusion,
+            num_workers=args.num_workers,
         )
 
     save_results_csv(args.output_dir, all_results)
