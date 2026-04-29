@@ -388,6 +388,24 @@ def build_confusion_matrix(labels, preds, num_classes):
     return matrix.numpy()
 
 
+def build_class_balanced_indices(labels, base_indices, samples_per_class, seed=2026):
+    rng = random.Random(seed)
+    by_class = {}
+    labels_list = labels.tolist()
+    for idx in base_indices:
+        by_class.setdefault(int(labels_list[idx]), []).append(int(idx))
+
+    balanced = []
+    for class_idx in sorted(by_class):
+        indices = by_class[class_idx]
+        if not indices:
+            continue
+        for _ in range(max(1, int(samples_per_class))):
+            balanced.append(rng.choice(indices))
+    rng.shuffle(balanced)
+    return balanced
+
+
 def select_best_template_in_class(sim_scores, template_labels, pred_classes):
     labels = template_labels.to(sim_scores.device)
     selected = []
@@ -546,6 +564,106 @@ def run_robustness_evaluation(
     return results
 
 
+def run_class_balanced_evaluation(
+    loader,
+    visualizer,
+    device,
+    pollution_type,
+    samples_per_class,
+    batch_size,
+    train_indices,
+    test_indices,
+    trained_cnn,
+    seed,
+    include_affine_robust=False,
+    affine_variant_level="light",
+    num_workers=0,
+):
+    print("\n" + "=" * 50)
+    print(f"Task 2c: class-balanced evaluation, pollution={pollution_type}...")
+    balanced_indices = build_class_balanced_indices(
+        loader.labels,
+        test_indices,
+        samples_per_class=samples_per_class,
+        seed=seed + 1009,
+    )
+    if not balanced_indices:
+        print("Warning: class-balanced evaluation skipped because no balanced indices were built.")
+        return {}
+
+    train_memory = loader.memory_matrix[train_indices].to(device)
+    train_labels = loader.labels[train_indices].to(device)
+    hopfield_memory, hopfield_labels = augment_hopfield_memory(train_memory, train_labels)
+    prototypes, prototype_labels = build_class_memory_from_tensors(train_memory, train_labels)
+    num_classes = len(loader.idx_to_label)
+
+    hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
+    traditional_hopfield = TraditionalHopfieldNetwork(
+        prototypes,
+        prototype_labels,
+        steps=6,
+        center_patterns=True,
+        retrieval_weight=0.35,
+    ).to(device)
+
+    def make_methods():
+        methods = {
+            "Balanced Traditional Hopfield": lambda q: traditional_hopfield.predict(q),
+            "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
+            "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
+            "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
+            "Modern Hopfield": lambda q: torch.argmax(
+                predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
+            ),
+            "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
+        }
+        if include_affine_robust:
+            methods["Affine-robust Hopfield"] = lambda q: predict_affine_robust_hopfield(
+                hopfield_models,
+                q,
+                hopfield_labels,
+                num_classes,
+                variant_level=affine_variant_level,
+            )
+        return methods
+
+    results = {name: [] for name in make_methods()}
+    for severity in SEVERITIES:
+        dataset = PollutedCharDataset(
+            loader,
+            virtual_size=len(balanced_indices),
+            pollution_type=pollution_type,
+            severity=severity,
+            seed=seed + 2003,
+            sample_indices=balanced_indices,
+        )
+        data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=max(0, int(num_workers)),
+            pin_memory=device.type == "cuda",
+        )
+        accs = evaluate_methods(make_methods(), data_loader, device)
+        for name, acc in accs.items():
+            results[name].append(acc)
+        print("  balanced severity=" + f"{severity:.1f}: " + " | ".join(f"{k}: {v:.2f}%" for k, v in accs.items()))
+
+    visualizer.plot_multi_robustness_curve(
+        SEVERITIES,
+        results,
+        pollution_type=f"class-balanced {pollution_type}",
+        filename=f"balanced_robustness_{pollution_type}_methods_curve.png",
+    )
+    visualizer.plot_final_severity_bar(
+        {name: values[-1] for name, values in results.items()},
+        pollution_type=f"class-balanced {pollution_type}",
+        severity=SEVERITIES[-1],
+        filename=f"balanced_robustness_{pollution_type}_methods_final_bar.png",
+    )
+    return results
+
+
 def run_ablation_evaluation(
     loader,
     visualizer,
@@ -634,6 +752,17 @@ def build_class_memory_from_tensors(memory, labels):
 
 def save_results_csv(output_dir, all_results):
     csv_path = os.path.join(output_dir, "robustness_all_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pollution", "method", *[f"severity_{s}" for s in SEVERITIES]])
+        for pollution, method_results in all_results.items():
+            for method, values in method_results.items():
+                writer.writerow([pollution, method, *[f"{value:.4f}" for value in values]])
+    print(f"Saved CSV: {csv_path}")
+
+
+def save_named_results_csv(output_dir, all_results, filename):
+    csv_path = os.path.join(output_dir, filename)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["pollution", "method", *[f"severity_{s}" for s in SEVERITIES]])
@@ -779,7 +908,7 @@ def save_mchn_memory_artifacts(loader, train_indices, test_indices, hopfield_mem
     print(f"Saved MCHN evaluation memory matrix: {save_path}")
 
 
-def plot_all_pollution_summary(visualizer, all_results):
+def plot_all_pollution_summary(visualizer, all_results, prefix=""):
     method_names = list(next(iter(all_results.values())).keys())
     pollution_names = list(all_results.keys())
     final_matrix = []
@@ -793,14 +922,14 @@ def plot_all_pollution_summary(visualizer, all_results):
         row_labels=method_names,
         col_labels=pollution_names,
         title=f"Held-out accuracy at severity={SEVERITIES[-1]}",
-        filename="summary_final_severity_heatmap.png",
+        filename=f"{prefix}summary_final_severity_heatmap.png",
     )
     visualizer.plot_summary_heatmap(
         mean_matrix,
         row_labels=method_names,
         col_labels=pollution_names,
         title="Held-out mean accuracy across severities",
-        filename="summary_mean_accuracy_heatmap.png",
+        filename=f"{prefix}summary_mean_accuracy_heatmap.png",
     )
     for method_name, filename in (
         ("Modern Hopfield", "mchn_pollution_severity_curves.png"),
@@ -811,12 +940,12 @@ def plot_all_pollution_summary(visualizer, all_results):
                 SEVERITIES,
                 all_results,
                 method_name=method_name,
-                filename=filename,
+                filename=f"{prefix}{filename}",
             )
 
 
-def save_summary_ranking_csv(output_dir, all_results):
-    csv_path = os.path.join(output_dir, "summary_method_ranking.csv")
+def save_summary_ranking_csv(output_dir, all_results, filename="summary_method_ranking.csv"):
+    csv_path = os.path.join(output_dir, filename)
     rows = []
     for pollution, method_results in all_results.items():
         for method, values in method_results.items():
@@ -899,6 +1028,8 @@ def parse_args():
     parser.add_argument("--save-confusion", action="store_true", default=True, help="Save confusion matrices for each pollution.")
     parser.add_argument("--skip-confusion", action="store_false", dest="save_confusion", help="Skip confusion matrices for a faster exploratory run.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers. Use 2 on Kaggle if CPU preprocessing is the bottleneck.")
+    parser.add_argument("--skip-balanced-eval", action="store_true", help="Skip class-balanced robustness evaluation.")
+    parser.add_argument("--balanced-samples-per-class", type=int, default=8)
     parser.add_argument("--skip-ablation", action="store_true")
     parser.add_argument("--ablation-samples", type=int, default=1000)
     parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
@@ -967,6 +1098,7 @@ if __name__ == "__main__":
         pollution_types = [args.pollution]
 
     all_results = {}
+    balanced_results = {}
     for pollution_type in pollution_types:
         all_results[pollution_type] = run_robustness_evaluation(
             loader,
@@ -984,11 +1116,32 @@ if __name__ == "__main__":
             save_confusion=args.save_confusion,
             num_workers=args.num_workers,
         )
+        if not args.skip_balanced_eval:
+            balanced_results[pollution_type] = run_class_balanced_evaluation(
+                loader,
+                visualizer,
+                device,
+                pollution_type=pollution_type,
+                samples_per_class=args.balanced_samples_per_class,
+                batch_size=args.batch_size,
+                train_indices=train_indices,
+                test_indices=test_indices,
+                trained_cnn=cnn,
+                seed=args.seed,
+                include_affine_robust=args.include_affine_robust,
+                affine_variant_level=args.affine_variant_level,
+                num_workers=args.num_workers,
+            )
 
     save_results_csv(args.output_dir, all_results)
     save_summary_ranking_csv(args.output_dir, all_results)
+    if balanced_results:
+        save_named_results_csv(args.output_dir, balanced_results, "balanced_robustness_all_results.csv")
+        save_summary_ranking_csv(args.output_dir, balanced_results, filename="balanced_summary_method_ranking.csv")
     if args.pollution == "all":
         plot_all_pollution_summary(visualizer, all_results)
+        if balanced_results:
+            plot_all_pollution_summary(visualizer, balanced_results, prefix="balanced_")
 
     if not args.skip_ablation:
         run_ablation_evaluation(
