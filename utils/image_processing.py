@@ -797,7 +797,7 @@ class PlateSegmenter:
             current = mask.astype(np.uint8)
             if np.mean(current > 0) > 0.62:
                 current = cv2.bitwise_not(current)
-            current = cv2.morphologyEx(current, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
+            current = cv2.morphologyEx(current, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
             ink = float(np.mean(current > 0))
             if ink < 0.012 or ink > 0.72:
                 continue
@@ -831,7 +831,31 @@ class PlateSegmenter:
         ink_score = 1.0 - min(abs(ink - 0.22) / 0.24, 1.0)
         component_penalty = min(max(0, len(contours) - 3) * 0.12, 0.45)
         main_area_ratio = max(areas) / max(1.0, sum(areas))
-        return 0.34 * height_score + 0.24 * ink_score + 0.18 * width_score + 0.24 * main_area_ratio - component_penalty
+        filled_blob_penalty = PlateSegmenter._filled_blob_penalty(mask)
+        return 0.34 * height_score + 0.24 * ink_score + 0.18 * width_score + 0.24 * main_area_ratio - component_penalty - filled_blob_penalty
+
+    @staticmethod
+    def _filled_blob_penalty(mask):
+        if mask.size == 0:
+            return 0.0
+        work = (mask > 0).astype(np.uint8) * 255
+        h_img, w_img = work.shape[:2]
+        contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return 0.0
+        max_penalty = 0.0
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w <= 0 or h <= 0:
+                continue
+            area = cv2.contourArea(cnt)
+            bbox_ratio = (w * h) / max(1.0, h_img * w_img)
+            extent = area / max(1.0, w * h)
+            if bbox_ratio >= 0.20 and extent >= 0.76:
+                max_penalty = max(max_penalty, 0.22)
+            elif bbox_ratio >= 0.16 and extent >= 0.68:
+                max_penalty = max(max_penalty, 0.12)
+        return max_penalty
 
     @staticmethod
     def _clean_slot_character(slot_binary, position=None):
@@ -1344,10 +1368,7 @@ class PlateSegmenter:
 
         if crop.size == 0:
             return canvas
-        if crop_mask is not None and 0.015 <= float(np.mean(crop_mask > 0)) <= 0.72:
-            crop = crop_mask
-        else:
-            crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask)
+        crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask)
         h, w = crop.shape[:2]
         scale = min(26.0 / max(1, w), 56.0 / max(1, h))
         new_w = max(1, min(30, int(round(w * scale))))
@@ -1358,6 +1379,33 @@ class PlateSegmenter:
         canvas[y : y + new_h, x : x + new_w] = resized
         canvas = PlateSegmenter._clean_resized_char_canvas(canvas, position=position)
         return PlateSegmenter._deskew_char_canvas(canvas, position=position) if deskew else canvas
+
+    @staticmethod
+    def _is_structurally_safe_mask(mask, position=None):
+        if mask is None or mask.size == 0:
+            return False
+        work = (mask > 0).astype(np.uint8) * 255
+        ink = float(np.mean(work > 0))
+        if position == 0:
+            if not (0.018 <= ink <= 0.58):
+                return False
+        else:
+            if not (0.018 <= ink <= 0.42):
+                return False
+        contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return False
+        h_img, w_img = work.shape[:2]
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            bbox_ratio = (w * h) / max(1.0, h_img * w_img)
+            extent = area / max(1.0, w * h)
+            if position != 0 and bbox_ratio >= 0.18 and extent >= 0.68:
+                return False
+            if position == 0 and bbox_ratio >= 0.26 and extent >= 0.78:
+                return False
+        return True
 
     @staticmethod
     def _clean_resized_char_canvas(char_img, position=None):
