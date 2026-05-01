@@ -1228,4 +1228,3 @@ if __name__ == "__main__":
         run_end_to_end_system(loader, device, test_dir=os.path.join(args.data_dir, "full_cars", "ccpd_weather"))
 
     print(f"\nAll tasks finished. Figures and CSV are saved in {args.output_dir}.")
-    print("ceshi")
