@@ -406,6 +406,10 @@ def rng_sample(rng, items, count):
     return rng.sample(items, count)
 
 
+def stable_text_seed(text):
+    return sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(text)))
+
+
 def apply_plate_pollution(img, pollution, severity, rng):
     severity = float(max(0.0, min(1.0, severity)))
     if pollution == "none" or severity <= 0.0:
@@ -511,7 +515,6 @@ def save_debug_case(output_dir, debug_index, pollution, severity, plate, chars):
 def evaluate(args):
     args.output_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(args.output_dir, exist_ok=True)
-    rng = np.random.default_rng(args.seed)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -575,7 +578,8 @@ def evaluate(args):
             img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 raise FileNotFoundError(image_path)
-            polluted = apply_plate_pollution(img, pollution, severity, rng)
+            pollution_rng = np.random.default_rng(args.seed + stable_text_seed(pollution) * 1009 + image_idx * 1000003)
+            polluted = apply_plate_pollution(img, pollution, severity, pollution_rng)
             plate = cv2.resize(polluted, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
             chars = segmenter.segment_characters(plate)
             pred_parts = []

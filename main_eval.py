@@ -194,6 +194,14 @@ def build_stratified_split(labels, train_ratio=0.7, seed=2026):
     return train_indices, test_indices
 
 
+def build_fixed_sample_sequence(candidate_indices, sample_count, seed=2026):
+    indices = list(candidate_indices)
+    if not indices:
+        return []
+    rng = random.Random(seed)
+    return [rng.choice(indices) for _ in range(int(sample_count))]
+
+
 def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
     labels = template_labels.to(sim_scores.device)
     scaled = beta * sim_scores
@@ -578,14 +586,16 @@ def run_robustness_evaluation(
 
     results = {name: [] for name in make_methods()}
     top3_results = {f"{name} Top-3": [] for name in make_score_methods()}
+    fixed_eval_indices = build_fixed_sample_sequence(test_indices, samples_per_level, seed=seed + 401)
     for severity in SEVERITIES:
         test_dataset = PollutedCharDataset(
             loader,
-            virtual_size=samples_per_level,
+            virtual_size=len(fixed_eval_indices),
             pollution_type=pollution_type,
             severity=severity,
-            seed=seed,
-            sample_indices=test_indices,
+            seed=seed + 503,
+            fixed_sample_indices=fixed_eval_indices,
+            deterministic_per_index=True,
         )
         test_loader = DataLoader(
             test_dataset,
@@ -709,7 +719,8 @@ def run_class_balanced_evaluation(
             pollution_type=pollution_type,
             severity=severity,
             seed=seed + 2003,
-            sample_indices=balanced_indices,
+            fixed_sample_indices=balanced_indices,
+            deterministic_per_index=True,
         )
         data_loader = DataLoader(
             dataset,
@@ -784,7 +795,8 @@ def run_ablation_evaluation(
         pollution_type=pollution_type,
         severity=severity,
         seed=seed + 17,
-        sample_indices=test_indices,
+        fixed_sample_indices=build_fixed_sample_sequence(test_indices, samples, seed=seed + 1701),
+        deterministic_per_index=True,
     )
     test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     methods = {
@@ -879,7 +891,8 @@ def save_confusion_reports(
         pollution_type=pollution_type,
         severity=severity,
         seed=3026,
-        sample_indices=test_indices,
+        fixed_sample_indices=build_fixed_sample_sequence(test_indices, max(1000, len(test_indices) * 20), seed=3026),
+        deterministic_per_index=True,
     )
     test_loader = DataLoader(
         dataset,

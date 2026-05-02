@@ -245,6 +245,8 @@ class PollutedCharDataset(Dataset):
         severity=0.5,
         seed=None,
         sample_indices=None,
+        fixed_sample_indices=None,
+        deterministic_per_index=False,
     ):
         self.M, self.L, self.idx_to_label = template_loader.get_memory_matrix()
         self.virtual_size = virtual_size
@@ -252,8 +254,11 @@ class PollutedCharDataset(Dataset):
         self.severity = severity
         self.img_h = template_loader.img_size[1]
         self.img_w = template_loader.img_size[0]
+        self.seed = 0 if seed is None else int(seed)
         self.rng = random.Random(seed)
         self.sample_indices = list(sample_indices) if sample_indices is not None else None
+        self.fixed_sample_indices = list(fixed_sample_indices) if fixed_sample_indices is not None else None
+        self.deterministic_per_index = bool(deterministic_per_index)
 
     def __len__(self):
         return self.virtual_size
@@ -261,43 +266,56 @@ class PollutedCharDataset(Dataset):
     def __getitem__(self, idx):
         if self.M.shape[0] == 0:
             raise RuntimeError("Template memory is empty. Check data_roots.")
-        if self.sample_indices:
+        if self.fixed_sample_indices:
+            target_idx = self.fixed_sample_indices[idx % len(self.fixed_sample_indices)]
+        elif self.sample_indices:
             target_idx = self.rng.choice(self.sample_indices)
         else:
             target_idx = self.rng.randint(0, self.M.shape[0] - 1)
         clean_q = self.M[target_idx].clone()
         clean_img = clean_q.view(1, self.img_h, self.img_w)
-        polluted_img = self._pollute(clean_img)
+        local_rng = None
+        torch_generator = None
+        if self.deterministic_per_index:
+            local_seed = self.seed + int(idx) * 1000003
+            local_rng = random.Random(local_seed)
+            torch_generator = torch.Generator(device=clean_img.device)
+            torch_generator.manual_seed(local_seed)
+        polluted_img = self._pollute(clean_img, rng=local_rng, torch_generator=torch_generator)
         return polluted_img.clamp(0.0, 1.0).view(-1), clean_q, self.L[target_idx]
 
-    def _severity_value(self):
+    def _severity_value(self, rng=None):
+        rng = rng or self.rng
         if isinstance(self.severity, (tuple, list)):
             low, high = float(self.severity[0]), float(self.severity[1])
-            return max(0.0, min(1.0, self.rng.uniform(low, high)))
+            return max(0.0, min(1.0, rng.uniform(low, high)))
         return max(0.0, min(1.0, float(self.severity)))
 
-    def _pollute(self, img):
-        severity = self._severity_value()
+    def _pollute(self, img, rng=None, torch_generator=None):
+        rng = rng or self.rng
+        severity = self._severity_value(rng=rng)
         if self.pollution_type == "mixed":
             choices = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
             count = 1 if severity < 0.35 else 2 if severity < 0.7 else 3
             out = img.clone()
-            for name in self.rng.sample(choices, count):
-                out = self._apply_one(out, name, severity)
+            for name in rng.sample(choices, count):
+                out = self._apply_one(out, name, severity, rng=rng, torch_generator=torch_generator)
             return out
-        return self._apply_one(img.clone(), self.pollution_type, severity)
+        return self._apply_one(img.clone(), self.pollution_type, severity, rng=rng, torch_generator=torch_generator)
 
-    def _apply_one(self, img, pollution, severity):
+    def _apply_one(self, img, pollution, severity, rng=None, torch_generator=None):
+        rng = rng or self.rng
         if pollution == "none":
             return img
         if pollution == "mask":
-            return self._random_mask(img, severity)
+            return self._random_mask(img, severity, rng=rng)
         if pollution == "noise":
             sigma = 0.03 + 0.30 * severity
-            return img + torch.randn_like(img) * sigma
+            noise = torch.randn(img.shape, dtype=img.dtype, device=img.device, generator=torch_generator)
+            return img + noise * sigma
         if pollution == "salt_pepper":
             prob = 0.01 + 0.22 * severity
-            rnd = torch.rand_like(img)
+            rnd = torch.rand(img.shape, dtype=img.dtype, device=img.device, generator=torch_generator)
             out = img.clone()
             out[rnd < prob / 2] = 0.0
             out[(rnd >= prob / 2) & (rnd < prob)] = 1.0
@@ -310,32 +328,34 @@ class PollutedCharDataset(Dataset):
             fog = 0.15 + 0.45 * severity
             return img * (1.0 - fog) + fog
         if pollution == "dirt":
-            return self._random_dirt(img, severity)
+            return self._random_dirt(img, severity, rng=rng)
         if pollution == "affine":
-            angle = self.rng.uniform(-10, 10) * severity
+            angle = rng.uniform(-10, 10) * severity
             translate = [
-                int(self.rng.uniform(-3, 3) * severity),
-                int(self.rng.uniform(-3, 3) * severity),
+                int(rng.uniform(-3, 3) * severity),
+                int(rng.uniform(-3, 3) * severity),
             ]
-            scale = 1.0 + self.rng.uniform(-0.12, 0.12) * severity
-            shear = self.rng.uniform(-6, 6) * severity
+            scale = 1.0 + rng.uniform(-0.12, 0.12) * severity
+            shear = rng.uniform(-6, 6) * severity
             return TF.affine(img, angle=angle, translate=translate, scale=scale, shear=[shear, 0.0])
         raise ValueError(f"Unsupported pollution_type: {pollution}")
 
-    def _random_mask(self, img, severity):
+    def _random_mask(self, img, severity, rng=None):
+        rng = rng or self.rng
         out = img.clone()
         block_count = 1 + int(3 * severity)
         for _ in range(block_count):
             max_h = max(2, int(self.img_h * (0.10 + 0.28 * severity)))
             max_w = max(2, int(self.img_w * (0.10 + 0.35 * severity)))
-            h = self.rng.randint(2, max_h)
-            w = self.rng.randint(2, max_w)
-            y = self.rng.randint(0, max(0, self.img_h - h))
-            x = self.rng.randint(0, max(0, self.img_w - w))
-            out[:, y : y + h, x : x + w] = 0.0 if self.rng.random() < 0.7 else 1.0
+            h = rng.randint(2, max_h)
+            w = rng.randint(2, max_w)
+            y = rng.randint(0, max(0, self.img_h - h))
+            x = rng.randint(0, max(0, self.img_w - w))
+            out[:, y : y + h, x : x + w] = 0.0 if rng.random() < 0.7 else 1.0
         return out
 
-    def _random_dirt(self, img, severity):
+    def _random_dirt(self, img, severity, rng=None):
+        rng = rng or self.rng
         out = img.clone()
         yy, xx = torch.meshgrid(
             torch.arange(self.img_h, dtype=torch.float32),
@@ -344,11 +364,11 @@ class PollutedCharDataset(Dataset):
         )
         spot_count = 1 + int(4 * severity)
         for _ in range(spot_count):
-            cx = self.rng.uniform(0, self.img_w - 1)
-            cy = self.rng.uniform(0, self.img_h - 1)
-            radius = self.rng.uniform(2, 4 + 10 * severity)
+            cx = rng.uniform(0, self.img_w - 1)
+            cy = rng.uniform(0, self.img_h - 1)
+            radius = rng.uniform(2, 4 + 10 * severity)
             mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius**2
-            out[:, mask] = self.rng.uniform(0.0, 0.35)
+            out[:, mask] = rng.uniform(0.0, 0.35)
         return out
 
 
