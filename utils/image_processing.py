@@ -607,9 +607,11 @@ class PlateSegmenter:
         binary = self._prepare_character_binary(self._make_character_mask(plate_img, gray))
 
         candidates = []
+        wave_chars, wave_boxes = self._segment_by_wave_columns(plate_img, gray)
+        if wave_chars:
+            candidates.append(("wave_columns", wave_boxes, wave_chars))
+
         scan_chars, scan_boxes = self._segment_by_left_to_right_scan(plate_img, gray, binary)
-        if self._is_usable_char_sequence(scan_chars):
-            return scan_chars[:7]
         if scan_chars:
             candidates.append(("ltr_scan", scan_boxes, scan_chars))
 
@@ -642,6 +644,225 @@ class PlateSegmenter:
                 best_score = score
                 best_chars = chars
         return best_chars
+
+    def _segment_by_wave_columns(self, plate_img, gray, char_count=7):
+        """Reference-style segmentation: horizontal wave crop + column runs."""
+        wave_binary = self._prepare_wave_binary(gray)
+        cropped_binary, top, bottom = self._crop_up_down_by_wave(wave_binary)
+        if cropped_binary is None or cropped_binary.size == 0:
+            return [], []
+
+        full_binary = np.zeros_like(wave_binary)
+        full_binary[top:bottom, :] = cropped_binary
+        full_binary = self._remove_long_plate_lines(full_binary)
+        full_binary[:, : max(1, int(0.018 * self.PLATE_W))] = 0
+        full_binary[:, min(self.PLATE_W, int(0.985 * self.PLATE_W)) :] = 0
+
+        boxes = self._segment_boxes_by_black_white_columns(full_binary, top, bottom, char_count=char_count)
+        if not boxes:
+            return [], []
+        chars = [self._crop_wave_char(gray, full_binary, box, idx) for idx, box in enumerate(boxes)]
+        return chars, boxes
+
+    @staticmethod
+    def _prepare_wave_binary(gray):
+        if gray is None or gray.size == 0:
+            return np.zeros((PlateSegmenter.PLATE_H, PlateSegmenter.PLATE_W), dtype=np.uint8)
+        if gray.ndim == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        work = cv2.resize(gray, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+        work = cv2.GaussianBlur(work, (3, 3), 0)
+        work = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(work)
+        _, binary = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        border = np.concatenate([binary[0, :], binary[-1, :], binary[:, 0], binary[:, -1]])
+        if float(np.mean(binary > 0)) > 0.58 or float(np.mean(border > 0)) > 0.70:
+            binary = cv2.bitwise_not(binary)
+        binary = cv2.medianBlur(binary, 3)
+        return binary
+
+    @staticmethod
+    def _find_histogram_waves(threshold, histogram, min_length=4):
+        waves = []
+        in_wave = False
+        start = 0
+        for idx, value in enumerate(histogram):
+            if not in_wave and value > threshold:
+                start = idx
+                in_wave = True
+            elif in_wave and value <= threshold:
+                if idx - start >= min_length:
+                    waves.append((start, idx))
+                in_wave = False
+        if in_wave and len(histogram) - start >= min_length:
+            waves.append((start, len(histogram)))
+        return waves
+
+    @classmethod
+    def _crop_up_down_by_wave(cls, binary):
+        if binary is None or binary.size == 0:
+            return None, 0, 0
+        row_hist = np.sum(binary > 0, axis=1).astype(np.float32)
+        if float(row_hist.max(initial=0)) <= 0:
+            return None, 0, 0
+        threshold = max(2.0, min(float(row_hist.mean()), 0.34 * float(row_hist.max())))
+        waves = cls._find_histogram_waves(threshold, row_hist, min_length=8)
+        if not waves:
+            active = np.where(row_hist > max(2.0, 0.10 * float(row_hist.max())))[0]
+            if len(active) < 18:
+                return None, 0, 0
+            top, bottom = int(active[0]), int(active[-1]) + 1
+        else:
+            top, bottom = max(waves, key=lambda item: item[1] - item[0])
+
+        pad = max(2, int(0.035 * (bottom - top)))
+        top = max(10, top - pad)
+        bottom = min(cls.PLATE_H - 6, bottom + pad)
+        if bottom - top < 38:
+            center = (top + bottom) // 2
+            top = max(10, center - 28)
+            bottom = min(cls.PLATE_H - 6, center + 28)
+        cropped = binary[top:bottom, :].copy()
+        # Clear the first/last rows of the selected wave so frame remnants do
+        # not dominate the later vertical projection.
+        edge = max(1, int(0.035 * cropped.shape[0]))
+        cropped[:edge, :] = 0
+        cropped[-edge:, :] = 0
+        return cropped, top, bottom
+
+    def _segment_boxes_by_black_white_columns(self, binary, top, bottom, char_count=7):
+        band = binary[top:bottom, :]
+        if band.size == 0:
+            return []
+        white = np.sum(band == 255, axis=0).astype(np.float32)
+        black = np.sum(band == 0, axis=0).astype(np.float32)
+        white_max = float(white.max(initial=0))
+        black_max = float(black.max(initial=0))
+        if white_max <= 0:
+            return []
+        char_is_black = black_max < white_max
+        signal = black if char_is_black else white
+        signal_max = float(signal.max(initial=0))
+        if signal_max <= 0:
+            return []
+
+        threshold = max(1.0, 0.05 * signal_max)
+        active = signal > threshold
+        raw_runs = []
+        idx = 0
+        width = binary.shape[1]
+        while idx < width - 1:
+            while idx < width - 1 and not active[idx]:
+                idx += 1
+            start = idx
+            while idx < width - 1 and active[idx]:
+                idx += 1
+            end = idx
+            if end - start > 5:
+                raw_runs.append((start, end))
+
+        if not raw_runs:
+            return []
+        runs = self._merge_close_ranges(raw_runs, max_gap=3)
+        runs = [(max(0, start - 1), min(width, end + 1)) for start, end in runs if end - start > 5]
+        runs = self._split_and_filter_wave_runs(binary, runs, top, bottom, char_count)
+        if len(runs) > char_count:
+            boxes = [self._box_from_scan_run(binary, start, end, top, bottom) for start, end in runs]
+            boxes = [box for box in boxes if box is not None]
+            return self._choose_best_seven_ltr_boxes(boxes, 0, width)
+        boxes = [self._box_from_scan_run(binary, start, end, top, bottom) for start, end in runs]
+        boxes = [box for box in boxes if box is not None]
+        boxes = self._normalize_ltr_boxes(binary, boxes, 0, width, top, bottom, char_count=char_count)
+        return boxes
+
+    def _split_and_filter_wave_runs(self, binary, runs, top, bottom, char_count):
+        if not runs:
+            return []
+        width = binary.shape[1]
+        min_width = max(6, int(0.018 * width))
+        max_width = max(38, int(0.16 * width))
+        filtered = []
+        for start, end in runs:
+            run_w = end - start
+            if run_w < min_width:
+                continue
+            pieces = self._split_wide_ltr_run(binary, start, end, top, bottom, min_width, max_width)
+            filtered.extend(pieces)
+        filtered = sorted(filtered, key=lambda item: item[0])
+        # Drop tiny punctuation/separator regions when we have too many parts.
+        if len(filtered) > char_count:
+            scored = []
+            for start, end in filtered:
+                box = self._box_from_scan_run(binary, start, end, top, bottom)
+                if box is None:
+                    continue
+                x, y, w, h = box
+                area = float(np.count_nonzero(binary[y : y + h, x : x + w]))
+                scored.append((area + 2.0 * h + 0.5 * w, (start, end)))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            filtered = sorted([item[1] for item in scored[: max(char_count, 7)]], key=lambda item: item[0])
+        return filtered
+
+    @staticmethod
+    def _crop_wave_char(gray, binary, box, position=None):
+        x, y, w, h = box
+        pad_x = max(1, int(round(w * (0.10 if position == 0 else 0.16))))
+        pad_y = max(1, int(round(h * 0.10)))
+        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+        x2, y2 = min(binary.shape[1], x + w + pad_x), min(binary.shape[0], y + h + pad_y)
+        if x2 <= x1 or y2 <= y1:
+            return np.zeros((64, 32), dtype=np.uint8)
+        slot_binary = binary[y1:y2, x1:x2]
+        slot_binary = PlateSegmenter._clean_wave_character(slot_binary, position=position)
+        return PlateSegmenter._resize_char_canvas(slot_binary)
+
+    @staticmethod
+    def _clean_wave_character(slot_binary, position=None):
+        if slot_binary is None or slot_binary.size == 0:
+            return np.zeros((1, 1), dtype=np.uint8)
+        cleaned = (slot_binary > 0).astype(np.uint8) * 255
+        cleaned[:1, :] = 0
+        cleaned[-1:, :] = 0
+        cleaned[:, :1] = 0
+        cleaned[:, -1:] = 0
+
+        h_img, w_img = cleaned.shape[:2]
+        horizontal = cv2.morphologyEx(
+            cleaned,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(0.62 * w_img)), 1)),
+        )
+        vertical = cv2.morphologyEx(
+            cleaned,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(14, int(0.86 * h_img)))),
+        )
+        cleaned = cv2.bitwise_and(cleaned, cv2.bitwise_not(cv2.bitwise_or(horizontal, vertical)))
+
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cleaned
+        kept = np.zeros_like(cleaned)
+        min_area = max(3, int(0.004 * h_img * w_img)) if position == 0 else max(4, int(0.007 * h_img * w_img))
+        scored = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            if area < min_area and h < 0.18 * h_img:
+                continue
+            if w <= 2 and h >= 0.86 * h_img and (x <= 1 or x + w >= w_img - 1):
+                continue
+            if h <= 2 and w >= 0.55 * w_img and (y <= 1 or y + h >= h_img - 1):
+                continue
+            scored.append((area + 0.8 * h + 0.25 * w, cnt))
+        if not scored:
+            return cleaned
+        scored.sort(key=lambda item: item[0], reverse=True)
+        keep_limit = 12 if position == 0 else 5
+        for _, cnt in scored[:keep_limit]:
+            cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
+        if np.count_nonzero(kept) < 0.35 * np.count_nonzero(cleaned):
+            return cleaned
+        return kept
 
     def _segment_by_left_to_right_scan(self, plate_img, gray, binary, char_count=7):
         """Segment characters by scanning foreground runs from left to right.
@@ -1526,6 +1747,7 @@ class PlateSegmenter:
 
         ink_scores = []
         border_penalties = []
+        shape_penalties = []
         for char_img in chars[:7]:
             if char_img is None or char_img.size == 0:
                 continue
@@ -1534,8 +1756,10 @@ class PlateSegmenter:
             ink_scores.append(1.0 - min(abs(ink - 0.24) / 0.30, 1.0))
             border = np.concatenate([foreground[0, :], foreground[-1, :], foreground[:, 0], foreground[:, -1]])
             border_penalties.append(float(np.mean(border)))
+            shape_penalties.append(PlateSegmenter._char_blockiness_penalty(char_img))
         ink_score = float(np.mean(ink_scores)) if ink_scores else 0.0
         border_score = 1.0 - min(float(np.mean(border_penalties)) / 0.22, 1.0) if border_penalties else 0.0
+        shape_score = 1.0 - min(float(np.mean(shape_penalties)), 1.0) if shape_penalties else 0.0
 
         layout_score = 0.0
         if boxes and len(boxes) == 7:
@@ -1548,7 +1772,31 @@ class PlateSegmenter:
                 + 0.35 * (1.0 - min(float(np.std(heights)) / max(float(np.mean(heights)), 1.0), 1.0))
                 + 0.25 * (1.0 - min(abs(span - 300.0) / 170.0, 1.0))
             )
-        return 0.38 * count_score + 0.24 * ink_score + 0.20 * border_score + 0.18 * layout_score
+        return 0.32 * count_score + 0.22 * ink_score + 0.18 * border_score + 0.18 * layout_score + 0.10 * shape_score
+
+    @staticmethod
+    def _char_blockiness_penalty(char_img):
+        if char_img is None or char_img.size == 0:
+            return 1.0
+        work = (char_img > 0).astype(np.uint8) * 255
+        ink = float(np.mean(work > 0))
+        penalty = max(0.0, (ink - 0.42) / 0.25)
+        contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return 1.0
+        h_img, w_img = work.shape[:2]
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w <= 0 or h <= 0:
+                continue
+            area = cv2.contourArea(cnt)
+            bbox_ratio = (w * h) / max(1.0, h_img * w_img)
+            extent = area / max(1.0, w * h)
+            if bbox_ratio >= 0.22 and extent >= 0.72:
+                penalty = max(penalty, 0.95)
+            elif bbox_ratio >= 0.16 and extent >= 0.78:
+                penalty = max(penalty, 0.70)
+        return min(float(penalty), 1.0)
 
     def _segment_boxes_by_projection(self, binary, char_count=7):
         work = binary.copy()
