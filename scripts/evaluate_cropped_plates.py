@@ -24,6 +24,7 @@ except Exception:
 
 
 POLLUTIONS = ["none", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
+CORE_PLATE_POLLUTIONS = ["noise", "salt_pepper", "blur", "mask", "dirt", "fog"]
 DEFAULT_SEVERITIES = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8]
 
 
@@ -364,6 +365,28 @@ def evaluation_grid(pollutions, severities):
     return grid
 
 
+def resolve_pollutions(pollution_arg):
+    value = str(pollution_arg).strip()
+    if value == "all":
+        return POLLUTIONS
+    if value in {"core", "main", "plate_core"}:
+        return CORE_PLATE_POLLUTIONS
+    if "," in value:
+        pollutions = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        pollutions = [value]
+
+    allowed = set(POLLUTIONS + ["mixed"])
+    unknown = [item for item in pollutions if item not in allowed]
+    if unknown:
+        raise ValueError(
+            f"Unsupported pollution(s): {', '.join(unknown)}. "
+            f"Use one of: all, core, mixed, {', '.join(POLLUTIONS)}; "
+            "or a comma-separated list such as noise,salt_pepper,blur,mask,dirt,fog."
+        )
+    return pollutions
+
+
 def apply_plate_pollution(img, pollution, severity, rng):
     severity = float(max(0.0, min(1.0, severity)))
     if pollution == "none" or severity <= 0.0:
@@ -508,7 +531,7 @@ def evaluate(args):
     if not rows:
         raise RuntimeError("No evaluation plates left after calibration/max-images filtering.")
 
-    pollutions = POLLUTIONS if args.pollution == "all" else [args.pollution]
+    pollutions = resolve_pollutions(args.pollution)
     severities = [float(item) for item in args.severities.split(",")]
     grid = evaluation_grid(pollutions, severities)
     detail_rows = []
@@ -518,6 +541,7 @@ def evaluate(args):
     debug_saved = 0
 
     print(f"Evaluation plan: {len(rows)} plates x {len(grid)} pollution/severity settings.")
+    print(f"Pollutions: {', '.join(pollutions)}")
     if args.pollution == "all":
         print("Note: pollution=none is evaluated once at severity=0.00; other pollution types keep all severity levels.")
 
@@ -717,7 +741,14 @@ def parse_args():
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./results")
     parser.add_argument("--run-name", default="cropped_plate_eval", help="Subfolder under output-dir for cropped-plate evaluation artifacts.")
-    parser.add_argument("--pollution", default="all", choices=["all", "mixed", *POLLUTIONS])
+    parser.add_argument(
+        "--pollution",
+        default="all",
+        help=(
+            "Pollution to evaluate. Use 'core' for noise,salt_pepper,blur,mask,dirt,fog; "
+            "use 'all' for every built-in single pollution including affine; or pass a comma-separated list."
+        ),
+    )
     parser.add_argument("--severities", default="0.0,0.1,0.2,0.4,0.6,0.8")
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument(
