@@ -289,6 +289,7 @@ def recognize_char(char_img, models, loader, template_labels, masks, device, pos
         mean_scores = torch.logsumexp(scores, dim=0) - torch.log(scores.new_tensor(float(scores.shape[0])))
         max_scores = torch.max(scores, dim=0).values
         pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+        pooled_scores = apply_position_prior(pooled_scores, loader, position=position)
         top_values, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
     top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
     return top_labels[0], top_labels

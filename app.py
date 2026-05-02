@@ -494,6 +494,17 @@ def collect_cropped_plate_samples(root="./plate_eval/image_clean"):
     return choices
 
 
+def build_class_prototypes(memory_matrix, labels, num_classes, device):
+    prototypes = torch.zeros((num_classes, memory_matrix.shape[1]), dtype=torch.float32, device=device)
+    labels_device = labels.to(device=device, dtype=torch.long)
+    memory_device = memory_matrix.to(device=device, dtype=torch.float32)
+    for class_idx in range(num_classes):
+        mask = labels_device == class_idx
+        if bool(mask.any().item()):
+            prototypes[class_idx] = memory_device[mask].mean(dim=0)
+    return F.normalize(prototypes, p=2, dim=-1)
+
+
 print("Loading MCHN memory and YOLO-first LPR pipeline...")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 loader = TemplateLoader(["./data/chars2", "./data/charsChinese"], img_size=(32, 64), cache_path=default_cache_path())
@@ -507,6 +518,7 @@ template_labels = template_labels.to(device)
 mchn_models = build_hopfield_ensemble(memory, device)
 pipeline = LPRPipeline()
 chinese_mask, alnum_mask, plate_tail_mask, letter_mask, digit_mask = build_template_masks(loader, template_labels, device)
+class_prototypes = build_class_prototypes(loader.memory_matrix, loader.labels, len(loader.idx_to_label), device)
 pollution_choices = ["none", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "mixed"]
 full_car_samples = collect_full_car_samples()
 cropped_plate_samples = collect_cropped_plate_samples()
@@ -527,7 +539,29 @@ pil_transform = transforms.Compose(
 )
 
 
-def recognize_tensor(tensor, template_mask=None, return_debug=False):
+def prototype_shape_scores(q):
+    q_norm = F.normalize(q.float(), p=2, dim=-1)
+    return torch.matmul(q_norm, class_prototypes.t())
+
+
+def apply_plate_position_prior(scores, position=None):
+    if position is None or position < 2:
+        return scores
+    adjusted = scores.clone()
+    digit_bonus_by_pos = {2: 0.14, 3: 0.18, 4: 0.18, 5: 0.20, 6: 0.26}
+    bonus = digit_bonus_by_pos.get(int(position), 0.0)
+    if bonus <= 0.0:
+        return adjusted
+    for class_idx, label in loader.idx_to_label.items():
+        text = str(label)
+        if len(text) == 1 and text.isdigit():
+            adjusted[int(class_idx)] += bonus
+        elif position == 6 and len(text) == 1 and "A" <= text <= "Z":
+            adjusted[int(class_idx)] -= 0.04
+    return adjusted
+
+
+def recognize_tensor(tensor, template_mask=None, return_debug=False, position=None):
     if tensor.dim() == 2 and tensor.shape[-1] == 64 * 32:
         tensor_img = tensor.view(-1, 1, 64, 32)[0]
     elif tensor.dim() == 3:
@@ -545,6 +579,12 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False):
     mean_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
     max_scores = torch.max(class_scores, dim=0).values
     pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+    if position is not None:
+        proto_scores = torch.max(prototype_shape_scores(q), dim=0).values
+        proto_scores = proto_scores.masked_fill(torch.isinf(pooled_scores), -1e9)
+        proto_weight = 0.30 if int(position) == 0 else 0.24
+        pooled_scores = (1.0 - proto_weight) * pooled_scores + proto_weight * proto_scores
+        pooled_scores = apply_plate_position_prior(pooled_scores, position=position)
     class_idx = int(torch.argmax(pooled_scores).item())
     variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)
@@ -700,7 +740,9 @@ def predict_plate(image):
     for i, char_img in enumerate(chars):
         tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
         current_mask = plate_position_mask(i)
-        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(tensor, current_mask, return_debug=True)
+        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(
+            tensor, current_mask, return_debug=True, position=i
+        )
         char = loader.idx_to_label[class_idx]
         plate_text += char
         char_type = "\u6c49\u5b57" if "\u4e00" <= char <= "\u9fff" else ("\u6570\u5b57" if char.isdigit() else "\u5b57\u6bcd")
@@ -748,7 +790,9 @@ def predict_plate_from_sample(sample_rel_path):
     for i, char_img in enumerate(chars):
         tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
         current_mask = plate_position_mask(i)
-        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(tensor, current_mask, return_debug=True)
+        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(
+            tensor, current_mask, return_debug=True, position=i
+        )
         char = loader.idx_to_label[class_idx]
         plate_text += char
         char_type = "\u6c49\u5b57" if "\u4e00" <= char <= "\u9fff" else ("\u6570\u5b57" if char.isdigit() else "\u5b57\u6bcd")
@@ -800,7 +844,9 @@ def run_cropped_plate_test(folder, sample_rel_path, pollution_type, severity, se
     for i, char_img in enumerate(chars):
         tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
         current_mask = plate_position_mask(i)
-        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(tensor, current_mask, return_debug=True)
+        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(
+            tensor, current_mask, return_debug=True, position=i
+        )
         char = loader.idx_to_label[class_idx]
         plate_text += char
         char_type = "\u6c49\u5b57" if is_chinese_label(char) else ("\u6570\u5b57" if str(char).isdigit() else "\u5b57\u6bcd")
