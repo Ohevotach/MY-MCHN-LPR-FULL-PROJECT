@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 import random
+import shutil
 import sys
 from collections import defaultdict
 
@@ -620,12 +621,23 @@ def save_debug_case(output_dir, debug_index, pollution, severity, plate, chars):
 
 
 def evaluate(args):
-    args.output_dir = os.path.join(args.output_dir, args.run_name)
+    output_base = os.path.abspath(args.output_dir)
+    if os.path.basename(output_base) == "cropped_plate_eval":
+        args.output_dir = output_base
+    else:
+        args.output_dir = os.path.join(output_base, "cropped_plate_eval")
     os.makedirs(args.output_dir, exist_ok=True)
+    debug_dir = os.path.join(args.output_dir, "cropped_plate_debug")
+    if os.path.isdir(debug_dir):
+        shutil.rmtree(debug_dir)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"Cropped-plate MCHN evaluation, device={device}")
+    if args.run_name != "cropped_plate_eval":
+        print(f"Note: --run-name={args.run_name} is accepted for compatibility; outputs are fixed to {args.output_dir}")
+    else:
+        print(f"Output directory: {args.output_dir}")
 
     loader = TemplateLoader(
         [os.path.join(args.data_dir, "chars2"), os.path.join(args.data_dir, "charsChinese")],
@@ -870,8 +882,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate MCHN on clean cropped plates with synthetic pollution.")
     parser.add_argument("--labels-csv", default="./plate_eval/labels.csv")
     parser.add_argument("--data-dir", default="./data")
-    parser.add_argument("--output-dir", default="./results")
-    parser.add_argument("--run-name", default="cropped_plate_eval", help="Subfolder under output-dir for cropped-plate evaluation artifacts.")
+    parser.add_argument("--output-dir", default="./results", help="Base output directory. Artifacts are always written to <output-dir>/cropped_plate_eval.")
+    parser.add_argument("--run-name", default="cropped_plate_eval", help="Compatibility option; cropped-plate artifacts are always saved in cropped_plate_eval.")
     parser.add_argument(
         "--pollution",
         default="all",
