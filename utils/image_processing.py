@@ -601,6 +601,7 @@ class PlateSegmenter:
 
         plate_img = cv2.resize(plate_img, (self.PLATE_W, self.PLATE_H))
         plate_img = self._tighten_plate_crop(self._deskew_plate(self._rectify_plate_perspective(plate_img)))
+        plate_img = self._strip_plate_frame(plate_img)
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         binary = self._prepare_character_binary(self._make_character_mask(plate_img, gray))
@@ -775,14 +776,14 @@ class PlateSegmenter:
     def _crop_slot_char(plate_img, gray, binary, box, position=None):
         x, y, w, h = box
         if position == 0:
-            pad_x = max(1, int(round(w * 0.025)))
+            pad_x = max(1, int(round(w * 0.015)))
         elif position == 1:
             pad_x = max(2, int(round(w * 0.080)))
         elif position == 6:
-            pad_x = max(1, int(round(w * 0.030)))
+            pad_x = max(1, int(round(w * 0.012)))
         else:
             pad_x = max(1, int(round(w * 0.040)))
-        pad_y = max(1, int(round(h * 0.08)))
+        pad_y = max(1, int(round(h * 0.055)))
         x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
         x2, y2 = min(binary.shape[1], x + w + pad_x), min(binary.shape[0], y + h + pad_y)
         if x2 <= x1 or y2 <= y1:
@@ -927,7 +928,8 @@ class PlateSegmenter:
             cleaned[:, -border_w:] = 0
             cleaned[: max(1, int(0.04 * cleaned.shape[0])), :] = 0
             cleaned[-max(1, int(0.04 * cleaned.shape[0])) :, :] = 0
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3)))
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+        cleaned = PlateSegmenter._remove_slot_rivets_and_reflections(cleaned, position=position)
         cleaned = PlateSegmenter._remove_slot_border_lines(cleaned, position=position)
         cleaned = PlateSegmenter._trim_slot_edge_artifacts(cleaned, position=position)
 
@@ -995,6 +997,36 @@ class PlateSegmenter:
             elif position in {0, 6} and (touches_left or touches_right) and h >= 0.82 * h_img and w <= 0.08 * w_img:
                 cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
             elif near_top_bottom and w >= 0.52 * w_img and h <= 0.16 * h_img:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+        return cleaned
+
+    @staticmethod
+    def _remove_slot_rivets_and_reflections(mask, position=None):
+        if mask.size == 0:
+            return mask
+        cleaned = mask.copy()
+        h_img, w_img = cleaned.shape[:2]
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cleaned
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            touches_left = x <= max(1, int(0.025 * w_img))
+            touches_right = x + w >= w_img - max(1, int(0.025 * w_img))
+            near_top = y <= 0.16 * h_img
+            near_bottom = y + h >= 0.86 * h_img
+            small_blob = area < 0.035 * h_img * w_img and h < 0.28 * h_img and w < 0.45 * w_img
+            side_line = (touches_left or touches_right) and h >= 0.52 * h_img and w <= 0.16 * w_img
+            edge_speck = (touches_left or touches_right) and area < 0.020 * h_img * w_img
+            cap_line = (near_top or near_bottom) and w >= 0.38 * w_img and h <= 0.16 * h_img
+            if small_blob and (near_top or near_bottom):
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif position in {0, 6} and side_line:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif position in {0, 6} and edge_speck:
+                cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
+            elif cap_line:
                 cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
         return cleaned
 
@@ -1071,6 +1103,38 @@ class PlateSegmenter:
         if crop.size == 0:
             return plate_img
         return cv2.resize(crop, (cls.PLATE_W, cls.PLATE_H))
+
+    @classmethod
+    def _strip_plate_frame(cls, plate_img):
+        if plate_img is None or plate_img.size == 0:
+            return plate_img
+        hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([90, 28, 20]), np.array([140, 255, 255]))
+        green = cv2.inRange(hsv, np.array([32, 25, 25]), np.array([95, 255, 255]))
+        plate_color = cv2.bitwise_or(blue, green)
+        plate_color = cv2.morphologyEx(plate_color, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5)))
+        contours, _ = cv2.findContours(plate_color, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        h_img, w_img = plate_img.shape[:2]
+        if contours:
+            cnt = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(cnt) >= 0.18 * h_img * w_img:
+                x, y, w, h = cv2.boundingRect(cnt)
+                inner_left = x + int(0.014 * w)
+                inner_right = x + w - int(0.040 * w)
+                inner_top = y + int(0.060 * h)
+                inner_bottom = y + h - int(0.075 * h)
+                if inner_right - inner_left >= 0.70 * w_img and inner_bottom - inner_top >= 0.48 * h_img:
+                    crop = plate_img[max(0, inner_top) : min(h_img, inner_bottom), max(0, inner_left) : min(w_img, inner_right)]
+                    if crop.size:
+                        return cv2.resize(crop, (cls.PLATE_W, cls.PLATE_H))
+
+        # Conservative fallback for plates whose color mask is fragmented by glare.
+        x1 = int(0.020 * w_img)
+        x2 = int(0.955 * w_img)
+        y1 = int(0.075 * h_img)
+        y2 = int(0.910 * h_img)
+        crop = plate_img[y1:y2, x1:x2]
+        return cv2.resize(crop, (cls.PLATE_W, cls.PLATE_H)) if crop.size else plate_img
 
     @staticmethod
     def _make_character_mask(plate_img, gray):
@@ -1420,7 +1484,7 @@ class PlateSegmenter:
 
         if crop.size == 0:
             return canvas
-        crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask)
+        crop = PlateSegmenter._foreground_gray_signal(crop, crop_mask, position=position)
         h, w = crop.shape[:2]
         scale = min(26.0 / max(1, w), 56.0 / max(1, h))
         new_w = max(1, min(30, int(round(w * scale))))
@@ -1489,7 +1553,9 @@ class PlateSegmenter:
                 elif touches_right and w <= 6 and h >= 26 and area < 0.12 * 64 * 32:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
             elif position == 6:
-                if touches_right and w <= 4 and h >= 40:
+                if touches_right and w <= 6 and h >= 34 and area < 0.10 * 64 * 32:
+                    cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
+                elif touches_left and w <= 4 and h >= 38 and area < 0.08 * 64 * 32:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
                 elif upper_or_lower_edge and w >= 14 and h <= 7:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
@@ -1556,7 +1622,7 @@ class PlateSegmenter:
         return PlateSegmenter._clean_resized_char_canvas(canvas, position=position)
 
     @staticmethod
-    def _foreground_gray_signal(gray_crop, mask=None):
+    def _foreground_gray_signal(gray_crop, mask=None, position=None):
         if gray_crop.size == 0:
             return gray_crop
         enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray_crop)
@@ -1589,6 +1655,14 @@ class PlateSegmenter:
                 x, y, w, h = cv2.boundingRect(cnt)
                 area = cv2.contourArea(cnt)
                 if area < max(2, 0.0025 * h_img * w_img) and h < 0.18 * h_img:
+                    continue
+                touches_left = x <= max(1, int(0.025 * w_img))
+                touches_right = x + w >= w_img - max(1, int(0.025 * w_img))
+                if position in {0, 6} and (touches_left or touches_right) and h >= 0.55 * h_img and w <= 0.12 * w_img:
+                    continue
+                if position in {0, 6} and (touches_left or touches_right) and area < 0.010 * h_img * w_img:
+                    continue
+                if (y <= 0.10 * h_img or y + h >= 0.90 * h_img) and w >= 0.44 * w_img and h <= 0.15 * h_img:
                     continue
                 cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
             signal[kept == 0] = 0

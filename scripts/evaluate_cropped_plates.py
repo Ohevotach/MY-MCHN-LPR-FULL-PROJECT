@@ -463,6 +463,7 @@ def save_debug_case(output_dir, debug_index, pollution, severity, plate, chars):
     montage = np.vstack([plate_vis, char_row[:, : plate_vis.shape[1]]])
     filename = f"debug_{debug_index:03d}_{pollution}_{severity:.2f}.jpg"
     cv2.imwrite(os.path.join(debug_dir, filename), montage)
+    return os.path.join("cropped_plate_debug", filename)
 
 
 def evaluate(args):
@@ -512,6 +513,7 @@ def evaluate(args):
     grid = evaluation_grid(pollutions, severities)
     detail_rows = []
     char_rows = []
+    debug_detail_rows = []
     position_stats = defaultdict(lambda: {"correct": 0, "total": 0, "top3": 0})
     debug_saved = 0
 
@@ -586,8 +588,30 @@ def evaluate(args):
             dist = edit_distance(pred_text, truth)
             edit_sum += dist
             if args.debug_samples > 0 and debug_saved < args.debug_samples and (pred_text != truth or len(chars) != len(truth)):
-                save_debug_case(args.output_dir, debug_saved + 1, pollution, severity, plate, chars)
+                debug_image = save_debug_case(args.output_dir, debug_saved + 1, pollution, severity, plate, chars)
                 debug_saved += 1
+                for pos, (truth_char, pred_char, top3_text, correct, top3_hit) in enumerate(
+                    zip(truth, pred_parts, top3_parts, correct_flags, top3_flags),
+                    start=1,
+                ):
+                    debug_detail_rows.append(
+                        {
+                            "debug_index": debug_saved,
+                            "debug_image": debug_image,
+                            "pollution": pollution,
+                            "severity": f"{severity:.2f}",
+                            "image_path": os.path.relpath(image_path, ROOT_DIR),
+                            "plate_truth": truth,
+                            "plate_pred": pred_text,
+                            "position": pos,
+                            "truth": truth_char,
+                            "pred": pred_char,
+                            "top3": top3_text,
+                            "correct": int(correct),
+                            "top3_hit": int(top3_hit),
+                            "segmented_count": len(chars),
+                        }
+                    )
             detail_rows.append(
                 {
                     "pollution": pollution,
@@ -619,6 +643,7 @@ def evaluate(args):
     summary_path = os.path.join(args.output_dir, "cropped_plate_summary.csv")
     details_path = os.path.join(args.output_dir, "cropped_plate_details.csv")
     char_details_path = os.path.join(args.output_dir, "cropped_plate_char_details.csv")
+    debug_details_path = os.path.join(args.output_dir, "cropped_plate_debug_details.csv")
     position_path = os.path.join(args.output_dir, "cropped_plate_position_accuracy.csv")
     with open(details_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(detail_rows[0].keys()))
@@ -628,6 +653,11 @@ def evaluate(args):
         writer = csv.DictWriter(f, fieldnames=list(char_rows[0].keys()))
         writer.writeheader()
         writer.writerows(char_rows)
+    if debug_detail_rows:
+        with open(debug_details_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(debug_detail_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(debug_detail_rows)
 
     summary = defaultdict(lambda: {"images": 0, "seg": 0, "char_ok": 0, "char_total": 0, "top3": 0, "plate": 0, "edit": 0})
     for row in detail_rows:
@@ -674,6 +704,8 @@ def evaluate(args):
     print(f"Saved summary: {summary_path}")
     print(f"Saved details: {details_path}")
     print(f"Saved char details: {char_details_path}")
+    if debug_detail_rows:
+        print(f"Saved debug details: {debug_details_path}")
     print(f"Saved position accuracy: {position_path}")
     if args.debug_samples > 0:
         print(f"Saved debug montages: {os.path.join(args.output_dir, 'cropped_plate_debug')}")
@@ -697,7 +729,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
-    parser.add_argument("--debug-samples", type=int, default=12, help="Save this many failed plate segmentation/recognition montages.")
+    parser.add_argument("--debug-samples", type=int, default=10, help="Save this many failed plate segmentation/recognition montages.")
     return parser.parse_args()
 
 
