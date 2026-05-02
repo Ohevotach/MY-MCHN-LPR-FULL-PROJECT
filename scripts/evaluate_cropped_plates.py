@@ -387,6 +387,25 @@ def resolve_pollutions(pollution_arg):
     return pollutions
 
 
+def rng_randint(rng, low, high):
+    low = int(low)
+    high = int(high)
+    if high < low:
+        high = low
+    if hasattr(rng, "integers"):
+        return int(rng.integers(low, high + 1))
+    return int(rng.randint(low, high))
+
+
+def rng_sample(rng, items, count):
+    count = int(max(0, min(count, len(items))))
+    if count <= 0:
+        return []
+    if hasattr(rng, "choice"):
+        return [items[int(idx)] for idx in rng.choice(len(items), size=count, replace=False)]
+    return rng.sample(items, count)
+
+
 def apply_plate_pollution(img, pollution, severity, rng):
     severity = float(max(0.0, min(1.0, severity)))
     if pollution == "none" or severity <= 0.0:
@@ -395,7 +414,7 @@ def apply_plate_pollution(img, pollution, severity, rng):
         choices = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
         count = 1 if severity < 0.35 else 2 if severity < 0.7 else 3
         out = img.copy()
-        for name in rng.sample(choices, count):
+        for name in rng_sample(rng, choices, count):
             out = apply_plate_pollution(out, name, severity, rng)
         return out
 
@@ -403,10 +422,10 @@ def apply_plate_pollution(img, pollution, severity, rng):
     h, w = out.shape[:2]
     if pollution == "mask":
         for _ in range(1 + int(3 * severity)):
-            bw = rng.randint(max(6, int(w * 0.06)), max(8, int(w * (0.12 + 0.18 * severity))))
-            bh = rng.randint(max(5, int(h * 0.10)), max(6, int(h * (0.18 + 0.22 * severity))))
-            x = rng.randint(0, max(0, w - bw))
-            y = rng.randint(0, max(0, h - bh))
+            bw = rng_randint(rng, max(6, int(w * 0.06)), max(8, int(w * (0.12 + 0.18 * severity))))
+            bh = rng_randint(rng, max(5, int(h * 0.10)), max(6, int(h * (0.18 + 0.22 * severity))))
+            x = rng_randint(rng, 0, max(0, w - bw))
+            y = rng_randint(rng, 0, max(0, h - bh))
             color = (0, 0, 0) if rng.random() < 0.65 else (255, 255, 255)
             cv2.rectangle(out, (x, y), (x + bw, y + bh), color, thickness=-1)
         return out
@@ -429,10 +448,10 @@ def apply_plate_pollution(img, pollution, severity, rng):
         return cv2.addWeighted(out, 1.0 - (0.12 + 0.55 * severity), fog, 0.12 + 0.55 * severity, 0)
     if pollution == "dirt":
         for _ in range(1 + int(5 * severity)):
-            radius = rng.randint(max(3, int(h * 0.04)), max(4, int(h * (0.08 + 0.15 * severity))))
-            x = rng.randint(0, max(0, w - 1))
-            y = rng.randint(0, max(0, h - 1))
-            color = tuple(int(v) for v in rng.integers(20, 90, size=3))
+            radius = rng_randint(rng, max(3, int(h * 0.04)), max(4, int(h * (0.08 + 0.15 * severity))))
+            x = rng_randint(rng, 0, max(0, w - 1))
+            y = rng_randint(rng, 0, max(0, h - 1))
+            color = tuple(rng_randint(rng, 20, 89) for _ in range(3))
             cv2.circle(out, (x, y), radius, color, thickness=-1)
         return out
     if pollution == "affine":
