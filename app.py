@@ -584,7 +584,7 @@ def apply_plate_position_prior(scores, position=None):
     if position is None or position < 2:
         return scores
     adjusted = scores.clone()
-    digit_bonus_by_pos = {2: 0.08, 3: 0.10, 4: 0.10, 5: 0.08, 6: 0.04}
+    digit_bonus_by_pos = {2: 0.14, 3: 0.18, 4: 0.18, 5: 0.20, 6: 0.26}
     bonus = digit_bonus_by_pos.get(int(position), 0.0)
     if bonus <= 0.0:
         return adjusted
@@ -592,6 +592,8 @@ def apply_plate_position_prior(scores, position=None):
         text = str(label)
         if len(text) == 1 and text.isdigit():
             adjusted[int(class_idx)] += bonus
+        elif position == 6 and len(text) == 1 and "A" <= text <= "Z":
+            adjusted[int(class_idx)] -= 0.04
     return adjusted
 
 
@@ -602,7 +604,8 @@ def prepare_plate_for_segmentation(img_bgr, pollution_type="none", severity=0.0)
     if severity <= 0.0 or pollution_type == "none":
         return img_bgr.copy()
     if pollution_type == "salt_pepper":
-        return cv2.medianBlur(img_bgr, 3)
+        kernel = 5 if severity >= 0.70 else 3
+        return cv2.medianBlur(img_bgr, kernel)
     if pollution_type == "noise":
         denoised = cv2.medianBlur(img_bgr, 3)
         return cv2.bilateralFilter(denoised, 5, 32, 32)
@@ -611,74 +614,6 @@ def prepare_plate_for_segmentation(img_bgr, pollution_type="none", severity=0.0)
     if pollution_type == "dirt" and severity >= 0.65:
         return cv2.medianBlur(img_bgr, 3)
     return img_bgr.copy()
-
-
-def _segmented_char_quality(char_img, position):
-    arr = _resize_char_candidate(char_img)
-    blurred = cv2.GaussianBlur(arr, (3, 3), 0)
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(binary > 0) > 0.55:
-        binary = cv2.bitwise_not(binary)
-    binary = _strip_character_frame_lines(binary)
-    ys, xs = np.where(binary > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return -6.0
-    ink = float(np.mean(binary > 0))
-    bbox_h = (float(ys.max() - ys.min() + 1)) / 64.0
-    bbox_w = (float(xs.max() - xs.min() + 1)) / 32.0
-    comp_count, _, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), connectivity=8)
-    min_area = 3 if position == 0 else 4
-    useful_components = sum(int(stats[idx, cv2.CC_STAT_AREA]) >= min_area for idx in range(1, comp_count))
-
-    score = 0.0
-    score += 2.0 - min(abs(ink - (0.18 if position == 0 else 0.22)) * 8.0, 2.5)
-    score += 2.0 - min(abs(bbox_h - 0.74) * 4.0, 2.5)
-    score += 1.5 - min(abs(bbox_w - (0.62 if position == 0 else 0.52)) * 3.0, 2.0)
-    if ink < 0.025 or bbox_h < 0.28 or bbox_w < 0.18:
-        score -= 5.0
-    if ink > 0.62:
-        score -= 3.0
-    if position == 0:
-        if useful_components < 2:
-            score -= 2.5
-        if useful_components > 14:
-            score -= 1.5
-    elif useful_components > 8:
-        score -= 1.5
-    return score
-
-
-def _segmentation_quality_score(chars, expected=7):
-    if not chars:
-        return -999.0
-    score = -12.0 * abs(len(chars) - expected)
-    for pos, char_img in enumerate(chars[:expected]):
-        score += _segmented_char_quality(char_img, pos)
-    return score
-
-
-def segment_plate_with_stable_input(img_bgr, pollution_type="none", severity=0.0):
-    candidates = [img_bgr]
-    prepared = prepare_plate_for_segmentation(img_bgr, pollution_type, severity)
-    if prepared is not None:
-        candidates.append(prepared)
-    best_chars = []
-    best_score = -1e9
-    seen = set()
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        key = candidate.shape, candidate[:2, :2].tobytes(), candidate[-2:, -2:].tobytes()
-        if key in seen:
-            continue
-        seen.add(key)
-        plate = cv2.resize(candidate, (pipeline.segmenter.PLATE_W, pipeline.segmenter.PLATE_H))
-        chars = pipeline.segmenter.segment_characters(plate)
-        score = _segmentation_quality_score(chars)
-        if score > best_score:
-            best_score = score
-            best_chars = chars
-    return best_chars
 
 
 def recognize_tensor(tensor, template_mask=None, return_debug=False, position=None):
@@ -953,7 +888,9 @@ def run_cropped_plate_test(folder, sample_rel_path, pollution_type, severity, se
         return "\u56fe\u7247\u8bfb\u53d6\u5931\u8d25\u3002", None, None, pd.DataFrame(), [], []
 
     polluted = apply_plate_pollution(img_bgr, pollution_type, float(severity), int(seed))
-    chars = segment_plate_with_stable_input(polluted, pollution_type, float(severity))
+    seg_input = prepare_plate_for_segmentation(polluted, pollution_type, float(severity))
+    plate_for_seg = cv2.resize(seg_input, (pipeline.segmenter.PLATE_W, pipeline.segmenter.PLATE_H))
+    chars = pipeline.segmenter.segment_characters(plate_for_seg)
     if not chars:
         return "\u5b57\u7b26\u5206\u5272\u5931\u8d25\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), cv2.cvtColor(polluted, cv2.COLOR_BGR2RGB), pd.DataFrame(), [], []
 

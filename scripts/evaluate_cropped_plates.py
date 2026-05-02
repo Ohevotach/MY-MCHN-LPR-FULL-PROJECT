@@ -393,7 +393,8 @@ def prepare_plate_for_segmentation(img_bgr, pollution="none", severity=0.0):
     if severity <= 0.0 or pollution == "none":
         return img_bgr.copy()
     if pollution == "salt_pepper":
-        return cv2.medianBlur(img_bgr, 3)
+        kernel = 5 if severity >= 0.70 else 3
+        return cv2.medianBlur(img_bgr, kernel)
     if pollution == "noise":
         denoised = cv2.medianBlur(img_bgr, 3)
         return cv2.bilateralFilter(denoised, 5, 32, 32)
@@ -402,78 +403,6 @@ def prepare_plate_for_segmentation(img_bgr, pollution="none", severity=0.0):
     if pollution == "dirt" and severity >= 0.65:
         return cv2.medianBlur(img_bgr, 3)
     return img_bgr.copy()
-
-
-def segmented_char_quality(char_img, position):
-    arr = resize_char_candidate(char_img)
-    blurred = cv2.GaussianBlur(arr, (3, 3), 0)
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(binary > 0) > 0.55:
-        binary = cv2.bitwise_not(binary)
-    binary = strip_character_frame_lines(binary)
-    ys, xs = np.where(binary > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return -6.0
-    ink = float(np.mean(binary > 0))
-    bbox_h = float(ys.max() - ys.min() + 1) / 64.0
-    bbox_w = float(xs.max() - xs.min() + 1) / 32.0
-    comp_count, _, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), connectivity=8)
-    min_area = 3 if position == 0 else 4
-    useful_components = sum(int(stats[idx, cv2.CC_STAT_AREA]) >= min_area for idx in range(1, comp_count))
-
-    score = 0.0
-    score += 2.0 - min(abs(ink - (0.18 if position == 0 else 0.22)) * 8.0, 2.5)
-    score += 2.0 - min(abs(bbox_h - 0.74) * 4.0, 2.5)
-    score += 1.5 - min(abs(bbox_w - (0.62 if position == 0 else 0.52)) * 3.0, 2.0)
-    if ink < 0.025 or bbox_h < 0.28 or bbox_w < 0.18:
-        score -= 5.0
-    if ink > 0.62:
-        score -= 3.0
-    if position == 0:
-        if useful_components < 2:
-            score -= 2.5
-        if useful_components > 14:
-            score -= 1.5
-    elif useful_components > 8:
-        score -= 1.5
-    return score
-
-
-def segmentation_quality_score(chars, expected=7):
-    if not chars:
-        return -999.0
-    score = -12.0 * abs(len(chars) - expected)
-    for pos, char_img in enumerate(chars[:expected]):
-        score += segmented_char_quality(char_img, pos)
-    return score
-
-
-def segment_plate_with_stable_input(segmenter, img_bgr, pollution="none", severity=0.0):
-    candidates = [img_bgr]
-    prepared = prepare_plate_for_segmentation(img_bgr, pollution, severity)
-    if prepared is not None:
-        candidates.append(prepared)
-    best_chars = []
-    best_plate = None
-    best_score = -1e9
-    seen = set()
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        key = candidate.shape, candidate[:2, :2].tobytes(), candidate[-2:, -2:].tobytes()
-        if key in seen:
-            continue
-        seen.add(key)
-        plate = cv2.resize(candidate, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
-        chars = segmenter.segment_characters(plate)
-        score = segmentation_quality_score(chars)
-        if score > best_score:
-            best_score = score
-            best_chars = chars
-            best_plate = plate
-    if best_plate is None:
-        best_plate = cv2.resize(img_bgr, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
-    return best_chars, best_plate
 
 
 def apply_position_prior(scores, loader, position):
@@ -485,7 +414,7 @@ def apply_position_prior(scores, loader, position):
     """
     if position < 2:
         return scores
-    digit_bonus_by_pos = {2: 0.08, 3: 0.10, 4: 0.10, 5: 0.08, 6: 0.04}
+    digit_bonus_by_pos = {2: 0.18, 3: 0.12, 4: 0.08, 5: 0.14, 6: 0.08}
     bonus = digit_bonus_by_pos.get(position, 0.0)
     if bonus <= 0:
         return scores
@@ -758,7 +687,9 @@ def evaluate(args):
                 raise FileNotFoundError(image_path)
             pollution_rng = np.random.default_rng(args.seed + stable_text_seed(pollution) * 1009 + image_idx * 1000003)
             polluted = apply_plate_pollution(img, pollution, severity, pollution_rng)
-            chars, plate = segment_plate_with_stable_input(segmenter, polluted, pollution, severity)
+            seg_input = prepare_plate_for_segmentation(polluted, pollution, severity)
+            plate = cv2.resize(seg_input, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+            chars = segmenter.segment_characters(plate)
             pred_parts = []
             top3_parts = []
             correct_flags = []
