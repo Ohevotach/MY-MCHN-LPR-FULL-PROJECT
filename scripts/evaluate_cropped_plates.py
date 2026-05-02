@@ -454,6 +454,7 @@ def segment_plate_with_stable_input(segmenter, img_bgr, pollution="none", severi
     if prepared is not None:
         candidates.append(prepared)
     best_chars = []
+    best_plate = None
     best_score = -1e9
     seen = set()
     for candidate in candidates:
@@ -469,7 +470,10 @@ def segment_plate_with_stable_input(segmenter, img_bgr, pollution="none", severi
         if score > best_score:
             best_score = score
             best_chars = chars
-    return best_chars
+            best_plate = plate
+    if best_plate is None:
+        best_plate = cv2.resize(img_bgr, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+    return best_chars, best_plate
 
 
 def apply_position_prior(scores, loader, position):
@@ -754,7 +758,7 @@ def evaluate(args):
                 raise FileNotFoundError(image_path)
             pollution_rng = np.random.default_rng(args.seed + stable_text_seed(pollution) * 1009 + image_idx * 1000003)
             polluted = apply_plate_pollution(img, pollution, severity, pollution_rng)
-            chars = segment_plate_with_stable_input(segmenter, polluted, pollution, severity)
+            chars, plate = segment_plate_with_stable_input(segmenter, polluted, pollution, severity)
             pred_parts = []
             top3_parts = []
             correct_flags = []
