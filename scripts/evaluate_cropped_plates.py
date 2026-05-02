@@ -132,16 +132,74 @@ def keep_likely_character_components(binary):
     return kept
 
 
+def resize_char_candidate(arr):
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.shape != (64, 32):
+        arr = cv2.resize(arr, (32, 64), interpolation=cv2.INTER_NEAREST)
+    return arr
+
+
+def query_variant_quality(arr):
+    work = resize_char_candidate(arr)
+    blurred = cv2.GaussianBlur(work, (3, 3), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binary > 0) > 0.55:
+        binary = cv2.bitwise_not(binary)
+    binary = strip_character_frame_lines(binary)
+    ink = float(np.mean(binary > 0))
+    if ink <= 0.0:
+        return {"ink": ink, "largest_area": 0.0, "largest_bbox": 0.0, "largest_extent": 0.0}
+
+    count, _, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), connectivity=8)
+    largest_area = 0.0
+    largest_bbox = 0.0
+    largest_extent = 0.0
+    image_area = float(binary.shape[0] * binary.shape[1])
+    for idx in range(1, count):
+        w = float(stats[idx, cv2.CC_STAT_WIDTH])
+        h = float(stats[idx, cv2.CC_STAT_HEIGHT])
+        area = float(stats[idx, cv2.CC_STAT_AREA])
+        bbox_area = max(1.0, w * h)
+        if area > largest_area:
+            largest_area = area
+            largest_bbox = bbox_area
+            largest_extent = area / bbox_area
+
+    return {
+        "ink": ink,
+        "largest_area": largest_area / image_area,
+        "largest_bbox": largest_bbox / image_area,
+        "largest_extent": largest_extent,
+    }
+
+
+def is_query_variant_usable(arr):
+    stats = query_variant_quality(arr)
+    ink = stats["ink"]
+    if ink < 0.01 or ink > 0.70:
+        return False
+    if stats["largest_area"] >= 0.30 and stats["largest_extent"] >= 0.70:
+        return False
+    if stats["largest_bbox"] >= 0.32 and stats["largest_extent"] >= 0.68:
+        return False
+    if stats["largest_bbox"] >= 0.20 and stats["largest_extent"] >= 0.86:
+        return False
+    return True
+
+
 def robust_char_query_variants(char_img):
+    source = resize_char_candidate(char_img)
     tensor_img = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
     normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
     base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
-    blurred = cv2.GaussianBlur(base, (3, 3), 0)
+    blurred = cv2.GaussianBlur(source, (3, 3), 0)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(otsu > 0) > 0.55:
         otsu = cv2.bitwise_not(otsu)
 
     candidates = [
+        source,
+        normalize_char_image(source),
         base,
         normalize_char_image(base),
         normalize_char_image(otsu),
@@ -152,9 +210,8 @@ def robust_char_query_variants(char_img):
     unique = []
     seen = set()
     for item in candidates:
-        item = normalize_char_image(item)
-        ink = float(np.mean(item > 0))
-        if ink < 0.01 or ink > 0.70:
+        item = resize_char_candidate(item)
+        if not is_query_variant_usable(item):
             continue
         key = item.tobytes()
         if key in seen:

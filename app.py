@@ -300,6 +300,67 @@ def _strip_character_frame_lines(binary):
     return cleaned
 
 
+def _resize_char_candidate(arr):
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.shape != (64, 32):
+        arr = cv2.resize(arr, (32, 64), interpolation=cv2.INTER_NEAREST)
+    return arr
+
+
+def _query_variant_quality(arr):
+    work = _resize_char_candidate(arr)
+    blurred = cv2.GaussianBlur(work, (3, 3), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binary > 0) > 0.55:
+        binary = cv2.bitwise_not(binary)
+    binary = _strip_character_frame_lines(binary)
+    ink = float(np.mean(binary > 0))
+    if ink <= 0.0:
+        return {"ink": ink, "largest_area": 0.0, "largest_bbox": 0.0, "largest_extent": 0.0}
+
+    count, _, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), connectivity=8)
+    largest_area = 0.0
+    largest_bbox = 0.0
+    largest_extent = 0.0
+    image_area = float(binary.shape[0] * binary.shape[1])
+    for idx in range(1, count):
+        x = float(stats[idx, cv2.CC_STAT_LEFT])
+        y = float(stats[idx, cv2.CC_STAT_TOP])
+        w = float(stats[idx, cv2.CC_STAT_WIDTH])
+        h = float(stats[idx, cv2.CC_STAT_HEIGHT])
+        area = float(stats[idx, cv2.CC_STAT_AREA])
+        bbox_area = max(1.0, w * h)
+        if area > largest_area:
+            largest_area = area
+            largest_bbox = bbox_area
+            largest_extent = area / bbox_area
+
+    return {
+        "ink": ink,
+        "largest_area": largest_area / image_area,
+        "largest_bbox": largest_bbox / image_area,
+        "largest_extent": largest_extent,
+    }
+
+
+def _is_query_variant_usable(arr):
+    stats = _query_variant_quality(arr)
+    ink = stats["ink"]
+    if ink < 0.01 or ink > 0.70:
+        return False
+
+    # Bad threshold/closing candidates can turn O/Q/0-like glyphs into one
+    # dense white blob. They may score highly against wrong templates, so keep
+    # them out before MCHN scoring.
+    if stats["largest_area"] >= 0.30 and stats["largest_extent"] >= 0.70:
+        return False
+    if stats["largest_bbox"] >= 0.32 and stats["largest_extent"] >= 0.68:
+        return False
+    if stats["largest_bbox"] >= 0.20 and stats["largest_extent"] >= 0.86:
+        return False
+    return True
+
+
 def affine_char_variants(tensor):
     base = tensor.detach().cpu().view(64, 32).numpy()
     base = normalize_char_image(np.clip(base * 255, 0, 255))
@@ -325,36 +386,38 @@ def affine_char_variants(tensor):
 def robust_char_query_variants(tensor_img):
     if tensor_img.dim() == 2:
         tensor_img = tensor_img.unsqueeze(0)
+    source = np.clip(tensor_img.detach().cpu().squeeze().numpy() * 255, 0, 255).astype(np.uint8)
+    source = _resize_char_candidate(source)
     normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
     base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
+    source_clean = normalize_char_image(source)
     base_clean = normalize_char_image(base)
 
-    variants = [base, base_clean]
-    blurred = cv2.GaussianBlur(base, (3, 3), 0)
+    variants = [(source, False), (source_clean, False), (base, False), (base_clean, False)]
+    blurred = cv2.GaussianBlur(source, (3, 3), 0)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(otsu > 0) > 0.55:
         otsu = cv2.bitwise_not(otsu)
-    variants.append(normalize_char_image(otsu))
+    variants.append((normalize_char_image(otsu), False))
 
     for scale, offset in ((1.25, -18), (1.45, -32)):
-        contrast = np.clip(base.astype(np.float32) * scale + offset, 0, 255).astype(np.uint8)
-        variants.append(normalize_char_image(contrast))
+        contrast = np.clip(source.astype(np.float32) * scale + offset, 0, 255).astype(np.uint8)
+        variants.append((normalize_char_image(contrast), False))
 
     kernels = [cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))]
-    variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernels[0])))
-    variants.append(normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_OPEN, kernels[0])))
-    variants.append(normalize_char_image(cv2.medianBlur(otsu, 3)))
-    variants.append(normalize_char_image(_keep_likely_character_components(otsu)))
-    variants.append(normalize_char_image(_strip_character_frame_lines(otsu)))
+    variants.append((normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernels[0])), False))
+    variants.append((normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_OPEN, kernels[0])), False))
+    variants.append((normalize_char_image(cv2.medianBlur(otsu, 3)), False))
+    variants.append((normalize_char_image(_keep_likely_character_components(otsu)), False))
+    variants.append((normalize_char_image(_strip_character_frame_lines(otsu)), False))
 
     unique = []
     seen = set()
-    for item in variants:
+    for item, should_normalize in variants:
         if item is None or item.size == 0:
             continue
-        item = normalize_char_image(item)
-        ink = float(np.mean(item > 0))
-        if ink < 0.01 or ink > 0.70:
+        item = normalize_char_image(item) if should_normalize else _resize_char_candidate(item)
+        if not _is_query_variant_usable(item):
             continue
         key = item.tobytes()
         if key in seen:
