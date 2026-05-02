@@ -19,10 +19,14 @@ def zh(text):
     texts = {
         "title": "\u73b0\u4ee3 Hopfield \u7f51\u7edc\u6c61\u67d3\u8f66\u724c\u5b57\u7b26\u8bc6\u522b",
         "plate_tab": "\u6574\u8f66\u56fe\u7247\u8bc6\u522b",
+        "cropped_plate_tab": "\u88c1\u526a\u8f66\u724c\u6c61\u67d3\u6d4b\u8bd5",
         "char_tab": "\u5355\u5b57\u7b26\u6c61\u67d3\u6d4b\u8bd5",
         "upload_plate": "\u4e0a\u4f20\u8f66\u724c\u6216\u6574\u8f66\u56fe\u7247",
         "run_lpr": "\u63d0\u4ea4\u8f66\u724c\u8bc6\u522b",
+        "run_cropped_plate": "\u8fd0\u884c\u88c1\u526a\u8f66\u724c MCHN \u6d4b\u8bd5",
         "overall": "\u603b\u4f53\u8bc6\u522b\u7ed3\u679c",
+        "cropped_plate_original": "\u539f\u59cb\u88c1\u526a\u8f66\u724c",
+        "cropped_plate_polluted": "\u6c61\u67d3\u540e\u88c1\u526a\u8f66\u724c",
         "plate_img": "\u8f66\u724c\u5b9a\u4f4d\u4e0e\u900f\u89c6\u77eb\u6b63",
         "char_gallery": "\u5b57\u7b26\u5207\u5272\u7ed3\u679c",
         "debug_gallery": "MCHN \u5b9e\u9645\u8f93\u5165\u4e0e\u5339\u914d\u6a21\u677f",
@@ -407,6 +411,26 @@ def collect_full_car_samples():
     return choices
 
 
+def collect_cropped_plate_samples(root="./plate_eval/image_clean"):
+    choices = []
+    if not root:
+        return choices
+    root = os.path.abspath(root)
+    project_root = os.path.abspath(os.getcwd())
+    data_root = os.path.abspath(os.path.join(project_root, "data"))
+    if root == data_root or root.startswith(data_root + os.sep):
+        return choices
+    if not os.path.exists(root):
+        return choices
+    for dirpath, _, filenames in os.walk(root):
+        for name in sorted(filenames):
+            if name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+                path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, project_root)
+                choices.append((rel, path))
+    return choices
+
+
 print("Loading MCHN memory and YOLO-first LPR pipeline...")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 loader = TemplateLoader(["./data/chars2", "./data/charsChinese"], img_size=(32, 64), cache_path=default_cache_path())
@@ -422,6 +446,7 @@ pipeline = LPRPipeline()
 chinese_mask, alnum_mask, plate_tail_mask, letter_mask, digit_mask = build_template_masks(loader, template_labels, device)
 pollution_choices = ["none", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "mixed"]
 full_car_samples = collect_full_car_samples()
+cropped_plate_samples = collect_cropped_plate_samples()
 
 label_to_paths = defaultdict(list)
 for idx, path in enumerate(loader.template_paths):
@@ -505,6 +530,75 @@ def plate_position_mask(position):
     if position == 1 and bool(letter_mask.any().item()):
         return letter_mask
     return plate_tail_mask if bool(plate_tail_mask.any().item()) else alnum_mask
+
+
+def rng_int(rng, low, high):
+    low = int(low)
+    high = int(high)
+    if high < low:
+        high = low
+    return int(rng.integers(low, high + 1))
+
+
+def apply_plate_pollution(img_bgr, pollution_type, severity, seed):
+    severity = float(max(0.0, min(1.0, severity)))
+    if img_bgr is None:
+        return None
+    if pollution_type == "none" or severity <= 0.0:
+        return img_bgr.copy()
+    rng = np.random.default_rng(int(seed))
+    if pollution_type == "mixed":
+        choices = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
+        count = 1 if severity < 0.35 else 2 if severity < 0.7 else 3
+        out = img_bgr.copy()
+        for name in [choices[int(idx)] for idx in rng.choice(len(choices), size=count, replace=False)]:
+            out = apply_plate_pollution(out, name, severity, int(rng.integers(0, 2**31 - 1)))
+        return out
+
+    out = img_bgr.copy()
+    h, w = out.shape[:2]
+    if pollution_type == "mask":
+        for _ in range(1 + int(3 * severity)):
+            bw = rng_int(rng, max(6, int(w * 0.06)), max(8, int(w * (0.12 + 0.18 * severity))))
+            bh = rng_int(rng, max(5, int(h * 0.10)), max(6, int(h * (0.18 + 0.22 * severity))))
+            x = rng_int(rng, 0, max(0, w - bw))
+            y = rng_int(rng, 0, max(0, h - bh))
+            color = (0, 0, 0) if rng.random() < 0.65 else (255, 255, 255)
+            cv2.rectangle(out, (x, y), (x + bw, y + bh), color, thickness=-1)
+        return out
+    if pollution_type == "noise":
+        sigma = 8 + 55 * severity
+        noise = rng.normal(0, sigma, out.shape).astype(np.float32)
+        return np.clip(out.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    if pollution_type == "salt_pepper":
+        prob = 0.005 + 0.12 * severity
+        mask = rng.random(out.shape[:2])
+        out[mask < prob / 2] = 0
+        out[(mask >= prob / 2) & (mask < prob)] = 255
+        return out
+    if pollution_type == "blur":
+        kernel = int(3 + 10 * severity)
+        kernel = kernel + 1 if kernel % 2 == 0 else kernel
+        return cv2.GaussianBlur(out, (kernel, kernel), 0)
+    if pollution_type == "fog":
+        fog = np.full_like(out, 255)
+        alpha = 0.12 + 0.55 * severity
+        return cv2.addWeighted(out, 1.0 - alpha, fog, alpha, 0)
+    if pollution_type == "dirt":
+        for _ in range(1 + int(5 * severity)):
+            radius = rng_int(rng, max(3, int(h * 0.04)), max(4, int(h * (0.08 + 0.15 * severity))))
+            x = rng_int(rng, 0, max(0, w - 1))
+            y = rng_int(rng, 0, max(0, h - 1))
+            color = tuple(rng_int(rng, 20, 89) for _ in range(3))
+            cv2.circle(out, (x, y), radius, color, thickness=-1)
+        return out
+    if pollution_type == "affine":
+        angle = float(rng.uniform(-8, 8)) * severity
+        shear = float(rng.uniform(-0.12, 0.12)) * severity
+        matrix = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+        matrix[0, 1] += shear
+        return cv2.warpAffine(out, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return img_bgr.copy()
 
 
 def plate_detector_status_message():
@@ -611,6 +705,66 @@ def predict_plate_from_sample(sample_rel_path):
     return f"\u6700\u7ec8\u8bc6\u522b: {plate_text}", cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB), pd.DataFrame(rows), gallery, debug_images
 
 
+def update_cropped_plate_choices(folder):
+    samples = collect_cropped_plate_samples(folder)
+    value = samples[0][0] if samples else None
+    return gr.update(choices=[item[0] for item in samples], value=value)
+
+
+def run_cropped_plate_test(folder, sample_rel_path, pollution_type, severity, seed):
+    samples = collect_cropped_plate_samples(folder)
+    path_lookup = dict(samples)
+    if not sample_rel_path:
+        return "\u8bf7\u5148\u9009\u62e9\u88c1\u526a\u8f66\u724c\u56fe\u7247\u3002", None, None, pd.DataFrame(), [], []
+    img_path = path_lookup.get(sample_rel_path)
+    if not img_path or not os.path.exists(img_path):
+        return "\u627e\u4e0d\u5230\u9009\u4e2d\u7684\u88c1\u526a\u8f66\u724c\u56fe\u7247\u3002", None, None, pd.DataFrame(), [], []
+
+    img_bgr = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return "\u56fe\u7247\u8bfb\u53d6\u5931\u8d25\u3002", None, None, pd.DataFrame(), [], []
+
+    polluted = apply_plate_pollution(img_bgr, pollution_type, float(severity), int(seed))
+    plate_for_seg = cv2.resize(polluted, (pipeline.segmenter.PLATE_W, pipeline.segmenter.PLATE_H))
+    chars = pipeline.segmenter.segment_characters(plate_for_seg)
+    if not chars:
+        return "\u5b57\u7b26\u5206\u5272\u5931\u8d25\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), cv2.cvtColor(polluted, cv2.COLOR_BGR2RGB), pd.DataFrame(), [], []
+
+    plate_text = ""
+    rows = []
+    char_gallery = [cv2.cvtColor(c, cv2.COLOR_GRAY2RGB) for c in chars]
+    debug_gallery = []
+    for i, char_img in enumerate(chars):
+        tensor = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
+        current_mask = plate_position_mask(i)
+        class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug = recognize_tensor(tensor, current_mask, return_debug=True)
+        char = loader.idx_to_label[class_idx]
+        plate_text += char
+        char_type = "\u6c49\u5b57" if is_chinese_label(char) else ("\u6570\u5b57" if str(char).isdigit() else "\u5b57\u6bcd")
+        debug_gallery.append(compose_mchn_debug_image(char_gallery[i], debug["query"], debug["matched"]))
+        rows.append(
+            {
+                "\u4f4d\u7f6e": f"\u7b2c{i + 1}\u4f4d",
+                "\u7c7b\u578b": char_type,
+                "\u8bc6\u522b": char,
+                "\u7c7b\u522b\u7f6e\u4fe1\u5ea6": f"{prob * 100:.2f}%",
+                "\u5019\u9009Top5": top_text,
+                "\u6a21\u677f\u76f8\u4f3c\u5ea6": f"{template_sim * 100:.2f}%",
+                "\u91cd\u6784\u76f8\u4f3c\u5ea6": f"{recon_sim * 100:.2f}%",
+                "\u5339\u914d\u6a21\u677f": loader.idx_to_label[int(template_labels[best_template_idx].detach().cpu().item())],
+                "\u53d8\u4f53": f"{debug['variant_index'] + 1}/{debug['variant_count']}",
+            }
+        )
+
+    if len(chars) != 7:
+        plate_text += f"  (\u8b66\u544a: \u5f53\u524d\u5207\u51fa {len(chars)} \u4e2a\u5b57\u7b26)"
+    summary = (
+        f"\u6700\u7ec8\u8bc6\u522b: {plate_text}\n"
+        f"\u6c61\u67d3\u7c7b\u578b: {pollution_type}, \u5f3a\u5ea6: {float(severity):.2f}, \u968f\u673a\u79cd\u5b50: {int(seed)}"
+    )
+    return summary, cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), cv2.cvtColor(polluted, cv2.COLOR_BGR2RGB), pd.DataFrame(rows), char_gallery, debug_gallery
+
+
 def update_sample_choices(class_label):
     choices = [item[0] for item in label_to_paths.get(class_label, [])]
     value = choices[0] if choices else None
@@ -679,6 +833,49 @@ with gr.Blocks(title="MCHN Polluted License Plate Recognition") as demo:
         debug_gallery = gr.Gallery(label=zh("debug_gallery"), show_label=True, columns=7, height=150, object_fit="contain")
         btn.click(predict_plate, img_in, [txt_out, img_out, df_out, char_gallery, debug_gallery])
         sample_btn.click(predict_plate_from_sample, car_sample_dropdown, [txt_out, img_out, df_out, char_gallery, debug_gallery])
+
+    with gr.Tab(zh("cropped_plate_tab")):
+        with gr.Row():
+            with gr.Column(scale=1):
+                cropped_folder = gr.Textbox(label="\u88c1\u526a\u8f66\u724c\u6587\u4ef6\u5939", value="./plate_eval/image_clean")
+                cropped_refresh = gr.Button("\u5237\u65b0\u6587\u4ef6\u5217\u8868")
+                cropped_dropdown = gr.Dropdown(
+                    label="\u4ece\u6587\u4ef6\u5939\u9009\u62e9\u88c1\u526a\u8f66\u724c\u56fe\u7247",
+                    choices=[item[0] for item in cropped_plate_samples],
+                    value=cropped_plate_samples[0][0] if cropped_plate_samples else None,
+                    filterable=True,
+                )
+                cropped_pollution = gr.Dropdown(label=zh("pollution"), choices=pollution_choices, value="none")
+                cropped_severity = gr.Slider(label=zh("severity"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                cropped_seed = gr.Number(label=zh("seed"), value=2026, precision=0)
+                cropped_btn = gr.Button(zh("run_cropped_plate"), variant="primary")
+            with gr.Column(scale=2):
+                cropped_result = gr.Textbox(label=zh("overall"), lines=2)
+                with gr.Row():
+                    cropped_original = gr.Image(label=zh("cropped_plate_original"))
+                    cropped_polluted = gr.Image(label=zh("cropped_plate_polluted"))
+        cropped_df = gr.Dataframe(
+            headers=[
+                "\u4f4d\u7f6e",
+                "\u7c7b\u578b",
+                "\u8bc6\u522b",
+                "\u7c7b\u522b\u7f6e\u4fe1\u5ea6",
+                "\u5019\u9009Top5",
+                "\u6a21\u677f\u76f8\u4f3c\u5ea6",
+                "\u91cd\u6784\u76f8\u4f3c\u5ea6",
+                "\u5339\u914d\u6a21\u677f",
+                "\u53d8\u4f53",
+            ],
+            label=zh("char_table"),
+        )
+        cropped_char_gallery = gr.Gallery(label=zh("char_gallery"), show_label=True, columns=7, height=120, object_fit="contain")
+        cropped_debug_gallery = gr.Gallery(label=zh("debug_gallery"), show_label=True, columns=7, height=150, object_fit="contain")
+        cropped_refresh.click(update_cropped_plate_choices, cropped_folder, cropped_dropdown)
+        cropped_btn.click(
+            run_cropped_plate_test,
+            [cropped_folder, cropped_dropdown, cropped_pollution, cropped_severity, cropped_seed],
+            [cropped_result, cropped_original, cropped_polluted, cropped_df, cropped_char_gallery, cropped_debug_gallery],
+        )
 
     with gr.Tab(zh("char_tab")):
         with gr.Row():
