@@ -607,6 +607,12 @@ class PlateSegmenter:
         binary = self._prepare_character_binary(self._make_character_mask(plate_img, gray))
 
         candidates = []
+        scan_chars, scan_boxes = self._segment_by_left_to_right_scan(plate_img, gray, binary)
+        if self._is_usable_char_sequence(scan_chars):
+            return scan_chars[:7]
+        if scan_chars:
+            candidates.append(("ltr_scan", scan_boxes, scan_chars))
+
         geometric_chars, geometric_boxes = self._segment_by_plate_geometry(plate_img, gray, binary)
         if self._is_usable_char_sequence(geometric_chars):
             return geometric_chars[:7]
@@ -636,6 +642,267 @@ class PlateSegmenter:
                 best_score = score
                 best_chars = chars
         return best_chars
+
+    def _segment_by_left_to_right_scan(self, plate_img, gray, binary, char_count=7):
+        """Segment characters by scanning foreground runs from left to right.
+
+        This path intentionally avoids fixed equal-width slots. It removes the
+        top/bottom plate edges, finds continuous vertical foreground regions,
+        treats sufficiently wide runs as characters, and splits over-wide runs
+        at projection valleys.
+        """
+        roi = self._scan_text_roi(binary)
+        if roi is None:
+            return [], []
+        left, top, right, bottom = roi
+        if right - left < 220 or bottom - top < 42:
+            return [], []
+
+        work = binary.copy()
+        work[:top, :] = 0
+        work[bottom:, :] = 0
+        work[:, :left] = 0
+        work[:, right:] = 0
+        work = self._remove_long_plate_lines(work)
+        work = cv2.morphologyEx(work, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2)))
+        work = cv2.morphologyEx(work, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+
+        boxes = self._scan_foreground_runs(work, left, right, top, bottom, char_count=char_count)
+        if not boxes:
+            return [], []
+        boxes = self._normalize_ltr_boxes(work, boxes, left, right, top, bottom, char_count=char_count)
+        if not boxes:
+            return [], []
+
+        chars = [self._crop_slot_char(plate_img, gray, work, box, idx) for idx, box in enumerate(boxes[:char_count])]
+        return chars, boxes[:char_count]
+
+    @classmethod
+    def _scan_text_roi(cls, binary):
+        work = binary.copy()
+        work[: max(1, int(0.12 * cls.PLATE_H)), :] = 0
+        work[min(cls.PLATE_H, int(0.90 * cls.PLATE_H)) :, :] = 0
+        work[:, : max(1, int(0.025 * cls.PLATE_W))] = 0
+        work[:, min(cls.PLATE_W, int(0.975 * cls.PLATE_W)) :] = 0
+        work = cls._remove_long_plate_lines(work)
+
+        row_sum = (work > 0).sum(axis=1).astype(np.float32)
+        col_sum = (work > 0).sum(axis=0).astype(np.float32)
+        if float(row_sum.max(initial=0)) <= 0 or float(col_sum.max(initial=0)) <= 0:
+            return None
+
+        row_active = np.where(row_sum > max(2.0, 0.10 * float(row_sum.max())))[0]
+        col_active = np.where(col_sum > max(1.0, 0.05 * float(col_sum.max())))[0]
+        if len(row_active) < 22 or len(col_active) < 120:
+            return None
+
+        top = max(12, int(row_active[0]) - 4)
+        bottom = min(cls.PLATE_H - 7, int(row_active[-1]) + 5)
+        left = max(10, int(col_active[0]) - 5)
+        right = min(cls.PLATE_W - 10, int(col_active[-1]) + 6)
+
+        # Explicitly trim top/bottom frame areas after the rough row estimate.
+        height = bottom - top
+        top = min(bottom - 36, top + max(1, int(0.04 * height)))
+        bottom = max(top + 36, bottom - max(1, int(0.035 * height)))
+        return left, top, right, bottom
+
+    @staticmethod
+    def _merge_close_ranges(ranges, max_gap):
+        if not ranges:
+            return []
+        merged = [list(ranges[0])]
+        for start, end in ranges[1:]:
+            if start - merged[-1][1] <= max_gap:
+                merged[-1][1] = end
+            else:
+                merged.append([start, end])
+        return [(int(start), int(end)) for start, end in merged]
+
+    def _scan_foreground_runs(self, work, left, right, top, bottom, char_count=7):
+        band = work[top:bottom, left:right]
+        if band.size == 0:
+            return []
+        col_sum = (band > 0).sum(axis=0).astype(np.float32)
+        if float(col_sum.max(initial=0)) <= 0:
+            return []
+        smooth = cv2.GaussianBlur(col_sum.reshape(1, -1), (1, 9), 0).ravel()
+        threshold = max(1.5, 0.12 * float(np.percentile(smooth[smooth > 0], 90)) if np.any(smooth > 0) else 1.5)
+        active_cols = np.where(smooth >= threshold)[0]
+        if len(active_cols) < 30:
+            return []
+
+        raw_runs = []
+        run_start = int(active_cols[0])
+        prev = int(active_cols[0])
+        for col in active_cols[1:]:
+            col = int(col)
+            if col > prev + 1:
+                raw_runs.append((run_start + left, prev + left + 1))
+                run_start = col
+            prev = col
+        raw_runs.append((run_start + left, prev + left + 1))
+
+        runs = self._merge_close_ranges(raw_runs, max_gap=max(3, int(0.012 * (right - left))))
+        min_width = max(8, int(0.026 * (right - left)))
+        max_width = max(42, int(0.19 * (right - left)))
+        boxes = []
+        for start, end in runs:
+            width = end - start
+            if width < min_width:
+                continue
+            pieces = self._split_wide_ltr_run(work, start, end, top, bottom, min_width, max_width)
+            for p_start, p_end in pieces:
+                box = self._box_from_scan_run(work, p_start, p_end, top, bottom)
+                if box is not None:
+                    boxes.append(box)
+        return sorted(boxes, key=lambda item: item[0])
+
+    @staticmethod
+    def _split_wide_ltr_run(work, start, end, top, bottom, min_width, max_width):
+        width = end - start
+        if width <= max_width:
+            return [(start, end)]
+
+        profile = (work[top:bottom, start:end] > 0).sum(axis=0).astype(np.float32)
+        if profile.size < 2 * min_width:
+            return [(start, end)]
+        smooth = cv2.GaussianBlur(profile.reshape(1, -1), (1, 7), 0).ravel()
+        pieces = [(0, profile.size)]
+        while pieces:
+            widest_idx = int(np.argmax([piece[1] - piece[0] for piece in pieces]))
+            p_start, p_end = pieces[widest_idx]
+            if p_end - p_start <= max_width:
+                break
+            lo = p_start + min_width
+            hi = p_end - min_width
+            if hi <= lo:
+                break
+            local = smooth[lo:hi]
+            if local.size == 0:
+                break
+            valley = int(lo + np.argmin(local))
+            if smooth[valley] > max(1.0, 0.55 * float(np.percentile(smooth[p_start:p_end], 75))):
+                break
+            pieces[widest_idx : widest_idx + 1] = [(p_start, valley), (valley + 1, p_end)]
+        return [(start + p_start, start + p_end) for p_start, p_end in pieces if p_end - p_start >= min_width]
+
+    @staticmethod
+    def _box_from_scan_run(work, start, end, top, bottom):
+        x1, x2 = max(0, int(start) - 1), min(work.shape[1], int(end) + 1)
+        if x2 - x1 < 6:
+            return None
+        slot = work[top:bottom, x1:x2]
+        rows = np.where((slot > 0).sum(axis=1) > 0)[0]
+        if len(rows) < 8:
+            return None
+        y1 = max(8, top + int(rows[0]) - 3)
+        y2 = min(work.shape[0] - 5, top + int(rows[-1]) + 4)
+        if y2 - y1 < 18:
+            return None
+        return (x1, y1, x2 - x1, y2 - y1)
+
+    def _normalize_ltr_boxes(self, work, boxes, left, right, top, bottom, char_count=7):
+        boxes = sorted(boxes, key=lambda item: item[0])
+        boxes = [box for box in boxes if self._is_reasonable_ltr_box(box, top, bottom)]
+        if len(boxes) > char_count:
+            boxes = self._choose_best_seven_ltr_boxes(boxes, left, right)
+
+        while len(boxes) < char_count:
+            split_idx = self._widest_splittable_box_index(work, boxes, top, bottom)
+            if split_idx is None:
+                break
+            box = boxes.pop(split_idx)
+            pieces = self._split_ltr_box_at_valley(work, box, top, bottom)
+            if len(pieces) <= 1:
+                boxes.insert(split_idx, box)
+                break
+            for piece in reversed(pieces):
+                boxes.insert(split_idx, piece)
+            boxes = sorted(boxes, key=lambda item: item[0])
+
+        if len(boxes) != char_count:
+            return []
+        return self._expand_ltr_boxes_to_gaps(boxes, left, right)
+
+    @staticmethod
+    def _is_reasonable_ltr_box(box, top, bottom):
+        x, y, w, h = box
+        band_h = bottom - top
+        if w < 7 or w > 90:
+            return False
+        if h < max(18, 0.30 * band_h):
+            return False
+        if h > 1.12 * band_h:
+            return False
+        return True
+
+    @staticmethod
+    def _choose_best_seven_ltr_boxes(boxes, left, right):
+        if len(boxes) <= 7:
+            return boxes
+        best = boxes[:7]
+        best_score = -1e9
+        for start in range(0, len(boxes) - 6):
+            candidate = boxes[start : start + 7]
+            centers = np.array([x + w / 2.0 for x, _, w, _ in candidate], dtype=np.float32)
+            gaps = np.diff(centers)
+            widths = np.array([w for _, _, w, _ in candidate], dtype=np.float32)
+            span = centers[-1] - centers[0]
+            span_target = 0.76 * max(1, right - left)
+            score = 0.0
+            score += 2.0 - min(abs(span - span_target) / 90.0, 2.0)
+            score += 1.5 - min(float(np.std(gaps)) / max(float(np.mean(gaps)), 1.0), 1.5)
+            score += 1.0 - min(float(np.std(widths)) / max(float(np.mean(widths)), 1.0), 1.0)
+            if score > best_score:
+                best_score = score
+                best = candidate
+        return best
+
+    @staticmethod
+    def _widest_splittable_box_index(work, boxes, top, bottom):
+        if not boxes:
+            return None
+        widths = [box[2] for box in boxes]
+        median_w = float(np.median(widths))
+        candidates = [idx for idx, box in enumerate(boxes) if box[2] >= max(28, 1.35 * median_w)]
+        if not candidates:
+            return None
+        return int(max(candidates, key=lambda idx: boxes[idx][2]))
+
+    @staticmethod
+    def _split_ltr_box_at_valley(work, box, top, bottom):
+        x, y, w, h = box
+        if w < 24:
+            return [box]
+        profile = (work[top:bottom, x : x + w] > 0).sum(axis=0).astype(np.float32)
+        if profile.size < 16:
+            return [box]
+        smooth = cv2.GaussianBlur(profile.reshape(1, -1), (1, 7), 0).ravel()
+        lo, hi = max(7, int(0.30 * w)), min(w - 7, int(0.70 * w))
+        if hi <= lo:
+            return [box]
+        valley = int(lo + np.argmin(smooth[lo:hi]))
+        if smooth[valley] > max(1.0, 0.62 * float(np.percentile(smooth, 75))):
+            return [box]
+        left_box = PlateSegmenter._box_from_scan_run(work, x, x + valley, top, bottom)
+        right_box = PlateSegmenter._box_from_scan_run(work, x + valley + 1, x + w, top, bottom)
+        pieces = [item for item in (left_box, right_box) if item is not None]
+        return pieces if len(pieces) == 2 else [box]
+
+    @staticmethod
+    def _expand_ltr_boxes_to_gaps(boxes, left, right):
+        boxes = [list(box) for box in sorted(boxes, key=lambda item: item[0])]
+        for idx, box in enumerate(boxes):
+            prev_end = left if idx == 0 else boxes[idx - 1][0] + boxes[idx - 1][2]
+            next_start = right if idx == len(boxes) - 1 else boxes[idx + 1][0]
+            pad_l = min(3, max(0, (box[0] - prev_end) // 3))
+            pad_r = min(3, max(0, (next_start - (box[0] + box[2])) // 3))
+            new_x = max(left, box[0] - pad_l)
+            new_end = min(right, box[0] + box[2] + pad_r)
+            box[0] = int(new_x)
+            box[2] = int(max(4, new_end - new_x))
+        return [(int(x), int(y), int(w), int(h)) for x, y, w, h in boxes]
 
     @staticmethod
     def _is_usable_char_sequence(chars):
