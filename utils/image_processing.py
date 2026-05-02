@@ -706,7 +706,7 @@ class PlateSegmenter:
             left_end = left_box[0] + left_box[2]
             right_start = right_box[0]
             expected = int(round((left_end + right_start) / 2.0))
-            local_w = max(5, int(0.10 * min(left_box[2], right_box[2])))
+            local_w = max(4, int(0.06 * min(left_box[2], right_box[2])))
             search_left = max(left_box[0] + int(0.55 * left_box[2]), expected - local_w)
             search_right = min(right_box[0] + int(0.45 * right_box[2]), expected + local_w)
             if search_right <= search_left + 2:
@@ -718,9 +718,9 @@ class PlateSegmenter:
             valley = int(search_left + np.argmin(smoothed))
             valley_value = float(np.min(smoothed))
             reference = float(np.percentile(smoothed, 75))
-            if reference <= 0 or valley_value > max(1.5, 0.52 * reference):
+            if reference <= 0 or valley_value > max(1.2, 0.38 * reference):
                 continue
-            if abs(valley - expected) > max(4, int(0.08 * min(left_box[2], right_box[2]))):
+            if abs(valley - expected) > max(3, int(0.05 * min(left_box[2], right_box[2]))):
                 continue
             min_gap = 2
             if valley <= left_box[0] + min_gap or valley >= right_box[0] + right_box[2] - min_gap:
@@ -729,7 +729,7 @@ class PlateSegmenter:
             new_right_start = valley + 1
             right_end = right_box[0] + right_box[2]
             right_new_w = max(4, right_end - new_right_start)
-            if left_new_w < 0.78 * original[idx][2] or right_new_w < 0.78 * original[idx + 1][2]:
+            if left_new_w < 0.90 * original[idx][2] or right_new_w < 0.90 * original[idx + 1][2]:
                 continue
             left_box[2] = left_new_w
             right_box[0] = new_right_start
@@ -948,9 +948,9 @@ class PlateSegmenter:
             if area < min_area and h < 0.18 * h_img:
                 continue
             if position is not None and position >= 1:
-                if y <= 0.18 * h_img and h <= 0.24 * h_img and area < 0.10 * h_img * w_img:
+                if y <= 0.07 * h_img and h <= 0.14 * h_img and area < 0.040 * h_img * w_img:
                     continue
-                if y + h >= 0.84 * h_img and h <= 0.20 * h_img and area < 0.08 * h_img * w_img:
+                if y + h >= 0.93 * h_img and h <= 0.14 * h_img and area < 0.035 * h_img * w_img:
                     continue
             if w >= 0.85 * w_img and h <= 0.10 * h_img and (y <= 2 or y + h >= h_img - 2):
                 continue
@@ -1014,12 +1014,12 @@ class PlateSegmenter:
             area = cv2.contourArea(cnt)
             touches_left = x <= max(1, int(0.025 * w_img))
             touches_right = x + w >= w_img - max(1, int(0.025 * w_img))
-            near_top = y <= 0.16 * h_img
-            near_bottom = y + h >= 0.86 * h_img
+            near_top = y <= 0.07 * h_img
+            near_bottom = y + h >= 0.93 * h_img
             small_blob = area < 0.035 * h_img * w_img and h < 0.28 * h_img and w < 0.45 * w_img
             side_line = (touches_left or touches_right) and h >= 0.52 * h_img and w <= 0.16 * w_img
             edge_speck = (touches_left or touches_right) and area < 0.020 * h_img * w_img
-            cap_line = (near_top or near_bottom) and w >= 0.38 * w_img and h <= 0.16 * h_img
+            cap_line = (near_top or near_bottom) and w >= 0.55 * w_img and h <= 0.10 * h_img
             if small_blob and (near_top or near_bottom):
                 cv2.drawContours(cleaned, [cnt], -1, 0, thickness=-1)
             elif position in {0, 6} and side_line:
@@ -1469,7 +1469,7 @@ class PlateSegmenter:
                 elif position == 6:
                     pad_x = max(1, int(0.12 * mask_w))
                 else:
-                    pad_x = max(2, int(0.18 * mask_w))
+                    pad_x = max(2, int(0.28 * mask_w))
                 pad_y = max(1, int(0.12 * mask_h))
                 x1 = max(0, int(xs.min()) - pad_x)
                 x2 = min(crop.shape[1], int(xs.max()) + pad_x + 1)
@@ -1478,6 +1478,8 @@ class PlateSegmenter:
                 # If thresholding finds only a thin fragment, keep the full slot.
                 # Cropping tightly around a broken mask is the main reason clear
                 # end-to-end characters lose strokes before Hopfield matching.
+                if position not in {0, 6}:
+                    x1, x2 = 0, crop.shape[1]
                 if mask_w >= 0.22 * crop.shape[1] and mask_h >= 0.35 * crop.shape[0]:
                     crop = crop[y1:y2, x1:x2]
                     crop_mask = mask[y1:y2, x1:x2]
@@ -1557,10 +1559,10 @@ class PlateSegmenter:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
                 elif touches_left and w <= 4 and h >= 38 and area < 0.08 * 64 * 32:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
-                elif upper_or_lower_edge and w >= 14 and h <= 7:
+                elif (y <= 2 or y + h >= 62) and w >= 22 and h <= 4:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
             else:
-                if upper_or_lower_edge and w >= 18 and h <= 6:
+                if (y <= 2 or y + h >= 62) and w >= 24 and h <= 4:
                     cv2.drawContours(remove_mask, [cnt], -1, 255, thickness=-1)
         if np.count_nonzero(remove_mask) > 0:
             cleaned[remove_mask > 0] = 0
@@ -1636,7 +1638,24 @@ class PlateSegmenter:
             if 0.035 <= float(np.mean(dilated > 0)) <= 0.78:
                 bright_support = (enhanced > max(25, background + 18.0)).astype(np.uint8) * 255
                 bright_support = cv2.morphologyEx(bright_support, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
-                support = cv2.bitwise_or(dilated, cv2.bitwise_and(bright_support, cv2.dilate(dilated, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5)))))
+                support_kernel = (9, 5) if position in {0, 6} else (15, 5)
+                support = cv2.bitwise_or(
+                    dilated,
+                    cv2.bitwise_and(bright_support, cv2.dilate(dilated, cv2.getStructuringElement(cv2.MORPH_RECT, support_kernel))),
+                )
+                if position not in {0, 6}:
+                    ys, xs = np.where(dilated > 0)
+                    if len(xs) > 0 and len(ys) > 0:
+                        h_img, w_img = enhanced.shape[:2]
+                        pad_x = max(2, int(0.22 * (xs.max() - xs.min() + 1)))
+                        pad_y = max(1, int(0.08 * (ys.max() - ys.min() + 1)))
+                        roi = np.zeros_like(support)
+                        x1 = max(0, int(xs.min()) - pad_x)
+                        x2 = min(w_img, int(xs.max()) + pad_x + 1)
+                        y1 = max(0, int(ys.min()) - pad_y)
+                        y2 = min(h_img, int(ys.max()) + pad_y + 1)
+                        roi[y1:y2, x1:x2] = 255
+                        support = cv2.bitwise_or(support, cv2.bitwise_and(bright_support, roi))
                 signal[support == 0] = 0
         else:
             background = float(np.percentile(enhanced, 45))
@@ -1662,7 +1681,7 @@ class PlateSegmenter:
                     continue
                 if position in {0, 6} and (touches_left or touches_right) and area < 0.010 * h_img * w_img:
                     continue
-                if (y <= 0.10 * h_img or y + h >= 0.90 * h_img) and w >= 0.44 * w_img and h <= 0.15 * h_img:
+                if (y <= 0.04 * h_img or y + h >= 0.96 * h_img) and w >= 0.55 * w_img and h <= 0.10 * h_img:
                     continue
                 cv2.drawContours(kept, [cnt], -1, 255, thickness=-1)
             signal[kept == 0] = 0
