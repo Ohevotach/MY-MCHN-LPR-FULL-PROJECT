@@ -18,6 +18,8 @@ from utils.metric_visuals import MetricVisualizer
 
 
 SEVERITIES = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8]
+POLLUTIONS = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
+CORE_POLLUTIONS = ["noise", "salt_pepper", "blur", "mask", "dirt", "fog"]
 METHOD_ORDER = [
     "Modern Hopfield",
     "Affine-robust Hopfield",
@@ -68,6 +70,28 @@ def order_method_results(results):
 
 def display_label(label):
     return CHINESE_LABEL_TO_PINYIN.get(str(label), str(label))
+
+
+def resolve_pollution_types(pollution_arg):
+    value = str(pollution_arg).strip()
+    if value == "all":
+        return POLLUTIONS
+    if value in {"core", "main", "plate_core"}:
+        return CORE_POLLUTIONS
+    if "," in value:
+        pollution_types = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        pollution_types = [value]
+
+    allowed = set(POLLUTIONS + ["mixed", "none"])
+    unknown = [item for item in pollution_types if item not in allowed]
+    if unknown:
+        raise ValueError(
+            f"Unsupported pollution(s): {', '.join(unknown)}. "
+            f"Use one of: all, core, mixed, none, {', '.join(POLLUTIONS)}; "
+            "or a comma-separated list such as noise,salt_pepper,blur,mask,dirt,fog."
+        )
+    return pollution_types
 
 
 class SimpleCNN(nn.Module):
@@ -1068,7 +1092,15 @@ def run_end_to_end_system(loader, device, test_dir="./data/full_cars/ccpd_weathe
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Modern Hopfield polluted license-plate character evaluation")
-    parser.add_argument("--pollution", default="all", choices=["all", "mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
+    parser.add_argument(
+        "--pollution",
+        default="all",
+        help=(
+            "Pollution to evaluate. Use 'core' for noise,salt_pepper,blur,mask,dirt,fog; "
+            "use 'all' for mask,noise,salt_pepper,blur,fog,dirt,affine; "
+            "or pass a comma-separated list."
+        ),
+    )
     parser.add_argument("--samples-per-level", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--cnn-epochs", type=int, default=5)
@@ -1160,9 +1192,8 @@ if __name__ == "__main__":
         device,
     )
 
-    pollution_types = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
-    if args.pollution != "all":
-        pollution_types = [args.pollution]
+    pollution_types = resolve_pollution_types(args.pollution)
+    print(f"Pollutions: {', '.join(pollution_types)}")
 
     all_results = {}
     balanced_results = {}
@@ -1205,7 +1236,7 @@ if __name__ == "__main__":
     if balanced_results:
         save_named_results_csv(args.output_dir, balanced_results, "balanced_robustness_all_results.csv")
         save_summary_ranking_csv(args.output_dir, balanced_results, filename="balanced_summary_method_ranking.csv")
-    if args.pollution == "all":
+    if len(pollution_types) > 1:
         plot_all_pollution_summary(visualizer, all_results)
         if balanced_results:
             plot_all_pollution_summary(visualizer, balanced_results, prefix="balanced_")
