@@ -361,6 +361,32 @@ def _is_query_variant_usable(arr):
     return True
 
 
+def _remove_tiny_foreground_components(binary, min_area=4):
+    work = (binary > 0).astype(np.uint8) * 255
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
+    if count <= 1:
+        return work
+    cleaned = np.zeros_like(work)
+    for idx in range(1, count):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        height = int(stats[idx, cv2.CC_STAT_HEIGHT])
+        if area >= min_area or height >= 8:
+            cleaned[labels == idx] = 255
+    return cleaned
+
+
+def _despeckle_char_image(arr):
+    work = _resize_char_candidate(arr)
+    median = cv2.medianBlur(work, 3)
+    _, binary = cv2.threshold(median, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binary > 0) > 0.55:
+        binary = cv2.bitwise_not(binary)
+    binary = _strip_character_frame_lines(binary)
+    binary = _remove_tiny_foreground_components(binary, min_area=5)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
+    return normalize_char_image(binary)
+
+
 def affine_char_variants(tensor):
     base = tensor.detach().cpu().view(64, 32).numpy()
     base = normalize_char_image(np.clip(base * 255, 0, 255))
@@ -388,17 +414,27 @@ def robust_char_query_variants(tensor_img):
         tensor_img = tensor_img.unsqueeze(0)
     source = np.clip(tensor_img.detach().cpu().squeeze().numpy() * 255, 0, 255).astype(np.uint8)
     source = _resize_char_candidate(source)
+    source_median = cv2.medianBlur(source, 3)
     normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
     base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
     source_clean = normalize_char_image(source)
+    source_despeckled = _despeckle_char_image(source)
     base_clean = normalize_char_image(base)
 
-    variants = [(source, False), (source_clean, False), (base, False), (base_clean, False)]
-    blurred = cv2.GaussianBlur(source, (3, 3), 0)
+    variants = [
+        (source, False),
+        (source_median, False),
+        (source_clean, False),
+        (source_despeckled, False),
+        (base, False),
+        (base_clean, False),
+    ]
+    blurred = cv2.GaussianBlur(source_median, (3, 3), 0)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(otsu > 0) > 0.55:
         otsu = cv2.bitwise_not(otsu)
     variants.append((normalize_char_image(otsu), False))
+    variants.append((_despeckle_char_image(otsu), False))
 
     for scale, offset in ((1.25, -18), (1.45, -32)):
         contrast = np.clip(source.astype(np.float32) * scale + offset, 0, 255).astype(np.uint8)
@@ -561,6 +597,25 @@ def apply_plate_position_prior(scores, position=None):
     return adjusted
 
 
+def prepare_plate_for_segmentation(img_bgr, pollution_type="none", severity=0.0):
+    if img_bgr is None:
+        return None
+    severity = float(max(0.0, min(1.0, severity)))
+    if severity <= 0.0 or pollution_type == "none":
+        return img_bgr.copy()
+    if pollution_type == "salt_pepper":
+        kernel = 5 if severity >= 0.70 else 3
+        return cv2.medianBlur(img_bgr, kernel)
+    if pollution_type == "noise":
+        denoised = cv2.medianBlur(img_bgr, 3)
+        return cv2.bilateralFilter(denoised, 5, 32, 32)
+    if pollution_type == "mixed":
+        return cv2.medianBlur(img_bgr, 3)
+    if pollution_type == "dirt" and severity >= 0.65:
+        return cv2.medianBlur(img_bgr, 3)
+    return img_bgr.copy()
+
+
 def recognize_tensor(tensor, template_mask=None, return_debug=False, position=None):
     if tensor.dim() == 2 and tensor.shape[-1] == 64 * 32:
         tensor_img = tensor.view(-1, 1, 64, 32)[0]
@@ -578,7 +633,8 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False, position=No
     # is not drowned out by harsher preprocessing variants.
     mean_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
     max_scores = torch.max(class_scores, dim=0).values
-    pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+    max_weight = 0.28 if position is not None else 0.45
+    pooled_scores = (1.0 - max_weight) * mean_scores + max_weight * max_scores
     if position is not None:
         proto_scores = torch.max(prototype_shape_scores(q), dim=0).values
         proto_scores = proto_scores.masked_fill(torch.isinf(pooled_scores), -1e9)
@@ -832,7 +888,8 @@ def run_cropped_plate_test(folder, sample_rel_path, pollution_type, severity, se
         return "\u56fe\u7247\u8bfb\u53d6\u5931\u8d25\u3002", None, None, pd.DataFrame(), [], []
 
     polluted = apply_plate_pollution(img_bgr, pollution_type, float(severity), int(seed))
-    plate_for_seg = cv2.resize(polluted, (pipeline.segmenter.PLATE_W, pipeline.segmenter.PLATE_H))
+    seg_input = prepare_plate_for_segmentation(polluted, pollution_type, float(severity))
+    plate_for_seg = cv2.resize(seg_input, (pipeline.segmenter.PLATE_W, pipeline.segmenter.PLATE_H))
     chars = pipeline.segmenter.segment_characters(plate_for_seg)
     if not chars:
         return "\u5b57\u7b26\u5206\u5272\u5931\u8d25\u3002", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), cv2.cvtColor(polluted, cv2.COLOR_BGR2RGB), pd.DataFrame(), [], []

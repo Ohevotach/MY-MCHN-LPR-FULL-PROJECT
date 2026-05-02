@@ -187,22 +187,52 @@ def is_query_variant_usable(arr):
     return True
 
 
+def remove_tiny_foreground_components(binary, min_area=4):
+    work = (binary > 0).astype(np.uint8) * 255
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
+    if count <= 1:
+        return work
+    cleaned = np.zeros_like(work)
+    for idx in range(1, count):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        height = int(stats[idx, cv2.CC_STAT_HEIGHT])
+        if area >= min_area or height >= 8:
+            cleaned[labels == idx] = 255
+    return cleaned
+
+
+def despeckle_char_image(arr):
+    work = resize_char_candidate(arr)
+    median = cv2.medianBlur(work, 3)
+    _, binary = cv2.threshold(median, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binary > 0) > 0.55:
+        binary = cv2.bitwise_not(binary)
+    binary = strip_character_frame_lines(binary)
+    binary = remove_tiny_foreground_components(binary, min_area=5)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
+    return normalize_char_image(binary)
+
+
 def robust_char_query_variants(char_img):
     source = resize_char_candidate(char_img)
+    source_median = cv2.medianBlur(source, 3)
     tensor_img = torch.tensor(cv2.resize(char_img, (32, 64)), dtype=torch.float32).view(1, 64, 32) / 255.0
     normalized = normalize_char_tensor(tensor_img, img_size=(32, 64))
     base = np.clip(normalized.detach().cpu().view(64, 32).numpy() * 255, 0, 255).astype(np.uint8)
-    blurred = cv2.GaussianBlur(source, (3, 3), 0)
+    blurred = cv2.GaussianBlur(source_median, (3, 3), 0)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(otsu > 0) > 0.55:
         otsu = cv2.bitwise_not(otsu)
 
     candidates = [
         source,
+        source_median,
         normalize_char_image(source),
+        despeckle_char_image(source),
         base,
         normalize_char_image(base),
         normalize_char_image(otsu),
+        despeckle_char_image(otsu),
         normalize_char_image(cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))),
         normalize_char_image(cv2.medianBlur(otsu, 3)),
         normalize_char_image(keep_likely_character_components(otsu)),
@@ -288,7 +318,7 @@ def recognize_char(char_img, models, loader, template_labels, masks, device, pos
         scores = ensemble_scores(models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask)
         mean_scores = torch.logsumexp(scores, dim=0) - torch.log(scores.new_tensor(float(scores.shape[0])))
         max_scores = torch.max(scores, dim=0).values
-        pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+        pooled_scores = 0.72 * mean_scores + 0.28 * max_scores
         pooled_scores = apply_position_prior(pooled_scores, loader, position=position)
         top_values, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
     top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
@@ -341,7 +371,7 @@ def recognize_plate_chars(chars, truth_len, models, loader, template_labels, mas
         scores = all_scores[start:end]
         mean_scores = torch.logsumexp(scores, dim=0) - torch.log(scores.new_tensor(float(scores.shape[0])))
         max_scores = torch.max(scores, dim=0).values
-        pooled_scores = 0.55 * mean_scores + 0.45 * max_scores
+        pooled_scores = 0.72 * mean_scores + 0.28 * max_scores
         if class_prototypes is not None:
             proto_scores = prototype_shape_scores(q_batch[start:end], class_prototypes)
             proto_scores = torch.max(proto_scores, dim=0).values
@@ -354,6 +384,25 @@ def recognize_plate_chars(chars, truth_len, models, loader, template_labels, mas
         pred_parts.append(top_labels[0])
         top3_parts.append(top_labels)
     return pred_parts, top3_parts
+
+
+def prepare_plate_for_segmentation(img_bgr, pollution="none", severity=0.0):
+    if img_bgr is None:
+        return None
+    severity = float(max(0.0, min(1.0, severity)))
+    if severity <= 0.0 or pollution == "none":
+        return img_bgr.copy()
+    if pollution == "salt_pepper":
+        kernel = 5 if severity >= 0.70 else 3
+        return cv2.medianBlur(img_bgr, kernel)
+    if pollution == "noise":
+        denoised = cv2.medianBlur(img_bgr, 3)
+        return cv2.bilateralFilter(denoised, 5, 32, 32)
+    if pollution == "mixed":
+        return cv2.medianBlur(img_bgr, 3)
+    if pollution == "dirt" and severity >= 0.65:
+        return cv2.medianBlur(img_bgr, 3)
+    return img_bgr.copy()
 
 
 def apply_position_prior(scores, loader, position):
@@ -638,7 +687,8 @@ def evaluate(args):
                 raise FileNotFoundError(image_path)
             pollution_rng = np.random.default_rng(args.seed + stable_text_seed(pollution) * 1009 + image_idx * 1000003)
             polluted = apply_plate_pollution(img, pollution, severity, pollution_rng)
-            plate = cv2.resize(polluted, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
+            seg_input = prepare_plate_for_segmentation(polluted, pollution, severity)
+            plate = cv2.resize(seg_input, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
             chars = segmenter.segment_characters(plate)
             pred_parts = []
             top3_parts = []
