@@ -1213,6 +1213,173 @@ def run_capacity_evaluation(
     return results
 
 
+def add_random_pattern_noise(patterns, flip_prob, generator):
+    noise = torch.rand(patterns.shape, generator=generator, device=patterns.device)
+    return torch.where(noise < float(flip_prob), 1.0 - patterns, patterns)
+
+
+def run_random_capacity_evaluation(
+    visualizer,
+    device,
+    feature_dim,
+    capacity_sizes,
+    query_count,
+    flip_prob,
+    seed,
+    batch_size=512,
+    classic_steps=4,
+):
+    print("\n" + "=" * 50)
+    print(f"Task 2f: random binary-pattern capacity evaluation (flip_prob={flip_prob})...")
+    if str(capacity_sizes).strip().lower() in {"auto", "default"}:
+        raw_sizes = [64, 128, int(round(0.14 * feature_dim)), 512, 1024, 2048, 4096]
+    else:
+        raw_sizes = []
+        for token in str(capacity_sizes).split(","):
+            token = token.strip().lower()
+            if not token:
+                continue
+            if token in {"classic", "0.14nf", "0.14n_f"}:
+                raw_sizes.append(int(round(0.14 * feature_dim)))
+            else:
+                raw_sizes.append(int(token))
+    resolved_sizes, classic_capacity = resolve_capacity_sizes(
+        ",".join(str(item) for item in raw_sizes),
+        max(raw_sizes),
+        feature_dim,
+    )
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed + 9101)
+
+    results = {
+        "Modern Hopfield": [],
+        "Classic Hopfield": [],
+    }
+    rows = []
+
+    for memory_size in resolved_sizes:
+        memory = torch.randint(
+            0,
+            2,
+            (int(memory_size), int(feature_dim)),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        ).float()
+        target_indices = torch.randint(
+            0,
+            int(memory_size),
+            (int(query_count),),
+            generator=generator,
+            device=device,
+            dtype=torch.long,
+        )
+        queries = add_random_pattern_noise(memory[target_indices], flip_prob=flip_prob, generator=generator)
+
+        modern_model = ModernHopfieldNetwork(
+            memory,
+            beta=10.0,
+            metric="dot",
+            normalize=True,
+            feature_mode="bipolar",
+            image_shape=(feature_dim, 1),
+        ).to(device)
+
+        modern_correct = 0
+        classic_correct = 0
+        total = 0
+        with torch.no_grad():
+            for start in range(0, int(query_count), int(batch_size)):
+                end = min(start + int(batch_size), int(query_count))
+                q = queries[start:end]
+                targets = target_indices[start:end]
+
+                _, modern_pred, modern_sim = modern_model(q, return_similarity=True)
+                modern_pred = torch.argmax(modern_sim, dim=-1)
+                modern_correct += (modern_pred == targets).sum().item()
+
+                classic_scores = fast_classic_hopfield_scores(
+                    q,
+                    memory,
+                    threshold_offset=0.0,
+                    steps=classic_steps,
+                    center_patterns=False,
+                    retrieval_weight=1.0,
+                )
+                classic_pred = torch.argmax(classic_scores, dim=-1)
+                classic_correct += (classic_pred == targets).sum().item()
+                total += targets.numel()
+
+        modern_acc = 100.0 * modern_correct / max(total, 1)
+        classic_acc = 100.0 * classic_correct / max(total, 1)
+        results["Modern Hopfield"].append(modern_acc)
+        results["Classic Hopfield"].append(classic_acc)
+        rows.extend(
+            [
+                {
+                    "capacity": memory_size,
+                    "feature_dim": feature_dim,
+                    "classic_014_nf": classic_capacity,
+                    "stored_over_feature_dim": memory_size / max(feature_dim, 1),
+                    "stored_over_classic_014_nf": memory_size / max(classic_capacity, 1),
+                    "flip_prob": flip_prob,
+                    "query_count": total,
+                    "method": "Modern Hopfield",
+                    "retrieval_accuracy": modern_acc,
+                },
+                {
+                    "capacity": memory_size,
+                    "feature_dim": feature_dim,
+                    "classic_014_nf": classic_capacity,
+                    "stored_over_feature_dim": memory_size / max(feature_dim, 1),
+                    "stored_over_classic_014_nf": memory_size / max(classic_capacity, 1),
+                    "flip_prob": flip_prob,
+                    "query_count": total,
+                    "method": "Classic Hopfield",
+                    "retrieval_accuracy": classic_acc,
+                },
+            ]
+        )
+        print(
+            f"  K={memory_size} ({memory_size / max(classic_capacity, 1):.1f}x 0.14Nf): "
+            f"Modern={modern_acc:.2f}% | Classic={classic_acc:.2f}%"
+        )
+
+    csv_path = os.path.join(visualizer.save_dir, "capacity_random_pattern_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "capacity",
+            "feature_dim",
+            "classic_014_nf",
+            "stored_over_feature_dim",
+            "stored_over_classic_014_nf",
+            "flip_prob",
+            "query_count",
+            "method",
+            "retrieval_accuracy",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    key: f"{value:.4f}" if isinstance(value, float) else value
+                    for key, value in row.items()
+                }
+            )
+
+    visualizer.plot_capacity_curve(
+        resolved_sizes,
+        results,
+        ylabel="Pattern retrieval accuracy (%)",
+        title=f"Random binary-pattern capacity (flip probability={flip_prob})",
+        filename="capacity_random_pattern_retrieval_accuracy.png",
+        classic_capacity=classic_capacity,
+    )
+    print(f"Saved random capacity CSV: {csv_path}")
+    return results
+
+
 def build_class_memory_from_tensors(memory, labels):
     vectors = []
     class_labels = []
@@ -1540,6 +1707,13 @@ def parse_args():
         default=4096,
         help="Largest K evaluated by classic Hebbian Hopfield in the capacity curve. Larger K is skipped for runtime.",
     )
+    parser.add_argument("--skip-random-capacity", action="store_true", help="Skip the random binary-pattern capacity experiment.")
+    parser.add_argument("--random-capacity-only", action="store_true", help="Run only the random binary-pattern capacity experiment.")
+    parser.add_argument("--random-capacity-sizes", default="auto")
+    parser.add_argument("--random-capacity-feature-dim", type=int, default=2048)
+    parser.add_argument("--random-capacity-query-count", type=int, default=1000)
+    parser.add_argument("--random-capacity-flip-prob", type=float, default=0.10)
+    parser.add_argument("--random-capacity-batch-size", type=int, default=512)
     parser.add_argument("--skip-e2e", action="store_true", default=True)
     parser.add_argument("--run-e2e", action="store_false", dest="skip_e2e")
     parser.add_argument(
@@ -1585,6 +1759,21 @@ if __name__ == "__main__":
 
     train_indices, test_indices = build_stratified_split(loader.labels, train_ratio=args.train_ratio, seed=args.seed)
     print(f"Held-out split: train templates={len(train_indices)}, test templates={len(test_indices)}")
+
+    if args.random_capacity_only:
+        run_random_capacity_evaluation(
+            visualizer,
+            device,
+            feature_dim=args.random_capacity_feature_dim,
+            capacity_sizes=args.random_capacity_sizes,
+            query_count=args.random_capacity_query_count,
+            flip_prob=args.random_capacity_flip_prob,
+            seed=args.seed,
+            batch_size=args.random_capacity_batch_size,
+            classic_steps=args.capacity_classic_steps,
+        )
+        print(f"\nRandom capacity experiment finished. Figures and CSV are saved in {args.output_dir}.")
+        raise SystemExit(0)
 
     if args.capacity_only:
         run_capacity_evaluation(
@@ -1726,6 +1915,19 @@ if __name__ == "__main__":
             num_workers=args.num_workers,
             classic_steps=args.capacity_classic_steps,
             classic_max_size=args.capacity_classic_max_size,
+        )
+
+    if not args.skip_random_capacity:
+        run_random_capacity_evaluation(
+            visualizer,
+            device,
+            feature_dim=args.random_capacity_feature_dim,
+            capacity_sizes=args.random_capacity_sizes,
+            query_count=args.random_capacity_query_count,
+            flip_prob=args.random_capacity_flip_prob,
+            seed=args.seed,
+            batch_size=args.random_capacity_batch_size,
+            classic_steps=args.capacity_classic_steps,
         )
 
     if not args.skip_e2e:
