@@ -20,7 +20,7 @@ if ROOT_DIR not in sys.path:
 
 from dataset.lp_dataset import TemplateLoader, normalize_char_tensor
 from main_eval import augment_hopfield_memory, build_hopfield_ensemble, fast_classic_hopfield_scores
-from utils.image_processing import PlateSegmenter
+from utils.image_processing import PlateDetector, PlateSegmenter
 
 try:
     from tqdm.auto import tqdm
@@ -281,7 +281,7 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
             if mask.dim() == 1:
                 mask = mask.unsqueeze(0)
             sim_scores = sim_scores.masked_fill(~mask, -1e9)
-        scores = fast_class_free_energy_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
+        scores = fast_class_max_similarity_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
         parts.append(torch.log_softmax(scores, dim=-1))
     return torch.logsumexp(torch.stack(parts, dim=0), dim=0) - torch.log(q.new_tensor(float(len(parts))))
 
@@ -306,7 +306,7 @@ def compute_cached_similarity(model, q):
     raise ValueError(f"Unsupported metric: {model.metric}")
 
 
-def fast_class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
+def fast_class_max_similarity_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
     scaled = beta * sim_scores
     labels = template_labels.to(device=sim_scores.device, dtype=torch.long)
     if template_mask is not None:
@@ -787,6 +787,99 @@ def save_debug_case(output_dir, debug_index, pollution, severity, plate, chars):
     return os.path.join("cropped_plate_debug", filename)
 
 
+def nms_boxes(detections, iou_threshold=0.35):
+    if not detections:
+        return []
+    remaining = sorted(detections, key=lambda item: item[0], reverse=True)
+    kept = []
+    while remaining:
+        current = remaining.pop(0)
+        kept.append(current)
+        remaining = [item for item in remaining if box_iou(current[1], item[1]) < iou_threshold]
+    return kept
+
+
+def box_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    area_a = max(1, ax2 - ax1) * max(1, ay2 - ay1)
+    area_b = max(1, bx2 - bx1) * max(1, by2 - by1)
+    return inter / float(area_a + area_b - inter)
+
+
+def postprocess_yolo_char_detections(plate_img, detections, expected_count=7):
+    h_img, w_img = plate_img.shape[:2]
+    normalized = []
+    for conf, box in detections:
+        x1, y1, x2, y2 = box
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(w_img, int(x2)), min(h_img, int(y2))
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 4 or bh <= 10:
+            continue
+        ratio = bw / max(1.0, float(bh))
+        if ratio > 1.30 or ratio < 0.05:
+            continue
+        if bh < 0.22 * h_img or bh > 0.98 * h_img:
+            continue
+        if bw > 0.28 * w_img:
+            continue
+        normalized.append((float(conf), (x1, y1, x2, y2)))
+
+    normalized = nms_boxes(normalized, iou_threshold=0.35)
+    if len(normalized) > expected_count:
+        normalized = sorted(normalized, key=lambda item: item[0], reverse=True)[:expected_count]
+    return [box for _, box in sorted(normalized, key=lambda item: (item[1][0] + item[1][2]) / 2.0)]
+
+
+def crop_chars_from_yolo_boxes(plate_img, boxes):
+    chars = []
+    ordered = sorted(boxes, key=lambda item: (item[0] + item[2]) / 2.0)
+    for idx, box in enumerate(ordered):
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        pad_x = max(2, int((0.16 if idx else 0.20) * bw))
+        pad_y = max(2, int(0.14 * bh))
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(plate_img.shape[1], x2 + pad_x)
+        y2 = min(plate_img.shape[0], y2 + pad_y)
+        if x2 - x1 < 4 or y2 - y1 < 8:
+            continue
+        crop = plate_img[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        binary = PlateSegmenter._local_character_mask(crop, gray)
+        binary = PlateSegmenter._clean_slot_character(binary, position=idx)
+        chars.append(PlateSegmenter._resize_gray_char_canvas(gray, binary, deskew=True))
+    return chars
+
+
+def segment_plate_characters(plate, segmenter, char_detector, mode, expected_count=7):
+    if mode == "opencv":
+        return segmenter.segment_characters(plate), "opencv"
+
+    if char_detector is None or not char_detector.is_ready:
+        if mode == "yolo":
+            return [], "yolo_unavailable"
+        return segmenter.segment_characters(plate), "opencv_fallback"
+
+    detections = char_detector.detect(plate)
+    boxes = postprocess_yolo_char_detections(plate, detections, expected_count=expected_count)
+    yolo_chars = crop_chars_from_yolo_boxes(plate, boxes)
+    if mode == "yolo":
+        return yolo_chars, "yolo"
+    if yolo_chars and len(yolo_chars) == expected_count:
+        return yolo_chars, "yolo"
+    return segmenter.segment_characters(plate), "opencv_fallback"
+
+
 def save_method_comparison_outputs(output_dir, method_stats, method_detail_rows):
     summary_path = os.path.join(output_dir, "cropped_plate_method_comparison.csv")
     detail_path = os.path.join(output_dir, "cropped_plate_method_char_details.csv")
@@ -942,6 +1035,16 @@ def evaluate(args):
         cache_path=os.path.join(args.output_dir, "cropped_plate_template_cache_32x64.pt"),
     )
     segmenter = PlateSegmenter()
+    char_detector = None
+    if args.char_segmentation in {"yolo", "yolo_fallback"}:
+        char_detector = PlateDetector(
+            args.char_detector_weights,
+            conf=args.char_detector_conf,
+            role="char",
+        )
+        print(f"Character segmentation mode: {args.char_segmentation} (no denoise preprocessing for YOLO input).")
+    else:
+        print("Character segmentation mode: opencv (uses existing preprocessing policy).")
     rows = read_labels(args.labels_csv)
     if args.calibration_count > 0:
         calibration_rows = rows[: args.calibration_count]
@@ -1025,9 +1128,18 @@ def evaluate(args):
                 raise FileNotFoundError(image_path)
             pollution_rng = np.random.default_rng(args.seed + stable_text_seed(pollution) * 1009 + image_idx * 1000003)
             polluted = apply_plate_pollution(img, pollution, severity, pollution_rng)
-            seg_input = prepare_plate_for_segmentation(polluted, pollution, severity)
+            if args.char_segmentation in {"yolo", "yolo_fallback"}:
+                seg_input = polluted.copy()
+            else:
+                seg_input = polluted.copy() if args.no_denoise else prepare_plate_for_segmentation(polluted, pollution, severity)
             plate = cv2.resize(seg_input, (PlateSegmenter.PLATE_W, PlateSegmenter.PLATE_H))
-            chars = segmenter.segment_characters(plate)
+            chars, segmentation_source = segment_plate_characters(
+                plate,
+                segmenter,
+                char_detector,
+                args.char_segmentation,
+                expected_count=len(truth),
+            )
             pred_parts = []
             top3_parts = []
             correct_flags = []
@@ -1065,6 +1177,7 @@ def evaluate(args):
                             "correct": int(correct),
                             "top3_hit": int(in_top3),
                             "segmented_count": len(chars),
+                            "segmentation_source": segmentation_source,
                         }
                     )
                 method_pred_text = "".join(method_preds)
@@ -1102,6 +1215,7 @@ def evaluate(args):
                         "correct": int(correct),
                         "top3_hit": int(in_top3),
                         "segmented_count": len(chars),
+                        "segmentation_source": segmentation_source,
                     }
                 )
             pred_text = "".join(pred_parts)
@@ -1148,6 +1262,7 @@ def evaluate(args):
                     "correct_by_position": "".join(correct_flags),
                     "top3_by_position_hit": "".join(top3_flags),
                     "segmented_count": len(chars),
+                    "segmentation_source": segmentation_source,
                     "char_correct": char_ok,
                     "char_total": len(truth),
                     "top3_correct": top3_ok,
@@ -1308,6 +1423,23 @@ def parse_args():
         default="none",
         choices=["none", "full"],
         help="Use full MCHN template augmentation. Default none keeps cropped-plate comparison fast and memory-light.",
+    )
+    parser.add_argument(
+        "--char-segmentation",
+        default="opencv",
+        choices=["opencv", "yolo", "yolo_fallback"],
+        help=(
+            "Character segmentation method. opencv keeps the original preprocessing and projection pipeline; "
+            "yolo runs character detection directly on polluted plates without denoising; "
+            "yolo_fallback falls back to opencv if YOLO does not return the expected number of characters."
+        ),
+    )
+    parser.add_argument("--char-detector-weights", default=None, help="Optional YOLO/ONNX character detector weights.")
+    parser.add_argument("--char-detector-conf", type=float, default=0.25)
+    parser.add_argument(
+        "--no-denoise",
+        action="store_true",
+        help="Disable denoising preprocessing for opencv segmentation too. YOLO modes already bypass denoising.",
     )
     args = parser.parse_args()
     if args.quick_compare:

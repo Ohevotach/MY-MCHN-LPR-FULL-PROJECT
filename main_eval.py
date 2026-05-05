@@ -202,7 +202,7 @@ def build_fixed_sample_sequence(candidate_indices, sample_count, seed=2026):
     return [rng.choice(indices) for _ in range(int(sample_count))]
 
 
-def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
+def class_max_similarity_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
     labels = template_labels.to(sim_scores.device)
     scaled = beta * sim_scores
     if template_mask is not None:
@@ -230,7 +230,7 @@ def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_m
     primary_sim = None
     for model in models:
         _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
-        scores = class_free_energy_scores(sim_scores, template_labels, beta=model.beta, num_classes=num_classes, template_mask=template_mask)
+        scores = class_max_similarity_scores(sim_scores, template_labels, beta=model.beta, num_classes=num_classes, template_mask=template_mask)
         log_probs = torch.log_softmax(scores, dim=-1)
         log_prob_parts.append(log_probs)
         if primary_sim is None:
@@ -1371,7 +1371,7 @@ def parse_args():
     )
     parser.add_argument("--samples-per-level", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--cnn-epochs", type=int, default=5)
+    parser.add_argument("--cnn-epochs", type=int, default=20)
     parser.add_argument("--cnn-train-samples", type=int, default=20000)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=2026)

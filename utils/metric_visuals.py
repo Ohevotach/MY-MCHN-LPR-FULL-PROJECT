@@ -237,9 +237,19 @@ class MetricVisualizer:
             plt.axvline(
                 float(classic_capacity),
                 color="#34495e",
-                linestyle=":",
+                linestyle="--",
                 linewidth=1.6,
-                label=f"0.14 Nf = {classic_capacity:.0f}",
+                label=f"K={classic_capacity:.0f} (0.14Nf)",
+            )
+            plt.text(
+                float(classic_capacity) * 1.03,
+                101.0,
+                f"K={classic_capacity:.0f}\n0.14Nf",
+                color="#34495e",
+                fontsize=9,
+                va="top",
+                ha="left",
+                bbox={"facecolor": "white", "edgecolor": "#34495e", "alpha": 0.78, "pad": 3},
             )
 
         plt.xscale("log", base=2)

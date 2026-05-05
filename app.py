@@ -158,7 +158,7 @@ def affine_memory_variants(imgs):
     return out
 
 
-def class_free_energy_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
+def class_max_similarity_scores(sim_scores, template_labels, beta, num_classes, template_mask=None):
     labels = template_labels.to(sim_scores.device)
     scaled = beta * sim_scores
     if template_mask is not None:
@@ -203,7 +203,7 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
     first_retrieved = None
     for model in models:
         retrieved, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
-        scores = class_free_energy_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
+        scores = class_max_similarity_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
         log_probs = torch.log_softmax(scores, dim=-1)
         log_prob_parts.append(log_probs)
         if first_sim is None:
