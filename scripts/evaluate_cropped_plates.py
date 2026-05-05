@@ -794,24 +794,16 @@ def save_method_comparison_outputs(output_dir, method_stats, method_detail_rows)
     for (pollution, severity, method), stat in sorted(method_stats.items()):
         images = max(int(stat["images"]), 1)
         char_total = max(int(stat["char_total"]), 1)
-        seg_images = int(stat["seg_success_images"])
-        seg_char_total = max(int(stat["seg_success_char_total"]), 1)
         summary_rows.append(
             {
                 "pollution": pollution,
                 "severity": severity,
                 "method": method,
                 "image_count": int(stat["images"]),
-                "segmentation_success": stat["seg_success"] / images,
                 "char_accuracy": stat["char_ok"] / char_total,
                 "top3_accuracy": stat["top3"] / char_total,
                 "plate_accuracy": stat["plate"] / images,
                 "mean_edit_distance": stat["edit"] / images,
-                "seg_success_image_count": seg_images,
-                "char_accuracy_when_seg_success": stat["seg_success_char_ok"] / seg_char_total if seg_images else float("nan"),
-                "top3_accuracy_when_seg_success": stat["seg_success_top3"] / seg_char_total if seg_images else float("nan"),
-                "plate_accuracy_when_seg_success": stat["seg_success_plate"] / max(seg_images, 1) if seg_images else float("nan"),
-                "mean_edit_distance_when_seg_success": stat["seg_success_edit"] / max(seg_images, 1) if seg_images else float("nan"),
             }
         )
 
@@ -821,16 +813,10 @@ def save_method_comparison_outputs(output_dir, method_stats, method_detail_rows)
             "severity",
             "method",
             "image_count",
-            "segmentation_success",
             "char_accuracy",
             "top3_accuracy",
             "plate_accuracy",
             "mean_edit_distance",
-            "seg_success_image_count",
-            "char_accuracy_when_seg_success",
-            "top3_accuracy_when_seg_success",
-            "plate_accuracy_when_seg_success",
-            "mean_edit_distance_when_seg_success",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -874,7 +860,6 @@ def plot_method_comparison(output_dir, summary_rows):
     for metric, ylabel, filename in (
         ("char_accuracy", "Character accuracy (%)", "cropped_plate_method_char_accuracy.png"),
         ("plate_accuracy", "Plate accuracy (%)", "cropped_plate_method_plate_accuracy.png"),
-        ("char_accuracy_when_seg_success", "Character accuracy when segmentation succeeds (%)", "cropped_plate_method_char_accuracy_seg_success.png"),
     ):
         x = np.arange(len(pollutions), dtype=float)
         width = 0.78 / max(1, len(methods))
@@ -973,18 +958,11 @@ def evaluate(args):
     method_stats = defaultdict(
         lambda: {
             "images": 0,
-            "seg_success": 0,
             "char_ok": 0,
             "char_total": 0,
             "top3": 0,
             "plate": 0,
             "edit": 0,
-            "seg_success_images": 0,
-            "seg_success_char_ok": 0,
-            "seg_success_char_total": 0,
-            "seg_success_top3": 0,
-            "seg_success_plate": 0,
-            "seg_success_edit": 0,
         }
     )
     debug_saved = 0
@@ -996,7 +974,7 @@ def evaluate(args):
         print("Note: pollution=none is evaluated once at severity=0.00; other pollution types keep all severity levels.")
 
     for pollution, severity in grid:
-        total_chars = correct_chars = top3_chars = plate_correct = segmentation_success = edit_sum = 0
+        total_chars = correct_chars = top3_chars = plate_correct = edit_sum = 0
         desc = f"{pollution} {severity:.2f}"
         for image_idx, item in enumerate(iter_with_progress(rows, enabled=not args.no_progress, desc=desc), start=1):
             image_path = item["image_path"]
@@ -1017,8 +995,6 @@ def evaluate(args):
             top3_flags = []
             top3_ok = 0
             char_ok = 0
-            if len(chars) == len(truth):
-                segmentation_success += 1
             comparison_outputs = {}
             for method_name in comparison_methods:
                 method_preds, method_top3 = recognize_plate_chars_with_method(
@@ -1050,25 +1026,16 @@ def evaluate(args):
                             "correct": int(correct),
                             "top3_hit": int(in_top3),
                             "segmented_count": len(chars),
-                            "segmentation_success": int(len(chars) == len(truth)),
                         }
                     )
                 method_pred_text = "".join(method_preds)
                 method_key = (pollution, f"{severity:.2f}", method_name)
                 method_stats[method_key]["images"] += 1
-                method_stats[method_key]["seg_success"] += int(len(chars) == len(truth))
                 method_stats[method_key]["char_ok"] += method_char_ok
                 method_stats[method_key]["char_total"] += len(truth)
                 method_stats[method_key]["top3"] += method_top3_ok
                 method_stats[method_key]["plate"] += int(method_pred_text == truth)
                 method_stats[method_key]["edit"] += edit_distance(method_pred_text, truth)
-                if len(chars) == len(truth):
-                    method_stats[method_key]["seg_success_images"] += 1
-                    method_stats[method_key]["seg_success_char_ok"] += method_char_ok
-                    method_stats[method_key]["seg_success_char_total"] += len(truth)
-                    method_stats[method_key]["seg_success_top3"] += method_top3_ok
-                    method_stats[method_key]["seg_success_plate"] += int(method_pred_text == truth)
-                    method_stats[method_key]["seg_success_edit"] += edit_distance(method_pred_text, truth)
 
             batch_preds, batch_top3 = comparison_outputs.get("MCHN", ([], []))
             for pos, (pred, top3) in enumerate(zip(batch_preds, batch_top3)):
@@ -1152,7 +1119,6 @@ def evaluate(args):
         image_count = len(rows)
         print(
             f"{pollution:12s} severity={severity:.2f} | "
-            f"seg={segmentation_success / image_count * 100:.2f}% | "
             f"char={correct_chars / total_chars * 100:.2f}% | "
             f"plate={plate_correct / image_count * 100:.2f}% | "
             f"top3={top3_chars / total_chars * 100:.2f}%"
@@ -1177,11 +1143,10 @@ def evaluate(args):
             writer.writeheader()
             writer.writerows(debug_detail_rows)
 
-    summary = defaultdict(lambda: {"images": 0, "seg": 0, "char_ok": 0, "char_total": 0, "top3": 0, "plate": 0, "edit": 0})
+    summary = defaultdict(lambda: {"images": 0, "char_ok": 0, "char_total": 0, "top3": 0, "plate": 0, "edit": 0})
     for row in detail_rows:
         key = (row["pollution"], row["severity"])
         summary[key]["images"] += 1
-        summary[key]["seg"] += int(row["segmented_count"] == row["char_total"])
         summary[key]["char_ok"] += int(row["char_correct"])
         summary[key]["char_total"] += int(row["char_total"])
         summary[key]["top3"] += int(row["top3_correct"])
@@ -1189,14 +1154,13 @@ def evaluate(args):
         summary[key]["edit"] += int(row["edit_distance"])
     with open(summary_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["pollution", "severity", "image_count", "segmentation_success", "char_accuracy", "top3_accuracy", "plate_accuracy", "mean_edit_distance"])
+        writer.writerow(["pollution", "severity", "image_count", "char_accuracy", "top3_accuracy", "plate_accuracy", "mean_edit_distance"])
         for (pollution, severity), stat in sorted(summary.items()):
             writer.writerow(
                 [
                     pollution,
                     severity,
                     stat["images"],
-                    f"{stat['seg'] / stat['images']:.4f}",
                     f"{stat['char_ok'] / stat['char_total']:.4f}",
                     f"{stat['top3'] / stat['char_total']:.4f}",
                     f"{stat['plate'] / stat['images']:.4f}",
