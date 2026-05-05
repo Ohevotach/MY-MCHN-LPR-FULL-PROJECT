@@ -128,14 +128,18 @@ class SimpleCNN(nn.Module):
         return self.classifier(self.features(x))
 
 
-def build_hopfield_ensemble(memory, device):
+def build_hopfield_ensemble(memory, device, beta_override=None):
+    beta_override = None if beta_override is None else float(beta_override)
+    def beta(default):
+        return default if beta_override is None else beta_override
+
     return [
-        ModernHopfieldNetwork(memory, beta=28.0, metric="dot", normalize=True, feature_mode="binary").to(device),
-        ModernHopfieldNetwork(memory, beta=32.0, metric="dot", normalize=True, feature_mode="centered").to(device),
-        ModernHopfieldNetwork(memory, beta=30.0, metric="dot", normalize=True, feature_mode="binary_centered").to(device),
-        ModernHopfieldNetwork(memory, beta=26.0, metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
-        ModernHopfieldNetwork(memory, beta=30.0, metric="dot", normalize=True, feature_mode="profile").to(device),
-        ModernHopfieldNetwork(memory, beta=2.5, metric="euclidean", normalize=False, feature_mode="profile").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(28.0), metric="dot", normalize=True, feature_mode="binary").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(32.0), metric="dot", normalize=True, feature_mode="centered").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(30.0), metric="dot", normalize=True, feature_mode="binary_centered").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(26.0), metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(30.0), metric="dot", normalize=True, feature_mode="profile").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(2.5), metric="euclidean", normalize=False, feature_mode="profile").to(device),
     ]
 
 
@@ -859,6 +863,101 @@ def run_ablation_evaluation(
     return scores
 
 
+def parse_float_list(value):
+    return [float(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def run_beta_ablation_evaluation(
+    loader,
+    visualizer,
+    device,
+    train_indices,
+    test_indices,
+    beta_values,
+    samples,
+    batch_size,
+    pollution_type="mixed",
+    severity=0.6,
+    seed=2026,
+    num_workers=0,
+):
+    print("\n" + "=" * 50)
+    print(f"Task 2e: beta ablation, pollution={pollution_type}, severity={severity}...")
+    train_memory = loader.memory_matrix[train_indices].to(device)
+    train_labels = loader.labels[train_indices].to(device)
+    aug_memory, aug_labels = augment_hopfield_memory(train_memory, train_labels)
+    num_classes = len(loader.idx_to_label)
+
+    dataset = PollutedCharDataset(
+        loader,
+        virtual_size=samples,
+        pollution_type=pollution_type,
+        severity=severity,
+        seed=seed + 2309,
+        fixed_sample_indices=build_fixed_sample_sequence(test_indices, samples, seed=seed + 2311),
+        deterministic_per_index=True,
+    )
+    test_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+        pin_memory=device.type == "cuda",
+    )
+
+    rows = []
+    results = {}
+    for beta_value in beta_values:
+        models = build_hopfield_ensemble(aug_memory, device, beta_override=beta_value)
+        method_name = f"beta={beta_value:g}"
+        scores = evaluate_methods(
+            {
+                method_name: lambda q, models=models: torch.argmax(
+                    predict_modern_hopfield_scores(models, q, aug_labels, num_classes),
+                    dim=-1,
+                )
+            },
+            test_loader,
+            device,
+        )
+        accuracy = scores[method_name]
+        results[method_name] = accuracy
+        rows.append(
+            {
+                "pollution": pollution_type,
+                "severity": severity,
+                "beta": beta_value,
+                "samples": samples,
+                "accuracy": accuracy,
+            }
+        )
+        print(f"  beta={beta_value:g}: {accuracy:.2f}%")
+
+    csv_path = os.path.join(visualizer.save_dir, "beta_ablation_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["pollution", "severity", "beta", "samples", "accuracy"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "pollution": row["pollution"],
+                    "severity": row["severity"],
+                    "beta": f"{row['beta']:.6g}",
+                    "samples": row["samples"],
+                    "accuracy": f"{row['accuracy']:.4f}",
+                }
+            )
+
+    visualizer.plot_final_severity_bar(
+        results,
+        pollution_type=f"beta_ablation_{pollution_type}",
+        severity=severity,
+        filename="beta_ablation_accuracy.png",
+    )
+    print(f"Saved beta ablation CSV: {csv_path}")
+    return results
+
+
 def resolve_capacity_sizes(capacity_arg, total_patterns, feature_dim):
     classic_capacity = max(1, int(round(0.14 * int(feature_dim))))
     if str(capacity_arg).strip().lower() in {"auto", "default"}:
@@ -1419,6 +1518,11 @@ def parse_args():
     parser.add_argument("--ablation-samples", type=int, default=1000)
     parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
     parser.add_argument("--ablation-severity", type=float, default=0.6)
+    parser.add_argument("--skip-beta-ablation", action="store_true")
+    parser.add_argument("--beta-values", default="0.1,0.5,1,2,5,10")
+    parser.add_argument("--beta-ablation-samples", type=int, default=1000)
+    parser.add_argument("--beta-ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
+    parser.add_argument("--beta-ablation-severity", type=float, default=0.6)
     parser.add_argument("--skip-capacity", action="store_true", help="Skip the real-template capacity experiment.")
     parser.add_argument("--capacity-only", action="store_true", help="Run only the capacity experiment after loading templates.")
     parser.add_argument(
@@ -1590,6 +1694,22 @@ if __name__ == "__main__":
             pollution_type=args.ablation_pollution,
             severity=args.ablation_severity,
             seed=args.seed,
+        )
+
+    if not args.skip_beta_ablation:
+        run_beta_ablation_evaluation(
+            loader,
+            visualizer,
+            device,
+            train_indices=train_indices,
+            test_indices=test_indices,
+            beta_values=parse_float_list(args.beta_values),
+            samples=args.beta_ablation_samples,
+            batch_size=args.batch_size,
+            pollution_type=args.beta_ablation_pollution,
+            severity=args.beta_ablation_severity,
+            seed=args.seed,
+            num_workers=args.num_workers,
         )
 
     if not args.skip_capacity:
