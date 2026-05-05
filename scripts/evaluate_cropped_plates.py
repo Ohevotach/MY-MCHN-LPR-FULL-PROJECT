@@ -889,6 +889,45 @@ def plot_method_comparison(output_dir, summary_rows):
         plt.close()
 
 
+def plot_mchn_pollution_severity_curve(output_dir, summary_rows):
+    if not summary_rows:
+        return None
+
+    by_pollution = defaultdict(list)
+    for row in summary_rows:
+        by_pollution[row["pollution"]].append((float(row["severity"]), float(row["char_accuracy"]) * 100.0))
+
+    plt.figure(figsize=(9.5, 6))
+    styles = ["o-", "s-", "^-", "d-", "x-", "v-", "p-", "h-"]
+    colors = ["#e74c3c", "#2c7fb8", "#27ae60", "#8e44ad", "#d35400", "#16a085", "#7f8c8d", "#c0392b"]
+    for idx, (pollution, values) in enumerate(sorted(by_pollution.items())):
+        values.sort(key=lambda item: item[0])
+        xs = [item[0] for item in values]
+        ys = [item[1] for item in values]
+        plt.plot(
+            xs,
+            ys,
+            styles[idx % len(styles)],
+            color=colors[idx % len(colors)],
+            linewidth=2.0,
+            markersize=5,
+            label=pollution,
+        )
+
+    plt.title("MCHN cropped-plate character accuracy under different pollutions")
+    plt.xlabel("Pollution severity")
+    plt.ylabel("Character accuracy (%)")
+    plt.ylim(0, 105)
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=2)
+    plt.tight_layout()
+    filename = "mchn_cropped_plate_core_severity_curve.png"
+    path = os.path.join(output_dir, filename)
+    plt.savefig(path, dpi=300)
+    plt.close()
+    return path
+
+
 def evaluate(args):
     args.output_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1127,13 +1166,23 @@ def evaluate(args):
     summary_path = os.path.join(args.output_dir, "cropped_plate_summary.csv")
     details_path = os.path.join(args.output_dir, "cropped_plate_details.csv")
     char_details_path = os.path.join(args.output_dir, "cropped_plate_char_details.csv")
+    mchn_plate_details_path = os.path.join(args.output_dir, "mchn_plate_details.csv")
+    mchn_char_details_path = os.path.join(args.output_dir, "mchn_char_details.csv")
     debug_details_path = os.path.join(args.output_dir, "cropped_plate_debug_details.csv")
     position_path = os.path.join(args.output_dir, "cropped_plate_position_accuracy.csv")
     with open(details_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(detail_rows[0].keys()))
         writer.writeheader()
         writer.writerows(detail_rows)
+    with open(mchn_plate_details_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(detail_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(detail_rows)
     with open(char_details_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(char_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(char_rows)
+    with open(mchn_char_details_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(char_rows[0].keys()))
         writer.writeheader()
         writer.writerows(char_rows)
@@ -1152,21 +1201,33 @@ def evaluate(args):
         summary[key]["top3"] += int(row["top3_correct"])
         summary[key]["plate"] += int(row["plate_correct"])
         summary[key]["edit"] += int(row["edit_distance"])
+    mchn_summary_rows = []
     with open(summary_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["pollution", "severity", "image_count", "char_accuracy", "top3_accuracy", "plate_accuracy", "mean_edit_distance"])
         for (pollution, severity), stat in sorted(summary.items()):
+            row = {
+                "pollution": pollution,
+                "severity": severity,
+                "image_count": stat["images"],
+                "char_accuracy": stat["char_ok"] / stat["char_total"],
+                "top3_accuracy": stat["top3"] / stat["char_total"],
+                "plate_accuracy": stat["plate"] / stat["images"],
+                "mean_edit_distance": stat["edit"] / stat["images"],
+            }
+            mchn_summary_rows.append(row)
             writer.writerow(
                 [
-                    pollution,
-                    severity,
-                    stat["images"],
-                    f"{stat['char_ok'] / stat['char_total']:.4f}",
-                    f"{stat['top3'] / stat['char_total']:.4f}",
-                    f"{stat['plate'] / stat['images']:.4f}",
-                    f"{stat['edit'] / stat['images']:.4f}",
+                    row["pollution"],
+                    row["severity"],
+                    row["image_count"],
+                    f"{row['char_accuracy']:.4f}",
+                    f"{row['top3_accuracy']:.4f}",
+                    f"{row['plate_accuracy']:.4f}",
+                    f"{row['mean_edit_distance']:.4f}",
                 ]
             )
+    mchn_curve_path = plot_mchn_pollution_severity_curve(args.output_dir, mchn_summary_rows)
     with open(position_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["pollution", "severity", "position", "correct", "top3_correct", "total", "accuracy", "top3_accuracy"])
@@ -1186,6 +1247,10 @@ def evaluate(args):
     print(f"Saved summary: {summary_path}")
     print(f"Saved details: {details_path}")
     print(f"Saved char details: {char_details_path}")
+    print(f"Saved MCHN plate details: {mchn_plate_details_path}")
+    print(f"Saved MCHN char details: {mchn_char_details_path}")
+    if mchn_curve_path:
+        print(f"Saved MCHN severity curve: {mchn_curve_path}")
     if debug_detail_rows:
         print(f"Saved debug details: {debug_details_path}")
     print(f"Saved position accuracy: {position_path}")
