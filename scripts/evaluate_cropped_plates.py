@@ -6,15 +6,20 @@ import sys
 from collections import defaultdict
 
 import cv2
+import matplotlib
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from dataset.lp_dataset import TemplateLoader, normalize_char_tensor
-from main_eval import augment_hopfield_memory, build_hopfield_ensemble
+from main_eval import augment_hopfield_memory, build_hopfield_ensemble, fast_classic_hopfield_scores
 from utils.image_processing import PlateSegmenter
 
 try:
@@ -60,6 +65,20 @@ def plate_position_mask(position, masks):
     if position == 1 and bool(letter_mask.any().item()):
         return letter_mask
     return plate_tail_mask if bool(plate_tail_mask.any().item()) else alnum_mask
+
+
+def plate_position_class_mask(position, loader, device):
+    mask = torch.zeros(len(loader.idx_to_label), dtype=torch.bool, device=device)
+    for class_idx, label in loader.idx_to_label.items():
+        text = str(label)
+        if position == 0:
+            allowed = is_chinese_label(text)
+        elif position == 1:
+            allowed = len(text) == 1 and "A" <= text <= "Z"
+        else:
+            allowed = (len(text) == 1 and ("A" <= text <= "Z" or text.isdigit())) and text not in {"I", "O"}
+        mask[int(class_idx)] = bool(allowed)
+    return mask
 
 
 def normalize_char_image(arr):
@@ -311,6 +330,30 @@ def fast_class_free_energy_scores(sim_scores, template_labels, beta, num_classes
         return torch.stack(scores, dim=-1)
 
 
+def max_template_scores_to_class(template_scores, template_labels, num_classes, template_mask=None):
+    scores = template_scores
+    labels = template_labels.to(device=scores.device, dtype=torch.long)
+    if template_mask is not None:
+        mask = template_mask.to(device=scores.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        scores = scores.masked_fill(~mask, -1e9)
+
+    try:
+        out = scores.new_full((scores.shape[0], num_classes), -1e9)
+        expanded_labels = labels.view(1, -1).expand(scores.shape[0], -1)
+        return out.scatter_reduce(1, expanded_labels, scores, reduce="amax", include_self=True)
+    except Exception:
+        parts = []
+        for class_idx in range(num_classes):
+            class_mask = labels == class_idx
+            if int(class_mask.sum().item()) == 0:
+                parts.append(scores.new_full((scores.shape[0],), -1e9))
+            else:
+                parts.append(torch.max(scores[:, class_mask], dim=-1).values)
+        return torch.stack(parts, dim=-1)
+
+
 def recognize_char(char_img, models, loader, template_labels, masks, device, position):
     q = robust_char_query_variants(char_img).to(device)
     template_mask = plate_position_mask(position, masks)
@@ -380,6 +423,131 @@ def recognize_plate_chars(chars, truth_len, models, loader, template_labels, mas
             pooled_scores = (1.0 - weight) * pooled_scores + weight * proto_scores
         pooled_scores = apply_position_prior(pooled_scores, loader, position=len(pred_parts))
         _, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
+        top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
+        pred_parts.append(top_labels[0])
+        top3_parts.append(top_labels)
+    return pred_parts, top3_parts
+
+
+def build_class_mean_memory(memory, labels, num_classes, device):
+    class_vectors = []
+    class_labels = []
+    labels = labels.to(dtype=torch.long)
+    for class_idx in range(num_classes):
+        mask = labels == class_idx
+        if bool(mask.any().item()):
+            class_vectors.append(memory[mask].float().mean(dim=0))
+            class_labels.append(class_idx)
+    return torch.stack(class_vectors).to(device), torch.tensor(class_labels, dtype=torch.long, device=device)
+
+
+def build_method_contexts(loader, mchn_memory, template_labels, models, masks, class_prototypes, device, classic_steps=4):
+    base_memory = loader.memory_matrix.float().to(device)
+    base_labels = loader.labels.long().to(device)
+    base_memory_norm = F.normalize(base_memory, p=2, dim=-1)
+    base_masks = build_template_masks(loader, base_labels, device)
+    classic_memory, classic_labels = build_class_mean_memory(
+        loader.memory_matrix,
+        loader.labels,
+        len(loader.idx_to_label),
+        device,
+    )
+    return {
+        "MCHN": {
+            "kind": "mchn",
+            "models": models,
+            "template_labels": template_labels,
+            "masks": masks,
+            "class_prototypes": class_prototypes,
+            "memory": mchn_memory,
+        },
+        "Classic Hopfield": {
+            "kind": "classic",
+            "memory": classic_memory,
+            "template_labels": classic_labels,
+            "classic_steps": int(classic_steps),
+        },
+        "Nearest Neighbor": {
+            "kind": "nn",
+            "memory": base_memory,
+            "memory_norm": base_memory_norm,
+            "template_labels": base_labels,
+            "masks": base_masks,
+        },
+    }
+
+
+def score_query_variants_by_method(q_batch, position, method_ctx, loader, device):
+    kind = method_ctx["kind"]
+    num_classes = len(loader.idx_to_label)
+    if kind == "mchn":
+        template_mask = torch.stack(
+            [plate_position_mask(position, method_ctx["masks"]).detach().cpu()] * q_batch.shape[0],
+            dim=0,
+        ).to(device)
+        scores = ensemble_scores(
+            method_ctx["models"],
+            q_batch,
+            method_ctx["template_labels"],
+            num_classes,
+            template_mask=template_mask,
+        )
+        if method_ctx.get("class_prototypes") is not None:
+            mean_scores = torch.logsumexp(scores, dim=0) - torch.log(scores.new_tensor(float(scores.shape[0])))
+            max_scores = torch.max(scores, dim=0).values
+            pooled = 0.72 * mean_scores + 0.28 * max_scores
+            proto_scores = prototype_shape_scores(q_batch, method_ctx["class_prototypes"])
+            proto_scores = torch.max(proto_scores, dim=0).values
+            proto_scores = proto_scores.masked_fill(torch.isinf(pooled), -1e9)
+            weight = 0.32 if position == 0 else 0.22
+            pooled = (1.0 - weight) * pooled + weight * proto_scores
+            pooled = apply_position_prior(pooled, loader, position=position)
+            return pooled
+        return torch.max(scores, dim=0).values
+
+    if kind == "nn":
+        template_mask = torch.stack(
+            [plate_position_mask(position, method_ctx["masks"]).detach().cpu()] * q_batch.shape[0],
+            dim=0,
+        ).to(device)
+        q_norm = F.normalize(q_batch.float(), p=2, dim=-1)
+        template_scores = torch.matmul(q_norm, method_ctx["memory_norm"].t())
+        class_scores = max_template_scores_to_class(
+            template_scores,
+            method_ctx["template_labels"],
+            num_classes,
+            template_mask=template_mask,
+        )
+        pooled = torch.max(class_scores, dim=0).values
+        return apply_position_prior(pooled, loader, position=position)
+
+    if kind == "classic":
+        template_scores = fast_classic_hopfield_scores(
+            q_batch,
+            method_ctx["memory"],
+            steps=method_ctx.get("classic_steps", 4),
+        )
+        class_scores = max_template_scores_to_class(
+            template_scores,
+            method_ctx["template_labels"],
+            num_classes,
+        )
+        pooled = torch.max(class_scores, dim=0).values
+        class_mask = plate_position_class_mask(position, loader, device)
+        pooled = pooled.masked_fill(~class_mask, -1e9)
+        return apply_position_prior(pooled, loader, position=position)
+
+    raise ValueError(f"Unsupported comparison method: {kind}")
+
+
+def recognize_plate_chars_with_method(chars, truth_len, method_ctx, loader, device):
+    pred_parts = []
+    top3_parts = []
+    for position, char_img in enumerate(chars[:truth_len]):
+        q = robust_char_query_variants(char_img).to(device)
+        with torch.no_grad():
+            pooled_scores = score_query_variants_by_method(q, position, method_ctx, loader, device)
+            top_values, top_indices = torch.topk(pooled_scores, k=min(3, pooled_scores.numel()))
         top_labels = [loader.idx_to_label[int(idx)] for idx in top_indices.detach().cpu().tolist()]
         pred_parts.append(top_labels[0])
         top3_parts.append(top_labels)
@@ -619,6 +787,123 @@ def save_debug_case(output_dir, debug_index, pollution, severity, plate, chars):
     return os.path.join("cropped_plate_debug", filename)
 
 
+def save_method_comparison_outputs(output_dir, method_stats, method_detail_rows):
+    summary_path = os.path.join(output_dir, "cropped_plate_method_comparison.csv")
+    detail_path = os.path.join(output_dir, "cropped_plate_method_char_details.csv")
+    summary_rows = []
+    for (pollution, severity, method), stat in sorted(method_stats.items()):
+        images = max(int(stat["images"]), 1)
+        char_total = max(int(stat["char_total"]), 1)
+        seg_images = int(stat["seg_success_images"])
+        seg_char_total = max(int(stat["seg_success_char_total"]), 1)
+        summary_rows.append(
+            {
+                "pollution": pollution,
+                "severity": severity,
+                "method": method,
+                "image_count": int(stat["images"]),
+                "segmentation_success": stat["seg_success"] / images,
+                "char_accuracy": stat["char_ok"] / char_total,
+                "top3_accuracy": stat["top3"] / char_total,
+                "plate_accuracy": stat["plate"] / images,
+                "mean_edit_distance": stat["edit"] / images,
+                "seg_success_image_count": seg_images,
+                "char_accuracy_when_seg_success": stat["seg_success_char_ok"] / seg_char_total if seg_images else float("nan"),
+                "top3_accuracy_when_seg_success": stat["seg_success_top3"] / seg_char_total if seg_images else float("nan"),
+                "plate_accuracy_when_seg_success": stat["seg_success_plate"] / max(seg_images, 1) if seg_images else float("nan"),
+                "mean_edit_distance_when_seg_success": stat["seg_success_edit"] / max(seg_images, 1) if seg_images else float("nan"),
+            }
+        )
+
+    with open(summary_path, "w", encoding="utf-8-sig", newline="") as f:
+        fieldnames = [
+            "pollution",
+            "severity",
+            "method",
+            "image_count",
+            "segmentation_success",
+            "char_accuracy",
+            "top3_accuracy",
+            "plate_accuracy",
+            "mean_edit_distance",
+            "seg_success_image_count",
+            "char_accuracy_when_seg_success",
+            "top3_accuracy_when_seg_success",
+            "plate_accuracy_when_seg_success",
+            "mean_edit_distance_when_seg_success",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in summary_rows:
+            writer.writerow(
+                {
+                    key: (
+                        f"{value:.4f}"
+                        if isinstance(value, float) and np.isfinite(value)
+                        else "nan"
+                        if isinstance(value, float)
+                        else value
+                    )
+                    for key, value in row.items()
+                }
+            )
+
+    if method_detail_rows:
+        with open(detail_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(method_detail_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(method_detail_rows)
+
+    plot_method_comparison(output_dir, summary_rows)
+    return summary_path, detail_path if method_detail_rows else None
+
+
+def plot_method_comparison(output_dir, summary_rows):
+    if not summary_rows:
+        return
+    methods = []
+    for row in summary_rows:
+        if row["method"] not in methods:
+            methods.append(row["method"])
+    pollutions = []
+    for row in summary_rows:
+        label = f"{row['pollution']} {row['severity']}"
+        if label not in pollutions:
+            pollutions.append(label)
+
+    for metric, ylabel, filename in (
+        ("char_accuracy", "Character accuracy (%)", "cropped_plate_method_char_accuracy.png"),
+        ("plate_accuracy", "Plate accuracy (%)", "cropped_plate_method_plate_accuracy.png"),
+        ("char_accuracy_when_seg_success", "Character accuracy when segmentation succeeds (%)", "cropped_plate_method_char_accuracy_seg_success.png"),
+    ):
+        x = np.arange(len(pollutions), dtype=float)
+        width = 0.78 / max(1, len(methods))
+        plt.figure(figsize=(max(9, 1.2 * len(pollutions)), 5.5))
+        for idx, method in enumerate(methods):
+            values = []
+            for pollution_label in pollutions:
+                match = next(
+                    (
+                        row
+                        for row in summary_rows
+                        if row["method"] == method and f"{row['pollution']} {row['severity']}" == pollution_label
+                    ),
+                    None,
+                )
+                value = float("nan") if match is None else float(match[metric]) * 100.0
+                values.append(value)
+            offsets = x - 0.39 + width / 2 + idx * width
+            plt.bar(offsets, values, width=width, label=method)
+        plt.ylim(0, 105)
+        plt.ylabel(ylabel)
+        plt.xticks(x, pollutions, rotation=25, ha="right")
+        plt.grid(axis="y", alpha=0.25)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, filename), dpi=300)
+        plt.close()
+
+
 def evaluate(args):
     args.output_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -650,13 +935,30 @@ def evaluate(args):
         rows = eval_rows
     if args.max_images:
         rows = rows[: args.max_images]
-    memory, template_labels = augment_hopfield_memory(loader.memory_matrix, loader.labels)
+    if args.memory_augmentation == "full":
+        memory, template_labels = augment_hopfield_memory(loader.memory_matrix, loader.labels)
+    else:
+        memory, template_labels = loader.memory_matrix, loader.labels
     memory = memory.to(device)
     template_labels = template_labels.to(device)
     models = build_hopfield_ensemble(memory, device)
     cache_model_memories(models)
     class_prototypes, _ = build_class_prototypes(memory, template_labels, len(loader.idx_to_label), device)
     masks = build_template_masks(loader, template_labels, device)
+    method_contexts = build_method_contexts(
+        loader,
+        memory,
+        template_labels,
+        models,
+        masks,
+        class_prototypes,
+        device,
+        classic_steps=args.classic_steps,
+    )
+    comparison_methods = [item.strip() for item in args.compare_methods.split(",") if item.strip()]
+    unknown_methods = [name for name in comparison_methods if name not in method_contexts]
+    if unknown_methods:
+        raise ValueError(f"Unsupported compare method(s): {', '.join(unknown_methods)}")
     if not rows:
         raise RuntimeError("No evaluation plates left after calibration/max-images filtering.")
 
@@ -665,12 +967,31 @@ def evaluate(args):
     grid = evaluation_grid(pollutions, severities)
     detail_rows = []
     char_rows = []
+    method_compare_detail_rows = []
     debug_detail_rows = []
     position_stats = defaultdict(lambda: {"correct": 0, "total": 0, "top3": 0})
+    method_stats = defaultdict(
+        lambda: {
+            "images": 0,
+            "seg_success": 0,
+            "char_ok": 0,
+            "char_total": 0,
+            "top3": 0,
+            "plate": 0,
+            "edit": 0,
+            "seg_success_images": 0,
+            "seg_success_char_ok": 0,
+            "seg_success_char_total": 0,
+            "seg_success_top3": 0,
+            "seg_success_plate": 0,
+            "seg_success_edit": 0,
+        }
+    )
     debug_saved = 0
 
     print(f"Evaluation plan: {len(rows)} plates x {len(grid)} pollution/severity settings.")
     print(f"Pollutions: {', '.join(pollutions)}")
+    print(f"Comparison methods: {', '.join(comparison_methods)}")
     if args.pollution == "all":
         print("Note: pollution=none is evaluated once at severity=0.00; other pollution types keep all severity levels.")
 
@@ -698,16 +1019,58 @@ def evaluate(args):
             char_ok = 0
             if len(chars) == len(truth):
                 segmentation_success += 1
-            batch_preds, batch_top3 = recognize_plate_chars(
-                chars,
-                len(truth),
-                models,
-                loader,
-                template_labels,
-                masks,
-                device,
-                class_prototypes=class_prototypes,
-            )
+            comparison_outputs = {}
+            for method_name in comparison_methods:
+                method_preds, method_top3 = recognize_plate_chars_with_method(
+                    chars,
+                    len(truth),
+                    method_contexts[method_name],
+                    loader,
+                    device,
+                )
+                comparison_outputs[method_name] = (method_preds, method_top3)
+
+                method_char_ok = 0
+                method_top3_ok = 0
+                for pos, (pred, top3) in enumerate(zip(method_preds, method_top3)):
+                    correct = pred == truth[pos]
+                    in_top3 = truth[pos] in top3
+                    method_char_ok += int(correct)
+                    method_top3_ok += int(in_top3)
+                    method_compare_detail_rows.append(
+                        {
+                            "pollution": pollution,
+                            "severity": f"{severity:.2f}",
+                            "method": method_name,
+                            "image_path": os.path.relpath(image_path, ROOT_DIR),
+                            "position": pos + 1,
+                            "truth": truth[pos],
+                            "pred": pred,
+                            "top3": "/".join(str(item) for item in top3),
+                            "correct": int(correct),
+                            "top3_hit": int(in_top3),
+                            "segmented_count": len(chars),
+                            "segmentation_success": int(len(chars) == len(truth)),
+                        }
+                    )
+                method_pred_text = "".join(method_preds)
+                method_key = (pollution, f"{severity:.2f}", method_name)
+                method_stats[method_key]["images"] += 1
+                method_stats[method_key]["seg_success"] += int(len(chars) == len(truth))
+                method_stats[method_key]["char_ok"] += method_char_ok
+                method_stats[method_key]["char_total"] += len(truth)
+                method_stats[method_key]["top3"] += method_top3_ok
+                method_stats[method_key]["plate"] += int(method_pred_text == truth)
+                method_stats[method_key]["edit"] += edit_distance(method_pred_text, truth)
+                if len(chars) == len(truth):
+                    method_stats[method_key]["seg_success_images"] += 1
+                    method_stats[method_key]["seg_success_char_ok"] += method_char_ok
+                    method_stats[method_key]["seg_success_char_total"] += len(truth)
+                    method_stats[method_key]["seg_success_top3"] += method_top3_ok
+                    method_stats[method_key]["seg_success_plate"] += int(method_pred_text == truth)
+                    method_stats[method_key]["seg_success_edit"] += edit_distance(method_pred_text, truth)
+
+            batch_preds, batch_top3 = comparison_outputs.get("MCHN", ([], []))
             for pos, (pred, top3) in enumerate(zip(batch_preds, batch_top3)):
                 pred_parts.append(pred)
                 top3_parts.append("/".join(str(item) for item in top3))
@@ -862,6 +1225,14 @@ def evaluate(args):
     if debug_detail_rows:
         print(f"Saved debug details: {debug_details_path}")
     print(f"Saved position accuracy: {position_path}")
+    method_summary_path, method_detail_path = save_method_comparison_outputs(
+        args.output_dir,
+        method_stats,
+        method_compare_detail_rows,
+    )
+    print(f"Saved method comparison: {method_summary_path}")
+    if method_detail_path:
+        print(f"Saved method char details: {method_detail_path}")
     if args.debug_samples > 0:
         print(f"Saved debug montages: {os.path.join(args.output_dir, 'cropped_plate_debug')}")
 
@@ -874,13 +1245,13 @@ def parse_args():
     parser.add_argument("--run-name", default="cropped_plate_eval", help="Subfolder under output-dir for cropped-plate evaluation artifacts.")
     parser.add_argument(
         "--pollution",
-        default="all",
+        default="core",
         help=(
             "Pollution to evaluate. Use 'core' for noise,salt_pepper,blur,mask,dirt,fog; "
             "use 'all' for every built-in single pollution including affine; or pass a comma-separated list."
         ),
     )
-    parser.add_argument("--severities", default="0.0,0.1,0.2,0.4,0.6,0.8")
+    parser.add_argument("--severities", default="0.6")
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument(
         "--calibration-count",
@@ -892,6 +1263,18 @@ def parse_args():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument("--debug-samples", type=int, default=10, help="Save this many failed plate segmentation/recognition montages.")
+    parser.add_argument(
+        "--compare-methods",
+        default="MCHN,Classic Hopfield,Nearest Neighbor",
+        help="Comma-separated recognition methods evaluated on the same segmented cropped plates.",
+    )
+    parser.add_argument("--classic-steps", type=int, default=4, help="Update steps for the classic Hopfield comparison baseline.")
+    parser.add_argument(
+        "--memory-augmentation",
+        default="none",
+        choices=["none", "full"],
+        help="Use full MCHN template augmentation. Default none keeps cropped-plate comparison fast and memory-light.",
+    )
     return parser.parse_args()
 
 
