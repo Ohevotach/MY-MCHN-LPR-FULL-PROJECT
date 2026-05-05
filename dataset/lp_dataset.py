@@ -63,6 +63,7 @@ class TemplateLoader:
             "zh_jing": "\u4eac",
             "zh_jin": "\u6d25",
             "zh_ji": "\u5180",
+            "zh_jl": "\u5409",
             "zh_jin1": "\u664b",
             "zh_meng": "\u8499",
             "zh_liao": "\u8fbd",
@@ -113,7 +114,7 @@ class TemplateLoader:
             self._save_cache()
 
     def _build_cache_signature(self):
-        signature = {"img_size": tuple(self.img_size), "label_map_version": 6, "roots": []}
+        signature = {"img_size": tuple(self.img_size), "label_map_version": 7, "roots": []}
         for root_dir in self.data_roots:
             root_info = {"root": os.path.abspath(root_dir), "file_count": 0, "latest_mtime": 0.0}
             if os.path.exists(root_dir):

@@ -1420,9 +1420,9 @@ def parse_args():
     )
     parser.add_argument(
         "--memory-augmentation",
-        default="none",
+        default="full",
         choices=["none", "full"],
-        help="Use full MCHN template augmentation. Default none keeps cropped-plate comparison fast and memory-light.",
+        help="Use full MCHN template augmentation. Use none for a faster memory-light exploratory run.",
     )
     parser.add_argument(
         "--char-segmentation",

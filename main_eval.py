@@ -61,6 +61,9 @@ CHINESE_LABEL_TO_PINYIN = {
     "青": "zh_qing",
     "宁": "zh_ning",
     "新": "zh_xin",
+    "zh_jl": "zh_ji1",
+    "zh_cuan": "zh_chuan",
+    "zh_sx": "zh_jin1",
 }
 
 
@@ -341,7 +344,7 @@ def predict_affine_robust_hopfield(models, q, template_labels, num_classes, vari
     return torch.where(base_conf >= 0.72, base_pred, pooled_pred)
 
 
-def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples, batch_size, seed):
+def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples, batch_size, seed, log_path=None):
     model = SimpleCNN(num_classes=num_classes).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
@@ -354,6 +357,7 @@ def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples,
         sample_indices=train_indices,
     )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=device.type == "cuda")
+    log_rows = []
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
@@ -371,7 +375,36 @@ def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples,
             correct += (torch.argmax(logits, dim=-1) == labels).sum().item()
             total += labels.size(0)
         scheduler.step()
-        print(f"  CNN epoch {epoch + 1}/{epochs}: loss={total_loss / max(total, 1):.4f}, acc={100 * correct / max(total, 1):.2f}%")
+        epoch_loss = total_loss / max(total, 1)
+        epoch_acc = 100.0 * correct / max(total, 1)
+        log_rows.append(
+            {
+                "epoch": epoch + 1,
+                "epochs": epochs,
+                "train_loss": epoch_loss,
+                "train_accuracy": epoch_acc,
+                "train_samples_seen": total,
+                "lr": optimizer.param_groups[0]["lr"],
+            }
+        )
+        print(f"  CNN epoch {epoch + 1}/{epochs}: loss={epoch_loss:.4f}, acc={epoch_acc:.2f}%")
+    if log_path:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["epoch", "epochs", "train_loss", "train_accuracy", "train_samples_seen", "lr"])
+            writer.writeheader()
+            for row in log_rows:
+                writer.writerow(
+                    {
+                        "epoch": row["epoch"],
+                        "epochs": row["epochs"],
+                        "train_loss": f"{row['train_loss']:.6f}",
+                        "train_accuracy": f"{row['train_accuracy']:.4f}",
+                        "train_samples_seen": row["train_samples_seen"],
+                        "lr": f"{row['lr']:.8f}",
+                    }
+                )
+        print(f"Saved CNN training log: {log_path}")
     return model.eval()
 
 
@@ -1477,6 +1510,7 @@ if __name__ == "__main__":
         train_samples=args.cnn_train_samples,
         batch_size=args.batch_size,
         seed=args.seed,
+        log_path=os.path.join(args.output_dir, "cnn_training_log.csv"),
     )
 
     train_memory = loader.memory_matrix[train_indices].to(device)
