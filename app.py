@@ -465,26 +465,6 @@ def robust_char_query_variants(tensor_img):
     return torch.cat(unique, dim=0)
 
 
-def source_priority_logmean(class_scores, source_weight):
-    """Average query-variant scores while favoring the original resized crop.
-
-    robust_char_query_variants keeps the raw resized crop first when it is
-    usable. End-to-end plate crops are often already readable, so this weighted
-    mean prevents aggressive thresholding/morphology variants from dominating
-    the MCHN decision.
-    """
-    variant_count = int(class_scores.shape[0])
-    if variant_count <= 1:
-        return class_scores[0]
-
-    source_mass = max(float(source_weight), 1.0 / float(variant_count))
-    source_mass = min(source_mass, 0.85)
-    rest_mass = max(1.0 - source_mass, 1e-6)
-    weights = class_scores.new_full((variant_count,), rest_mass / float(variant_count - 1))
-    weights[0] = source_mass
-    return torch.logsumexp(class_scores + torch.log(weights).unsqueeze(1), dim=0)
-
-
 def _keep_likely_character_components(binary):
     work = (binary > 0).astype(np.uint8) * 255
     contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -648,38 +628,21 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False, position=No
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
-    raw_only = os.environ.get("APP_RAW_RESIZE_ONLY", "1").lower() in {"1", "true", "yes", "on"}
-    if raw_only and class_scores.shape[0] > 0:
-        class_scores_for_pooling = class_scores[:1]
-        q_for_proto = q[:1]
-    else:
-        class_scores_for_pooling = class_scores
-        q_for_proto = q
-    # End-to-end crops are less template-like than folder samples, but the raw
-    # resized crop is often more faithful than aggressive binary/morphological
-    # variants. Give that first variant extra mass while still using the robust
-    # variant set as support.
-    default_source_weight = 0.35 if position is not None else 0.18
-    source_weight = float(os.environ.get("APP_SOURCE_VARIANT_WEIGHT", default_source_weight))
-    mean_scores = source_priority_logmean(class_scores_for_pooling, source_weight)
-    max_scores = torch.max(class_scores_for_pooling, dim=0).values
+    # End-to-end crops are less template-like than folder samples. Blend
+    # consensus with a small best-variant vote so a clean, well-normalized crop
+    # is not drowned out by harsher preprocessing variants.
+    mean_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
+    max_scores = torch.max(class_scores, dim=0).values
     max_weight = 0.28 if position is not None else 0.45
     pooled_scores = (1.0 - max_weight) * mean_scores + max_weight * max_scores
-    if not raw_only and position is not None and class_scores_for_pooling.shape[0] > 1:
-        source_direct_weight = float(os.environ.get("APP_SOURCE_DIRECT_WEIGHT", "0.12"))
-        source_direct_weight = min(max(source_direct_weight, 0.0), 0.40)
-        pooled_scores = (1.0 - source_direct_weight) * pooled_scores + source_direct_weight * class_scores_for_pooling[0]
     if position is not None:
-        proto_scores = torch.max(prototype_shape_scores(q_for_proto), dim=0).values
+        proto_scores = torch.max(prototype_shape_scores(q), dim=0).values
         proto_scores = proto_scores.masked_fill(torch.isinf(pooled_scores), -1e9)
         proto_weight = 0.30 if int(position) == 0 else 0.24
         pooled_scores = (1.0 - proto_weight) * pooled_scores + proto_weight * proto_scores
         pooled_scores = apply_plate_position_prior(pooled_scores, position=position)
     class_idx = int(torch.argmax(pooled_scores).item())
-    if raw_only:
-        variant_idx = 0
-    else:
-        variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
+    variant_idx = int(torch.argmax(class_scores[:, class_idx]).item())
     best_template_idx = select_best_template_in_class(sim_scores[variant_idx : variant_idx + 1], template_labels, class_idx)
     prob = torch.softmax(pooled_scores, dim=-1)[class_idx].item()
     best_q = q[variant_idx : variant_idx + 1]
@@ -692,7 +655,6 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False, position=No
             "matched": tensor_to_rgb_image(memory[best_template_idx].detach().cpu()),
             "variant_index": variant_idx,
             "variant_count": int(q.shape[0]),
-            "raw_resize_only": raw_only,
         }
         return class_idx, best_template_idx, prob, template_sim, recon_sim, top_text, debug
     return class_idx, best_template_idx, prob, template_sim, recon_sim, top_text
