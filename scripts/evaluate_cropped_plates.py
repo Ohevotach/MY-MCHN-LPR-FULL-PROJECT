@@ -1215,7 +1215,7 @@ def parse_args():
             "use 'all' for every built-in single pollution including affine; or pass a comma-separated list."
         ),
     )
-    parser.add_argument("--severities", default="0.6")
+    parser.add_argument("--severities", default="0.0,0.1,0.2,0.4,0.6,0.8")
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument(
         "--calibration-count",
@@ -1234,12 +1234,21 @@ def parse_args():
     )
     parser.add_argument("--classic-steps", type=int, default=4, help="Update steps for the classic Hopfield comparison baseline.")
     parser.add_argument(
+        "--quick-compare",
+        action="store_true",
+        help="Shortcut for the fast comparison experiment: core pollution at severity 0.6.",
+    )
+    parser.add_argument(
         "--memory-augmentation",
         default="none",
         choices=["none", "full"],
         help="Use full MCHN template augmentation. Default none keeps cropped-plate comparison fast and memory-light.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.quick_compare:
+        args.pollution = "core"
+        args.severities = "0.6"
+    return args
 
 
 if __name__ == "__main__":
