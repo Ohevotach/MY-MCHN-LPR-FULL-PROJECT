@@ -1218,6 +1218,18 @@ def add_random_pattern_noise(patterns, flip_prob, generator):
     return torch.where(noise < float(flip_prob), 1.0 - patterns, patterns)
 
 
+def classic_hopfield_restore_state(q, memory, steps=4):
+    patterns = memory.float() * 2.0 - 1.0
+    state = q.float() * 2.0 - 1.0
+    feature_dim = max(1, patterns.shape[1])
+    diagonal = patterns.square().sum(dim=0, keepdim=True) / float(feature_dim)
+    for _ in range(max(1, int(steps))):
+        updated = state.matmul(patterns.t()).matmul(patterns) / float(feature_dim)
+        updated = updated - state * diagonal
+        state = torch.where(updated >= 0.0, torch.ones_like(state), -torch.ones_like(state))
+    return (state > 0.0).float()
+
+
 def run_random_capacity_evaluation(
     visualizer,
     device,
@@ -1228,9 +1240,14 @@ def run_random_capacity_evaluation(
     seed,
     batch_size=512,
     classic_steps=4,
+    classic_metric="strict",
+    recovery_tolerance=0.05,
 ):
     print("\n" + "=" * 50)
-    print(f"Task 2f: random binary-pattern capacity evaluation (flip_prob={flip_prob})...")
+    print(
+        f"Task 2f: random binary-pattern capacity evaluation "
+        f"(flip_prob={flip_prob}, classic_metric={classic_metric})..."
+    )
     if str(capacity_sizes).strip().lower() in {"auto", "default"}:
         raw_sizes = [64, 128, int(round(0.14 * feature_dim)), 512, 1024, 2048, 4096]
     else:
@@ -1298,16 +1315,24 @@ def run_random_capacity_evaluation(
                 modern_pred = torch.argmax(modern_sim, dim=-1)
                 modern_correct += (modern_pred == targets).sum().item()
 
-                classic_scores = fast_classic_hopfield_scores(
-                    q,
-                    memory,
-                    threshold_offset=0.0,
-                    steps=classic_steps,
-                    center_patterns=False,
-                    retrieval_weight=1.0,
-                )
-                classic_pred = torch.argmax(classic_scores, dim=-1)
-                classic_correct += (classic_pred == targets).sum().item()
+                if classic_metric == "index":
+                    classic_scores = fast_classic_hopfield_scores(
+                        q,
+                        memory,
+                        threshold_offset=0.0,
+                        steps=classic_steps,
+                        center_patterns=False,
+                        retrieval_weight=1.0,
+                    )
+                    classic_pred = torch.argmax(classic_scores, dim=-1)
+                    classic_correct += (classic_pred == targets).sum().item()
+                elif classic_metric == "strict":
+                    restored = classic_hopfield_restore_state(q, memory, steps=classic_steps)
+                    target_patterns = memory[targets]
+                    bit_error = (restored != target_patterns).float().mean(dim=-1)
+                    classic_correct += (bit_error <= float(recovery_tolerance)).sum().item()
+                else:
+                    raise ValueError(f"Unsupported random capacity classic metric: {classic_metric}")
                 total += targets.numel()
 
         modern_acc = 100.0 * modern_correct / max(total, 1)
@@ -1323,6 +1348,8 @@ def run_random_capacity_evaluation(
                     "stored_over_feature_dim": memory_size / max(feature_dim, 1),
                     "stored_over_classic_014_nf": memory_size / max(classic_capacity, 1),
                     "flip_prob": flip_prob,
+                    "classic_metric": classic_metric,
+                    "recovery_tolerance": recovery_tolerance,
                     "query_count": total,
                     "method": "Modern Hopfield",
                     "retrieval_accuracy": modern_acc,
@@ -1334,6 +1361,8 @@ def run_random_capacity_evaluation(
                     "stored_over_feature_dim": memory_size / max(feature_dim, 1),
                     "stored_over_classic_014_nf": memory_size / max(classic_capacity, 1),
                     "flip_prob": flip_prob,
+                    "classic_metric": classic_metric,
+                    "recovery_tolerance": recovery_tolerance,
                     "query_count": total,
                     "method": "Classic Hopfield",
                     "retrieval_accuracy": classic_acc,
@@ -1354,6 +1383,8 @@ def run_random_capacity_evaluation(
             "stored_over_feature_dim",
             "stored_over_classic_014_nf",
             "flip_prob",
+            "classic_metric",
+            "recovery_tolerance",
             "query_count",
             "method",
             "retrieval_accuracy",
@@ -1709,11 +1740,30 @@ def parse_args():
     )
     parser.add_argument("--skip-random-capacity", action="store_true", help="Skip the random binary-pattern capacity experiment.")
     parser.add_argument("--random-capacity-only", action="store_true", help="Run only the random binary-pattern capacity experiment.")
-    parser.add_argument("--random-capacity-sizes", default="auto")
+    parser.add_argument(
+        "--random-capacity-sizes",
+        default="64,128,287,512,1024,2048,4096",
+        help="Stored random-pattern counts K. The default is the paper-ready main capacity curve.",
+    )
     parser.add_argument("--random-capacity-feature-dim", type=int, default=2048)
-    parser.add_argument("--random-capacity-query-count", type=int, default=1000)
+    parser.add_argument("--random-capacity-query-count", type=int, default=2000)
     parser.add_argument("--random-capacity-flip-prob", type=float, default=0.10)
     parser.add_argument("--random-capacity-batch-size", type=int, default=512)
+    parser.add_argument(
+        "--random-capacity-classic-metric",
+        default="strict",
+        choices=["strict", "index"],
+        help=(
+            "Classic Hopfield scoring for random capacity: 'strict' iteratively restores the query state "
+            "and checks bit recovery; 'index' uses the older nearest-template index match."
+        ),
+    )
+    parser.add_argument(
+        "--random-capacity-recovery-tolerance",
+        type=float,
+        default=0.05,
+        help="Allowed bit-error rate for strict classic Hopfield recovery in the random capacity experiment.",
+    )
     parser.add_argument("--skip-e2e", action="store_true", default=True)
     parser.add_argument("--run-e2e", action="store_false", dest="skip_e2e")
     parser.add_argument(
@@ -1771,6 +1821,8 @@ if __name__ == "__main__":
             seed=args.seed,
             batch_size=args.random_capacity_batch_size,
             classic_steps=args.capacity_classic_steps,
+            classic_metric=args.random_capacity_classic_metric,
+            recovery_tolerance=args.random_capacity_recovery_tolerance,
         )
         print(f"\nRandom capacity experiment finished. Figures and CSV are saved in {args.output_dir}.")
         raise SystemExit(0)
@@ -1928,6 +1980,8 @@ if __name__ == "__main__":
             seed=args.seed,
             batch_size=args.random_capacity_batch_size,
             classic_steps=args.capacity_classic_steps,
+            classic_metric=args.random_capacity_classic_metric,
+            recovery_tolerance=args.random_capacity_recovery_tolerance,
         )
 
     if not args.skip_e2e:
