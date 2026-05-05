@@ -465,6 +465,26 @@ def robust_char_query_variants(tensor_img):
     return torch.cat(unique, dim=0)
 
 
+def source_priority_logmean(class_scores, source_weight):
+    """Average query-variant scores while favoring the original resized crop.
+
+    robust_char_query_variants keeps the raw resized crop first when it is
+    usable. End-to-end plate crops are often already readable, so this weighted
+    mean prevents aggressive thresholding/morphology variants from dominating
+    the MCHN decision.
+    """
+    variant_count = int(class_scores.shape[0])
+    if variant_count <= 1:
+        return class_scores[0]
+
+    source_mass = max(float(source_weight), 1.0 / float(variant_count))
+    source_mass = min(source_mass, 0.85)
+    rest_mass = max(1.0 - source_mass, 1e-6)
+    weights = class_scores.new_full((variant_count,), rest_mass / float(variant_count - 1))
+    weights[0] = source_mass
+    return torch.logsumexp(class_scores + torch.log(weights).unsqueeze(1), dim=0)
+
+
 def _keep_likely_character_components(binary):
     work = (binary > 0).astype(np.uint8) * 255
     contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -628,13 +648,20 @@ def recognize_tensor(tensor, template_mask=None, return_debug=False, position=No
         class_scores, sim_scores, retrieved = ensemble_scores(
             mchn_models, q, template_labels, len(loader.idx_to_label), template_mask=template_mask
         )
-    # End-to-end crops are less template-like than folder samples. Blend
-    # consensus with a small best-variant vote so a clean, well-normalized crop
-    # is not drowned out by harsher preprocessing variants.
-    mean_scores = torch.logsumexp(class_scores, dim=0) - torch.log(class_scores.new_tensor(float(class_scores.shape[0])))
+    # End-to-end crops are less template-like than folder samples, but the raw
+    # resized crop is often more faithful than aggressive binary/morphological
+    # variants. Give that first variant extra mass while still using the robust
+    # variant set as support.
+    default_source_weight = 0.35 if position is not None else 0.18
+    source_weight = float(os.environ.get("APP_SOURCE_VARIANT_WEIGHT", default_source_weight))
+    mean_scores = source_priority_logmean(class_scores, source_weight)
     max_scores = torch.max(class_scores, dim=0).values
     max_weight = 0.28 if position is not None else 0.45
     pooled_scores = (1.0 - max_weight) * mean_scores + max_weight * max_scores
+    if position is not None and class_scores.shape[0] > 1:
+        source_direct_weight = float(os.environ.get("APP_SOURCE_DIRECT_WEIGHT", "0.12"))
+        source_direct_weight = min(max(source_direct_weight, 0.0), 0.40)
+        pooled_scores = (1.0 - source_direct_weight) * pooled_scores + source_direct_weight * class_scores[0]
     if position is not None:
         proto_scores = torch.max(prototype_shape_scores(q), dim=0).values
         proto_scores = proto_scores.masked_fill(torch.isinf(pooled_scores), -1e9)
