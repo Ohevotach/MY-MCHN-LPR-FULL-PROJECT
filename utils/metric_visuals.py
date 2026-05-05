@@ -213,6 +213,46 @@ class MetricVisualizer:
         plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
         plt.close()
 
+    def plot_capacity_curve(self, capacities, method_results, ylabel, title, filename, classic_capacity=None):
+        plt.figure(figsize=(9, 6))
+        styles = ["o-", "s--", "^--", "d--", "x--"]
+        colors = ["#e74c3c", "#2c7fb8", "#7f8c8d", "#27ae60", "#8e44ad"]
+
+        for i, (name, values) in enumerate(method_results.items()):
+            y = np.asarray(values, dtype=float)
+            x = np.asarray(capacities, dtype=float)
+            valid = np.isfinite(y)
+            if not np.any(valid):
+                continue
+            plt.plot(
+                x[valid],
+                y[valid],
+                styles[i % len(styles)],
+                color=self._method_color(name, colors[i % len(colors)]),
+                linewidth=self._method_linewidth(name),
+                label=name,
+            )
+
+        if classic_capacity is not None:
+            plt.axvline(
+                float(classic_capacity),
+                color="#34495e",
+                linestyle=":",
+                linewidth=1.6,
+                label=f"0.14 Nf = {classic_capacity:.0f}",
+            )
+
+        plt.xscale("log", base=2)
+        plt.xlabel("Stored real character patterns K")
+        plt.ylabel(ylabel)
+        plt.ylim(0, 105)
+        plt.title(title)
+        plt.grid(True, which="both", alpha=0.28)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
+        plt.close()
+
     def plot_confusion_matrix(self, matrix, labels, title, filename, normalize=True, max_labels=80):
         data = np.asarray(matrix, dtype=float)
         if normalize:

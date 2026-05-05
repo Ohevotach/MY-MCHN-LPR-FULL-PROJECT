@@ -826,6 +826,261 @@ def run_ablation_evaluation(
     return scores
 
 
+def resolve_capacity_sizes(capacity_arg, total_patterns, feature_dim):
+    classic_capacity = max(1, int(round(0.14 * int(feature_dim))))
+    if str(capacity_arg).strip().lower() in {"auto", "default"}:
+        raw_sizes = [64, 128, classic_capacity, 512, 1024, 2048]
+    else:
+        raw_sizes = []
+        for token in str(capacity_arg).split(","):
+            token = token.strip().lower()
+            if not token:
+                continue
+            if token in {"all", "full", "max"}:
+                raw_sizes.append(int(total_patterns))
+            elif token in {"classic", "0.14nf", "0.14n_f"}:
+                raw_sizes.append(classic_capacity)
+            else:
+                raw_sizes.append(int(token))
+
+    sizes = []
+    for size in raw_sizes:
+        clipped = max(2, min(int(size), int(total_patterns)))
+        if clipped not in sizes:
+            sizes.append(clipped)
+    sizes.sort()
+    return sizes, classic_capacity
+
+
+def ensemble_template_scores(models, q):
+    log_prob_parts = []
+    for model in models:
+        _, _, sim_scores = model(q, return_similarity=True)
+        log_prob_parts.append(torch.log_softmax(model.beta * sim_scores, dim=-1))
+    return torch.logsumexp(torch.stack(log_prob_parts, dim=0), dim=0) - torch.log(
+        q.new_tensor(float(len(log_prob_parts)))
+    )
+
+
+def fast_classic_hopfield_scores(
+    q,
+    memory,
+    threshold_offset=0.10,
+    steps=4,
+    center_patterns=True,
+    retrieval_weight=0.35,
+):
+    """Classic Hebbian Hopfield retrieval without explicitly materializing W.
+
+    The update is equivalent to state @ (P.T @ P / N) with the diagonal removed,
+    but computing it as (state @ P.T) @ P avoids building a dense 2048x2048
+    matrix for every capacity point.
+    """
+    patterns = TraditionalHopfieldNetwork._to_bipolar(
+        memory.float(),
+        threshold_offset=threshold_offset,
+        center=center_patterns,
+    ).to(q.device)
+    state = TraditionalHopfieldNetwork._to_bipolar(
+        q.float(),
+        threshold_offset=threshold_offset,
+        center=center_patterns,
+    ).to(q.device)
+    initial = state
+    feature_dim = max(1, patterns.shape[1])
+    diagonal = patterns.square().sum(dim=0, keepdim=True) / float(feature_dim)
+
+    for _ in range(max(1, int(steps))):
+        updated = state.matmul(patterns.t()).matmul(patterns) / float(feature_dim)
+        updated = updated - state * diagonal
+        state = torch.where(updated >= 0.0, torch.ones_like(state), -torch.ones_like(state))
+        if center_patterns:
+            state = state - state.mean(dim=-1, keepdim=True)
+
+    pattern_norm = F.normalize(patterns, dim=-1)
+    initial_scores = F.normalize(initial, dim=-1).matmul(pattern_norm.t())
+    restored_scores = F.normalize(state, dim=-1).matmul(pattern_norm.t())
+    return (1.0 - retrieval_weight) * initial_scores + retrieval_weight * restored_scores
+
+
+def run_capacity_evaluation(
+    loader,
+    visualizer,
+    device,
+    batch_size,
+    capacity_sizes,
+    query_count,
+    pollution_type,
+    severity,
+    seed,
+    num_workers=0,
+    classic_steps=4,
+    classic_max_size=4096,
+):
+    print("\n" + "=" * 50)
+    print(
+        "Task 2d: real-template capacity evaluation "
+        f"(pollution={pollution_type}, severity={severity})..."
+    )
+
+    total_patterns = int(loader.memory_matrix.shape[0])
+    feature_dim = int(loader.memory_matrix.shape[1])
+    resolved_sizes, classic_capacity = resolve_capacity_sizes(capacity_sizes, total_patterns, feature_dim)
+    rng = random.Random(seed + 7001)
+    shuffled_indices = list(range(total_patterns))
+    rng.shuffle(shuffled_indices)
+
+    results = {
+        "Modern Hopfield": {"class": [], "template": []},
+        "Classic Hopfield": {"class": [], "template": []},
+    }
+    rows = []
+
+    for memory_size in resolved_sizes:
+        memory_indices = shuffled_indices[:memory_size]
+        local_lookup = {global_idx: local_idx for local_idx, global_idx in enumerate(memory_indices)}
+        target_sequence = [rng.choice(memory_indices) for _ in range(max(1, int(query_count)))]
+        memory = loader.memory_matrix[memory_indices].to(device)
+        memory_labels = loader.labels[memory_indices].to(device)
+        hopfield_models = build_hopfield_ensemble(memory, device)
+
+        dataset = PollutedCharDataset(
+            loader,
+            virtual_size=len(target_sequence),
+            pollution_type=pollution_type,
+            severity=severity,
+            seed=seed + 7103 + memory_size,
+            fixed_sample_indices=target_sequence,
+            deterministic_per_index=True,
+        )
+        data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=max(0, int(num_workers)),
+            pin_memory=device.type == "cuda",
+        )
+
+        counters = {
+            "Modern Hopfield": {"class_correct": 0, "template_correct": 0},
+            "Classic Hopfield": {"class_correct": 0, "template_correct": 0},
+        }
+        total = 0
+        run_classic = int(memory_size) <= int(classic_max_size)
+
+        with torch.no_grad():
+            offset = 0
+            for q, _, labels in data_loader:
+                q = q.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                batch_targets = target_sequence[offset : offset + labels.shape[0]]
+                target_local = torch.tensor(
+                    [local_lookup[int(idx)] for idx in batch_targets],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                modern_class_scores = predict_modern_hopfield_scores(
+                    hopfield_models,
+                    q,
+                    memory_labels,
+                    len(loader.idx_to_label),
+                )
+                modern_class_pred = torch.argmax(modern_class_scores, dim=-1)
+                modern_template_pred = torch.argmax(ensemble_template_scores(hopfield_models, q), dim=-1)
+                counters["Modern Hopfield"]["class_correct"] += (modern_class_pred == labels).sum().item()
+                counters["Modern Hopfield"]["template_correct"] += (modern_template_pred == target_local).sum().item()
+
+                if run_classic:
+                    classic_scores = fast_classic_hopfield_scores(q, memory, steps=classic_steps)
+                    classic_template_pred = torch.argmax(classic_scores, dim=-1)
+                    classic_class_pred = memory_labels[classic_template_pred]
+                    counters["Classic Hopfield"]["class_correct"] += (classic_class_pred == labels).sum().item()
+                    counters["Classic Hopfield"]["template_correct"] += (classic_template_pred == target_local).sum().item()
+
+                total += labels.shape[0]
+                offset += labels.shape[0]
+
+        print(f"  K={memory_size} ({memory_size / max(classic_capacity, 1):.1f}x 0.14Nf):", end="")
+        for method_name in ("Modern Hopfield", "Classic Hopfield"):
+            if method_name == "Classic Hopfield" and not run_classic:
+                class_acc = float("nan")
+                template_acc = float("nan")
+                print(f" {method_name}=skipped(K>{classic_max_size})", end="")
+            else:
+                class_acc = 100.0 * counters[method_name]["class_correct"] / max(total, 1)
+                template_acc = 100.0 * counters[method_name]["template_correct"] / max(total, 1)
+                print(f" {method_name}: class={class_acc:.2f}%, template={template_acc:.2f}%", end="")
+            results[method_name]["class"].append(class_acc)
+            results[method_name]["template"].append(template_acc)
+            rows.append(
+                {
+                    "capacity": memory_size,
+                    "feature_dim": feature_dim,
+                    "classic_014_nf": classic_capacity,
+                    "stored_over_feature_dim": memory_size / max(feature_dim, 1),
+                    "stored_over_classic_014_nf": memory_size / max(classic_capacity, 1),
+                    "pollution": pollution_type,
+                    "severity": severity,
+                    "query_count": total,
+                    "method": method_name,
+                    "class_accuracy": class_acc,
+                    "template_accuracy": template_acc,
+                }
+            )
+        print()
+
+    csv_path = os.path.join(visualizer.save_dir, "capacity_real_template_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "capacity",
+            "feature_dim",
+            "classic_014_nf",
+            "stored_over_feature_dim",
+            "stored_over_classic_014_nf",
+            "pollution",
+            "severity",
+            "query_count",
+            "method",
+            "class_accuracy",
+            "template_accuracy",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    key: (
+                        f"{value:.4f}"
+                        if isinstance(value, float) and np.isfinite(value)
+                        else "nan"
+                        if isinstance(value, float)
+                        else value
+                    )
+                    for key, value in row.items()
+                }
+            )
+
+    visualizer.plot_capacity_curve(
+        resolved_sizes,
+        {name: values["class"] for name, values in results.items()},
+        ylabel="Class accuracy (%)",
+        title=f"Capacity curve on real character memories ({pollution_type}, severity={severity})",
+        filename="capacity_real_template_class_accuracy.png",
+        classic_capacity=classic_capacity,
+    )
+    visualizer.plot_capacity_curve(
+        resolved_sizes,
+        {name: values["template"] for name, values in results.items()},
+        ylabel="Template retrieval accuracy (%)",
+        title=f"Template retrieval capacity ({pollution_type}, severity={severity})",
+        filename="capacity_real_template_retrieval_accuracy.png",
+        classic_capacity=classic_capacity,
+    )
+    print(f"Saved capacity CSV: {csv_path}")
+    return results
+
+
 def build_class_memory_from_tensors(memory, labels):
     vectors = []
     class_labels = []
@@ -1131,6 +1386,23 @@ def parse_args():
     parser.add_argument("--ablation-samples", type=int, default=1000)
     parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
     parser.add_argument("--ablation-severity", type=float, default=0.6)
+    parser.add_argument("--skip-capacity", action="store_true", help="Skip the real-template capacity experiment.")
+    parser.add_argument("--capacity-only", action="store_true", help="Run only the capacity experiment after loading templates.")
+    parser.add_argument(
+        "--capacity-sizes",
+        default="auto",
+        help="Comma-separated memory sizes for the capacity curve. Use auto, all, or classic for 0.14Nf.",
+    )
+    parser.add_argument("--capacity-query-count", type=int, default=256)
+    parser.add_argument("--capacity-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
+    parser.add_argument("--capacity-severity", type=float, default=0.5)
+    parser.add_argument("--capacity-classic-steps", type=int, default=4)
+    parser.add_argument(
+        "--capacity-classic-max-size",
+        type=int,
+        default=4096,
+        help="Largest K evaluated by classic Hebbian Hopfield in the capacity curve. Larger K is skipped for runtime.",
+    )
     parser.add_argument("--skip-e2e", action="store_true", default=True)
     parser.add_argument("--run-e2e", action="store_false", dest="skip_e2e")
     parser.add_argument(
@@ -1176,6 +1448,24 @@ if __name__ == "__main__":
 
     train_indices, test_indices = build_stratified_split(loader.labels, train_ratio=args.train_ratio, seed=args.seed)
     print(f"Held-out split: train templates={len(train_indices)}, test templates={len(test_indices)}")
+
+    if args.capacity_only:
+        run_capacity_evaluation(
+            loader,
+            visualizer,
+            device,
+            batch_size=args.batch_size,
+            capacity_sizes=args.capacity_sizes,
+            query_count=args.capacity_query_count,
+            pollution_type=args.capacity_pollution,
+            severity=args.capacity_severity,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            classic_steps=args.capacity_classic_steps,
+            classic_max_size=args.capacity_classic_max_size,
+        )
+        print(f"\nCapacity experiment finished. Figures and CSV are saved in {args.output_dir}.")
+        raise SystemExit(0)
 
     print("\nTraining CNN baseline on polluted training templates...")
     cnn = train_cnn(
@@ -1266,6 +1556,22 @@ if __name__ == "__main__":
             pollution_type=args.ablation_pollution,
             severity=args.ablation_severity,
             seed=args.seed,
+        )
+
+    if not args.skip_capacity:
+        run_capacity_evaluation(
+            loader,
+            visualizer,
+            device,
+            batch_size=args.batch_size,
+            capacity_sizes=args.capacity_sizes,
+            query_count=args.capacity_query_count,
+            pollution_type=args.capacity_pollution,
+            severity=args.capacity_severity,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            classic_steps=args.capacity_classic_steps,
+            classic_max_size=args.capacity_classic_max_size,
         )
 
     if not args.skip_e2e:
