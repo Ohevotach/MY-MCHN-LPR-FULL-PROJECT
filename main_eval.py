@@ -1535,12 +1535,18 @@ def run_ablation_evaluation(
     severity=0.6,
     seed=2026,
     num_workers=0,
+    optimized_aug_per_class=16,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2b: ablation study, pollution={pollution_type}, severities={SEVERITIES}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    aug_memory, aug_labels = build_balanced_medium_aug_memory(train_memory, train_labels, seed=seed + 1901)
+    aug_memory, aug_labels = build_balanced_medium_aug_memory(
+        train_memory,
+        train_labels,
+        max_per_class=optimized_aug_per_class,
+        seed=seed + 1901,
+    )
     num_classes = len(loader.idx_to_label)
 
     feature_ablations = {
@@ -1766,12 +1772,18 @@ def run_beta_ablation_evaluation(
     severity=0.6,
     seed=2026,
     num_workers=0,
+    optimized_aug_per_class=16,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2e: beta ablation, pollution={pollution_type}, severities={SEVERITIES}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    aug_memory, aug_labels = build_balanced_medium_aug_memory(train_memory, train_labels, seed=seed + 2903)
+    aug_memory, aug_labels = build_balanced_medium_aug_memory(
+        train_memory,
+        train_labels,
+        max_per_class=optimized_aug_per_class,
+        seed=seed + 2903,
+    )
     num_classes = len(loader.idx_to_label)
 
     rows = []
@@ -3024,6 +3036,7 @@ if __name__ == "__main__":
             severity=args.beta_ablation_severity,
             seed=args.seed,
             num_workers=args.num_workers,
+            optimized_aug_per_class=args.optimized_aug_per_class,
         )
 
     if not args.skip_attention_errors:
