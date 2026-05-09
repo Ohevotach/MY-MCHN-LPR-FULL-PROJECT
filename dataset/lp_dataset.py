@@ -306,27 +306,28 @@ class PollutedCharDataset(Dataset):
 
     def _apply_one(self, img, pollution, severity, rng=None, torch_generator=None):
         rng = rng or self.rng
-        if pollution == "none":
+        if pollution == "none" or severity <= 0.0:
             return img
         if pollution == "mask":
             return self._random_mask(img, severity, rng=rng)
         if pollution == "noise":
-            sigma = 0.03 + 0.30 * severity
+            sigma = 0.30 * severity
             noise = torch.randn(img.shape, dtype=img.dtype, device=img.device, generator=torch_generator)
             return img + noise * sigma
         if pollution == "salt_pepper":
-            prob = 0.01 + 0.22 * severity
+            prob = 0.22 * severity
             rnd = torch.rand(img.shape, dtype=img.dtype, device=img.device, generator=torch_generator)
             out = img.clone()
             out[rnd < prob / 2] = 0.0
             out[(rnd >= prob / 2) & (rnd < prob)] = 1.0
             return out
         if pollution == "blur":
-            kernel = int(3 + 6 * severity)
+            kernel = int(1 + 8 * severity)
+            kernel = max(3, kernel)
             kernel = kernel + 1 if kernel % 2 == 0 else kernel
             return TF.gaussian_blur(img, kernel_size=[kernel, kernel])
         if pollution == "fog":
-            fog = 0.15 + 0.45 * severity
+            fog = 0.60 * severity
             return img * (1.0 - fog) + fog
         if pollution == "dirt":
             return self._random_dirt(img, severity, rng=rng)
@@ -344,7 +345,7 @@ class PollutedCharDataset(Dataset):
     def _random_mask(self, img, severity, rng=None):
         rng = rng or self.rng
         out = img.clone()
-        block_count = 1 + int(3 * severity)
+        block_count = max(1, int(round(4 * severity)))
         for _ in range(block_count):
             max_h = max(2, int(self.img_h * (0.10 + 0.28 * severity)))
             max_w = max(2, int(self.img_w * (0.10 + 0.35 * severity)))
@@ -363,7 +364,7 @@ class PollutedCharDataset(Dataset):
             torch.arange(self.img_w, dtype=torch.float32),
             indexing="ij",
         )
-        spot_count = 1 + int(4 * severity)
+        spot_count = max(1, int(round(5 * severity)))
         for _ in range(spot_count):
             cx = rng.uniform(0, self.img_w - 1)
             cy = rng.uniform(0, self.img_h - 1)
@@ -418,26 +419,27 @@ class CharPolluter:
         return self._apply_one(img.clone(), pollution_type, severity).clamp(0.0, 1.0)
 
     def _apply_one(self, img, pollution, severity):
-        if pollution == "none":
+        if pollution == "none" or severity <= 0.0:
             return img
         if pollution == "mask":
             return self._random_mask(img, severity)
         if pollution == "noise":
-            sigma = 0.03 + 0.30 * severity
+            sigma = 0.30 * severity
             return img + torch.randn_like(img) * sigma
         if pollution == "salt_pepper":
-            prob = 0.01 + 0.22 * severity
+            prob = 0.22 * severity
             rnd = torch.rand_like(img)
             out = img.clone()
             out[rnd < prob / 2] = 0.0
             out[(rnd >= prob / 2) & (rnd < prob)] = 1.0
             return out
         if pollution == "blur":
-            kernel = int(3 + 6 * severity)
+            kernel = int(1 + 8 * severity)
+            kernel = max(3, kernel)
             kernel = kernel + 1 if kernel % 2 == 0 else kernel
             return TF.gaussian_blur(img, kernel_size=[kernel, kernel])
         if pollution == "fog":
-            fog = 0.15 + 0.45 * severity
+            fog = 0.60 * severity
             return img * (1.0 - fog) + fog
         if pollution == "dirt":
             return self._random_dirt(img, severity)
@@ -454,7 +456,7 @@ class CharPolluter:
 
     def _random_mask(self, img, severity):
         out = img.clone()
-        block_count = 1 + int(3 * severity)
+        block_count = max(1, int(round(4 * severity)))
         for _ in range(block_count):
             max_h = max(2, int(self.img_h * (0.10 + 0.28 * severity)))
             max_w = max(2, int(self.img_w * (0.10 + 0.35 * severity)))
@@ -472,7 +474,7 @@ class CharPolluter:
             torch.arange(self.img_w, dtype=torch.float32),
             indexing="ij",
         )
-        spot_count = 1 + int(4 * severity)
+        spot_count = max(1, int(round(5 * severity)))
         for _ in range(spot_count):
             cx = self.rng.uniform(0, self.img_w - 1)
             cy = self.rng.uniform(0, self.img_h - 1)

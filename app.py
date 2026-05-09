@@ -733,7 +733,7 @@ def apply_plate_pollution(img_bgr, pollution_type, severity, seed):
     out = img_bgr.copy()
     h, w = out.shape[:2]
     if pollution_type == "mask":
-        for _ in range(1 + int(3 * severity)):
+        for _ in range(max(1, int(round(4 * severity)))):
             bw = rng_int(rng, max(6, int(w * 0.06)), max(8, int(w * (0.12 + 0.18 * severity))))
             bh = rng_int(rng, max(5, int(h * 0.10)), max(6, int(h * (0.18 + 0.22 * severity))))
             x = rng_int(rng, 0, max(0, w - bw))
@@ -742,25 +742,26 @@ def apply_plate_pollution(img_bgr, pollution_type, severity, seed):
             cv2.rectangle(out, (x, y), (x + bw, y + bh), color, thickness=-1)
         return out
     if pollution_type == "noise":
-        sigma = 8 + 55 * severity
+        sigma = 63 * severity
         noise = rng.normal(0, sigma, out.shape).astype(np.float32)
         return np.clip(out.astype(np.float32) + noise, 0, 255).astype(np.uint8)
     if pollution_type == "salt_pepper":
-        prob = 0.005 + 0.12 * severity
+        prob = 0.125 * severity
         mask = rng.random(out.shape[:2])
         out[mask < prob / 2] = 0
         out[(mask >= prob / 2) & (mask < prob)] = 255
         return out
     if pollution_type == "blur":
-        kernel = int(3 + 10 * severity)
+        kernel = int(1 + 12 * severity)
+        kernel = max(3, kernel)
         kernel = kernel + 1 if kernel % 2 == 0 else kernel
         return cv2.GaussianBlur(out, (kernel, kernel), 0)
     if pollution_type == "fog":
         fog = np.full_like(out, 255)
-        alpha = 0.12 + 0.55 * severity
+        alpha = 0.67 * severity
         return cv2.addWeighted(out, 1.0 - alpha, fog, alpha, 0)
     if pollution_type == "dirt":
-        for _ in range(1 + int(5 * severity)):
+        for _ in range(max(1, int(round(6 * severity)))):
             radius = rng_int(rng, max(3, int(h * 0.04)), max(4, int(h * (0.08 + 0.15 * severity))))
             x = rng_int(rng, 0, max(0, w - 1))
             y = rng_int(rng, 0, max(0, h - 1))
