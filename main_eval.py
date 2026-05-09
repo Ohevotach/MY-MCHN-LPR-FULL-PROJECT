@@ -338,12 +338,35 @@ def build_group_duplicate_split(
     exact_hashes = [template_exact_hash(memory[i]) for i in range(num_templates)]
     uf = UnionFind(num_templates)
     exact_duplicate_rows = []
+    exact_label_conflict_rows = []
     near_rows_ge0999 = []
     near_rows_ge099 = []
 
     indices_by_class = defaultdict(list)
     for idx, class_id in enumerate(labels_list):
         indices_by_class[class_id].append(idx)
+
+    global_by_hash = defaultdict(list)
+    for idx, md5_value in enumerate(exact_hashes):
+        global_by_hash[md5_value].append(idx)
+    for md5_value, dup_indices in global_by_hash.items():
+        if len(dup_indices) <= 1:
+            continue
+        first = dup_indices[0]
+        for idx in dup_indices[1:]:
+            uf.union(first, idx)
+        conflict_labels = sorted(set(labels_list[i] for i in dup_indices))
+        if len(conflict_labels) > 1:
+            exact_label_conflict_rows.append(
+                {
+                    "md5": md5_value,
+                    "count": len(dup_indices),
+                    "labels": " ".join(display_label(loader.idx_to_label[class_id]) for class_id in conflict_labels),
+                    "class_ids": " ".join(str(class_id) for class_id in conflict_labels),
+                    "indices": " ".join(str(i) for i in dup_indices),
+                    "paths": " | ".join(paths[i] for i in dup_indices),
+                }
+            )
 
     for class_id in sorted(indices_by_class):
         class_indices = indices_by_class[class_id]
@@ -407,14 +430,13 @@ def build_group_duplicate_split(
     group_label = {}
     for group_num, members in enumerate(sorted_components):
         group_id = f"g{group_num:05d}"
-        member_labels = sorted(set(labels_list[i] for i in members))
-        if len(member_labels) != 1:
-            raise RuntimeError(
-                f"Near-duplicate group {group_id} contains multiple labels: {member_labels}. "
-                "Inspect preprocessing or labels before evaluation."
-            )
+        member_label_counts = defaultdict(int)
+        for idx in members:
+            member_label_counts[labels_list[idx]] += 1
+        member_labels = sorted(member_label_counts)
+        primary_label = max(member_labels, key=lambda class_id: (member_label_counts[class_id], -class_id))
         group_members[group_id] = members
-        group_label[group_id] = member_labels[0]
+        group_label[group_id] = primary_label
         for idx in members:
             group_id_by_index[idx] = group_id
 
@@ -471,10 +493,13 @@ def build_group_duplicate_split(
         members = group_members[group_id]
         hashes = [exact_hashes[i] for i in members]
         class_id = group_label[group_id]
+        member_label_ids = sorted(set(labels_list[i] for i in members))
         duplicate_check_rows.append(
             {
                 "group_id": group_id,
                 "label": display_label(loader.idx_to_label[class_id]),
+                "member_labels": " ".join(display_label(loader.idx_to_label[label_id]) for label_id in member_label_ids),
+                "member_class_ids": " ".join(str(label_id) for label_id in member_label_ids),
                 "class_id": class_id,
                 "split": group_split[group_id],
                 "group_size": len(members),
@@ -496,6 +521,8 @@ def build_group_duplicate_split(
         [
             "group_id",
             "label",
+            "member_labels",
+            "member_class_ids",
             "class_id",
             "split",
             "group_size",
@@ -521,6 +548,11 @@ def build_group_duplicate_split(
     ]
     write_csv_rows(os.path.join(output_dir, "near_duplicate_pairs_ge0999.csv"), pair_fields, near_rows_ge0999)
     write_csv_rows(os.path.join(output_dir, "near_duplicate_pairs_ge099.csv"), pair_fields, near_rows_ge099)
+    write_csv_rows(
+        os.path.join(output_dir, "group_exact_hash_label_conflicts.csv"),
+        ["md5", "count", "labels", "class_ids", "indices", "paths"],
+        exact_label_conflict_rows,
+    )
 
     group_ids_train = {group_id_by_index[idx] for idx in train_indices}
     group_ids_test = {group_id_by_index[idx] for idx in test_indices}
@@ -552,6 +584,7 @@ def build_group_duplicate_split(
         f"templates={num_templates}, groups={len(group_members)}, "
         f"train templates={len(train_indices)}, test templates={len(test_indices)}, "
         f"exact duplicate groups={sum(int(row['exact_duplicate']) for row in duplicate_check_rows)}, "
+        f"cross-label exact hash conflicts={len(exact_label_conflict_rows)}, "
         f"near pairs >= {group_threshold:g}: {len(near_rows_ge0999)}, "
         f"inspection pairs >= {inspect_threshold:g}: {len(near_rows_ge099)}."
     )
