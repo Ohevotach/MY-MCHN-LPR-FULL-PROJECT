@@ -201,6 +201,13 @@ def build_stratified_split(labels, train_ratio=0.7, seed=2026):
     return train_indices, test_indices
 
 
+def assert_disjoint_splits(train_indices, test_indices):
+    overlap = set(int(idx) for idx in train_indices) & set(int(idx) for idx in test_indices)
+    if overlap:
+        examples = ", ".join(str(idx) for idx in sorted(overlap)[:10])
+        raise RuntimeError(f"Train/test split leakage detected: {len(overlap)} overlapping indices, e.g. {examples}.")
+
+
 def build_fixed_sample_sequence(candidate_indices, sample_count, seed=2026):
     indices = list(candidate_indices)
     if not indices:
@@ -391,11 +398,12 @@ def train_cnn(loader, train_indices, num_classes, device, epochs, train_samples,
     model = SimpleCNN(num_classes=num_classes).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    print("CNN training protocol: clean train split only (pollution_type=none, severity=0.0).")
     train_dataset = PollutedCharDataset(
         loader,
         virtual_size=train_samples,
-        pollution_type="mixed",
-        severity=(0.0, 0.6),
+        pollution_type="none",
+        severity=0.0,
         seed=seed,
         sample_indices=train_indices,
     )
@@ -546,6 +554,113 @@ def build_confusion_matrix(labels, preds, num_classes):
     return matrix.numpy()
 
 
+def save_evaluation_input_debug(
+    loader,
+    output_dir,
+    test_indices,
+    pollution_type,
+    severity,
+    sample_count,
+    seed,
+):
+    """Save a small held-out batch proving every method receives polluted q.
+
+    This diagnostic intentionally mirrors run_robustness_evaluation: samples are
+    drawn only from test_indices, pollution is deterministic per index, and the
+    returned q tensor is the exact tensor passed to every method in evaluation.
+    """
+    debug_dir = os.path.join(output_dir, "debug_eval_inputs", f"{pollution_type}_severity_{float(severity):.1f}")
+    os.makedirs(debug_dir, exist_ok=True)
+    fixed_indices = build_fixed_sample_sequence(test_indices, sample_count, seed=seed + 9401)
+    dataset = PollutedCharDataset(
+        loader,
+        virtual_size=len(fixed_indices),
+        pollution_type=pollution_type,
+        severity=severity,
+        seed=seed + 9403,
+        fixed_sample_indices=fixed_indices,
+        deterministic_per_index=True,
+    )
+
+    rows = []
+    for local_idx in range(len(dataset)):
+        polluted, clean, label = dataset[local_idx]
+        clean_img = clean.view(loader.img_size[1], loader.img_size[0]).detach().cpu()
+        polluted_img = polluted.view(loader.img_size[1], loader.img_size[0]).detach().cpu()
+        diff = (polluted_img - clean_img).abs()
+        target_idx = int(fixed_indices[local_idx])
+        label_name = display_label(loader.idx_to_label[int(label)])
+
+        clean_u8 = np.clip(clean_img.numpy() * 255.0, 0, 255).astype(np.uint8)
+        polluted_u8 = np.clip(polluted_img.numpy() * 255.0, 0, 255).astype(np.uint8)
+        diff_u8 = np.clip(diff.numpy() * 255.0, 0, 255).astype(np.uint8)
+        stem = f"{local_idx:03d}_idx{target_idx}_{label_name}"
+        cv2.imwrite(os.path.join(debug_dir, f"{stem}_clean.png"), clean_u8)
+        cv2.imwrite(os.path.join(debug_dir, f"{stem}_polluted.png"), polluted_u8)
+        cv2.imwrite(os.path.join(debug_dir, f"{stem}_diff.png"), diff_u8)
+
+        rows.append(
+            {
+                "local_idx": local_idx,
+                "template_index": target_idx,
+                "label": label_name,
+                "pollution": pollution_type,
+                "severity": float(severity),
+                "clean_mean": float(clean_img.mean().item()),
+                "polluted_mean": float(polluted_img.mean().item()),
+                "clean_std": float(clean_img.std().item()),
+                "polluted_std": float(polluted_img.std().item()),
+                "l1_diff": float(diff.mean().item()),
+                "l2_diff": float(torch.sqrt(torch.mean((polluted_img - clean_img) ** 2)).item()),
+                "linf_diff": float(diff.max().item()),
+                "changed_fraction_gt_001": float((diff > 0.01).float().mean().item()),
+            }
+        )
+
+    stats_path = os.path.join(debug_dir, "input_pixel_stats.csv")
+    with open(stats_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "local_idx",
+            "template_index",
+            "label",
+            "pollution",
+            "severity",
+            "clean_mean",
+            "polluted_mean",
+            "clean_std",
+            "polluted_std",
+            "l1_diff",
+            "l2_diff",
+            "linf_diff",
+            "changed_fraction_gt_001",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    key: f"{value:.6f}" if isinstance(value, float) else value
+                    for key, value in row.items()
+                }
+            )
+
+    method_trace_path = os.path.join(debug_dir, "method_input_trace.csv")
+    with open(method_trace_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["method", "input_tensor", "clean_tensor_used_for_prediction", "library_or_memory_source"])
+        for method, source in [
+            ("Modern Hopfield", "same polluted q from PollutedCharDataset", "no", "clean train split memory"),
+            ("Balanced Traditional Hopfield", "same polluted q from PollutedCharDataset", "no", "train split class prototypes"),
+            ("CNN", "same polluted q from PollutedCharDataset", "no", "trained on clean train split"),
+            ("Nearest Neighbor", "same polluted q from PollutedCharDataset", "no", "train split memory"),
+            ("Euclidean NN", "same polluted q from PollutedCharDataset", "no", "train split memory"),
+            ("Class Prototype", "same polluted q from PollutedCharDataset", "no", "train split class prototypes"),
+        ]:
+            writer.writerow([method, "q", "no", source])
+
+    print(f"Saved evaluation input debug images and stats: {debug_dir}")
+
+
 def build_class_balanced_indices(labels, base_indices, samples_per_class, seed=2026):
     rng = random.Random(seed)
     by_class = {}
@@ -617,7 +732,7 @@ def run_robustness_evaluation(
     print(f"Task 2: held-out evaluation, pollution={pollution_type}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    hopfield_memory, hopfield_labels = augment_hopfield_memory(train_memory, train_labels)
+    hopfield_memory, hopfield_labels = train_memory, train_labels
     prototypes, prototype_labels = build_class_memory_from_tensors(train_memory, train_labels)
     num_classes = len(loader.idx_to_label)
 
@@ -753,7 +868,7 @@ def run_class_balanced_evaluation(
 
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    hopfield_memory, hopfield_labels = augment_hopfield_memory(train_memory, train_labels)
+    hopfield_memory, hopfield_labels = train_memory, train_labels
     prototypes, prototype_labels = build_class_memory_from_tensors(train_memory, train_labels)
     num_classes = len(loader.idx_to_label)
 
@@ -1772,6 +1887,10 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers. Use 2 on Kaggle if CPU preprocessing is the bottleneck.")
     parser.add_argument("--skip-balanced-eval", action="store_true", help="Skip class-balanced robustness evaluation.")
     parser.add_argument("--balanced-samples-per-class", type=int, default=8)
+    parser.add_argument("--debug-eval-inputs", action="store_true", help="Save held-out clean/polluted/diff samples and input statistics.")
+    parser.add_argument("--debug-eval-pollution", default="dirt", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
+    parser.add_argument("--debug-eval-severity", type=float, default=0.8)
+    parser.add_argument("--debug-eval-samples", type=int, default=16)
     parser.add_argument("--skip-ablation", action="store_true")
     parser.add_argument("--ablation-samples", type=int, default=1000)
     parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
@@ -1830,7 +1949,7 @@ def parse_args():
         "--save-mchn-memory",
         action="store_true",
         default=True,
-        help="Save the large augmented MCHN evaluation memory artifact. Enabled by default for reproducible experiment artifacts.",
+        help="Save the clean train-split MCHN evaluation memory artifact. Enabled by default for reproducible experiment artifacts.",
     )
     parser.add_argument(
         "--skip-save-mchn-memory",
@@ -1868,7 +1987,18 @@ if __name__ == "__main__":
         raise RuntimeError("Template memory is empty.")
 
     train_indices, test_indices = build_stratified_split(loader.labels, train_ratio=args.train_ratio, seed=args.seed)
+    assert_disjoint_splits(train_indices, test_indices)
     print(f"Held-out split: train templates={len(train_indices)}, test templates={len(test_indices)}")
+    if args.debug_eval_inputs:
+        save_evaluation_input_debug(
+            loader,
+            args.output_dir,
+            test_indices,
+            pollution_type=args.debug_eval_pollution,
+            severity=args.debug_eval_severity,
+            sample_count=args.debug_eval_samples,
+            seed=args.seed,
+        )
 
     if args.random_capacity_only:
         run_random_capacity_evaluation(
@@ -1905,7 +2035,7 @@ if __name__ == "__main__":
         print(f"\nCapacity experiment finished. Figures and CSV are saved in {args.output_dir}.")
         raise SystemExit(0)
 
-    print("\nTraining CNN baseline on polluted training templates...")
+    print("\nTraining CNN baseline on clean training templates...")
     cnn = train_cnn(
         loader,
         train_indices=train_indices,
@@ -1920,7 +2050,7 @@ if __name__ == "__main__":
 
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    demo_memory, demo_labels = augment_hopfield_memory(train_memory, train_labels)
+    demo_memory, demo_labels = train_memory, train_labels
     if args.save_mchn_memory:
         save_mchn_memory_artifacts(loader, train_indices, test_indices, demo_memory, demo_labels, args.saved_weights_dir)
     else:
