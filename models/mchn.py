@@ -184,7 +184,32 @@ class ModernHopfieldNetwork(nn.Module):
             return -torch.cdist(q_sim, m_sim, p=2.0)
         raise ValueError(f"Unsupported metric: {self.metric}")
 
-    def forward(self, q, template_mask=None, return_attention=False, return_similarity=False):
+    @staticmethod
+    def project_attention_to_classes(attention_weights, memory_labels, num_classes=None):
+        """Project template attention weights into class probabilities.
+
+        attention_weights has shape [B, K], memory_labels has shape [K].
+        The result has shape [B, C] and sums attention mass for all templates
+        belonging to the same class.
+        """
+        labels = memory_labels.to(device=attention_weights.device, dtype=torch.long)
+        if labels.dim() != 1 or labels.shape[0] != attention_weights.shape[-1]:
+            raise ValueError("memory_labels must have shape [num_templates].")
+        if num_classes is None:
+            num_classes = int(labels.max().item()) + 1 if labels.numel() else 0
+        label_proj = F.one_hot(labels, num_classes=int(num_classes)).to(dtype=attention_weights.dtype)
+        return torch.matmul(attention_weights, label_proj)
+
+    def forward(
+        self,
+        q,
+        template_mask=None,
+        return_attention=False,
+        return_similarity=False,
+        memory_labels=None,
+        num_classes=None,
+        return_dict=False,
+    ):
         if q.dim() == 1:
             q = q.unsqueeze(0)
 
@@ -198,6 +223,21 @@ class ModernHopfieldNetwork(nn.Module):
         attention_weights = F.softmax(self.beta * sim_scores, dim=-1)
         retrieved = torch.matmul(attention_weights, self.M)
         predicted_indices = torch.argmax(attention_weights, dim=-1)
+        class_scores = None
+        class_pred = None
+        if memory_labels is not None:
+            class_scores = self.project_attention_to_classes(attention_weights, memory_labels, num_classes=num_classes)
+            class_pred = torch.argmax(class_scores, dim=-1)
+
+        if return_dict:
+            return {
+                "retrieved": retrieved,
+                "attention_weights": attention_weights,
+                "class_scores": class_scores,
+                "pred": class_pred if class_pred is not None else predicted_indices,
+                "template_pred": predicted_indices,
+                "sim_scores": sim_scores,
+            }
 
         if return_attention and return_similarity:
             return retrieved, predicted_indices, attention_weights, sim_scores

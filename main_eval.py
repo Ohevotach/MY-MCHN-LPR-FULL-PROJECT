@@ -232,13 +232,45 @@ def class_max_similarity_scores(sim_scores, template_labels, beta, num_classes, 
     return torch.stack(scores, dim=-1)
 
 
-def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_mask=None):
+def class_attention_projection_scores(attention_weights, template_labels, num_classes, template_mask=None):
+    labels = template_labels.to(device=attention_weights.device, dtype=torch.long)
+    if labels.dim() != 1 or labels.shape[0] != attention_weights.shape[-1]:
+        raise ValueError("template_labels must have shape [num_templates].")
+
+    label_proj = F.one_hot(labels, num_classes=int(num_classes)).to(dtype=attention_weights.dtype)
+    if template_mask is not None and template_mask.dim() == 1:
+        label_proj = label_proj * template_mask.to(device=attention_weights.device, dtype=attention_weights.dtype).unsqueeze(-1)
+    return torch.matmul(attention_weights, label_proj)
+
+
+def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_mask=None, scoring_mode="class_projection"):
     log_prob_parts = []
     primary_sim = None
+    if scoring_mode not in {"class_projection", "maxsim"}:
+        raise ValueError(f"Unsupported Hopfield scoring mode: {scoring_mode}")
+
     for model in models:
-        _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
-        scores = class_max_similarity_scores(sim_scores, template_labels, beta=model.beta, num_classes=num_classes, template_mask=template_mask)
-        log_probs = torch.log_softmax(scores, dim=-1)
+        if scoring_mode == "class_projection":
+            outputs = model(
+                q,
+                template_mask=template_mask,
+                memory_labels=template_labels,
+                num_classes=num_classes,
+                return_dict=True,
+            )
+            scores = outputs["class_scores"].clamp_min(1e-12)
+            log_probs = torch.log(scores)
+            sim_scores = outputs["sim_scores"]
+        else:
+            _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
+            scores = class_max_similarity_scores(
+                sim_scores,
+                template_labels,
+                beta=model.beta,
+                num_classes=num_classes,
+                template_mask=template_mask,
+            )
+            log_probs = torch.log_softmax(scores, dim=-1)
         log_prob_parts.append(log_probs)
         if primary_sim is None:
             primary_sim = sim_scores
@@ -248,8 +280,15 @@ def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_m
     return fused, primary_sim
 
 
-def predict_modern_hopfield_scores(models, q, template_labels, num_classes, template_mask=None):
-    return ensemble_hopfield_scores(models, q, template_labels, num_classes, template_mask=template_mask)[0]
+def predict_modern_hopfield_scores(models, q, template_labels, num_classes, template_mask=None, scoring_mode="class_projection"):
+    return ensemble_hopfield_scores(
+        models,
+        q,
+        template_labels,
+        num_classes,
+        template_mask=template_mask,
+        scoring_mode=scoring_mode,
+    )[0]
 
 
 def predict_nearest_neighbor(q, train_memory, train_labels, metric):
@@ -843,6 +882,27 @@ def run_ablation_evaluation(
         ))
         for name, (models, labels) in ablations.items()
     }
+    aug_models, aug_template_labels = ablations["MCHN-Ensemble-Aug"]
+    methods["MCHN-class-projection"] = lambda q: torch.argmax(
+        predict_modern_hopfield_scores(
+            aug_models,
+            q,
+            aug_template_labels,
+            num_classes,
+            scoring_mode="class_projection",
+        ),
+        dim=-1,
+    )
+    methods["MCHN-maxsim"] = lambda q: torch.argmax(
+        predict_modern_hopfield_scores(
+            aug_models,
+            q,
+            aug_template_labels,
+            num_classes,
+            scoring_mode="maxsim",
+        ),
+        dim=-1,
+    )
     scores = evaluate_methods(methods, test_loader, device)
     for name, value in scores.items():
         print(f"  {name}: {value:.2f}%")

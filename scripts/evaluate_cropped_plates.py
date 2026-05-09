@@ -281,8 +281,9 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
             if mask.dim() == 1:
                 mask = mask.unsqueeze(0)
             sim_scores = sim_scores.masked_fill(~mask, -1e9)
-        scores = fast_class_max_similarity_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
-        parts.append(torch.log_softmax(scores, dim=-1))
+        attention_weights = F.softmax(model.beta * sim_scores, dim=-1)
+        scores = fast_class_attention_projection_scores(attention_weights, template_labels, num_classes, template_mask)
+        parts.append(torch.log(scores.clamp_min(1e-12)))
     return torch.logsumexp(torch.stack(parts, dim=0), dim=0) - torch.log(q.new_tensor(float(len(parts))))
 
 
@@ -328,6 +329,14 @@ def fast_class_max_similarity_scores(sim_scores, template_labels, beta, num_clas
             else:
                 scores.append(torch.max(scaled[:, class_mask], dim=-1).values)
         return torch.stack(scores, dim=-1)
+
+
+def fast_class_attention_projection_scores(attention_weights, template_labels, num_classes, template_mask=None):
+    labels = template_labels.to(device=attention_weights.device, dtype=torch.long)
+    label_proj = F.one_hot(labels, num_classes=int(num_classes)).to(dtype=attention_weights.dtype)
+    if template_mask is not None and template_mask.dim() == 1:
+        label_proj = label_proj * template_mask.to(device=attention_weights.device, dtype=attention_weights.dtype).unsqueeze(-1)
+    return torch.matmul(attention_weights, label_proj)
 
 
 def max_template_scores_to_class(template_scores, template_labels, num_classes, template_mask=None):

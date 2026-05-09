@@ -180,6 +180,14 @@ def class_max_similarity_scores(sim_scores, template_labels, beta, num_classes, 
     return torch.stack(scores, dim=-1)
 
 
+def class_attention_projection_scores(attention_weights, template_labels, num_classes, template_mask=None):
+    labels = template_labels.to(device=attention_weights.device, dtype=torch.long)
+    label_proj = F.one_hot(labels, num_classes=int(num_classes)).to(dtype=attention_weights.dtype)
+    if template_mask is not None and template_mask.dim() == 1:
+        label_proj = label_proj * template_mask.to(device=attention_weights.device, dtype=attention_weights.dtype).unsqueeze(-1)
+    return torch.matmul(attention_weights, label_proj)
+
+
 def build_hopfield_ensemble(memory, device):
     return [
         ModernHopfieldNetwork(memory, beta=28.0, metric="dot", normalize=True, feature_mode="binary").to(device),
@@ -202,9 +210,17 @@ def ensemble_scores(models, q, template_labels, num_classes, template_mask=None)
     first_sim = None
     first_retrieved = None
     for model in models:
-        retrieved, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
-        scores = class_max_similarity_scores(sim_scores, template_labels, model.beta, num_classes, template_mask)
-        log_probs = torch.log_softmax(scores, dim=-1)
+        outputs = model(
+            q,
+            template_mask=template_mask,
+            memory_labels=template_labels,
+            num_classes=num_classes,
+            return_dict=True,
+        )
+        retrieved = outputs["retrieved"]
+        sim_scores = outputs["sim_scores"]
+        scores = outputs["class_scores"].clamp_min(1e-12)
+        log_probs = torch.log(scores)
         log_prob_parts.append(log_probs)
         if first_sim is None:
             first_sim = sim_scores
