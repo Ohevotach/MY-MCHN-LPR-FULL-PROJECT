@@ -1,7 +1,9 @@
 ﻿import argparse
 import csv
+import hashlib
 import os
 import random
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -199,6 +201,304 @@ def build_stratified_split(labels, train_ratio=0.7, seed=2026):
         test_indices.extend(indices[:test_count])
         train_indices.extend(indices[test_count:])
     return train_indices, test_indices
+
+
+class UnionFind:
+    def __init__(self, size):
+        self.parent = list(range(size))
+        self.rank = [0] * size
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+
+
+def template_exact_hash(vector):
+    pixels = vector.detach().cpu().float().clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).numpy()
+    return hashlib.md5(pixels.tobytes()).hexdigest()
+
+
+def write_csv_rows(path, fieldnames, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def build_group_duplicate_split(
+    loader,
+    train_ratio=0.7,
+    seed=2026,
+    output_dir="./results",
+    group_threshold=0.999,
+    inspect_threshold=0.99,
+):
+    """Build a held-out split where exact/near duplicate templates stay together.
+
+    TemplateLoader already applies the unified preprocessing used by the experiments:
+    grayscale, resize to 64x32, foreground normalization, and flattening. Grouping is
+    done within each class, then entire groups are assigned to train or test.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    memory = loader.memory_matrix.detach().cpu().float()
+    labels = loader.labels.detach().cpu().long()
+    labels_list = [int(v) for v in labels.tolist()]
+    paths = list(loader.template_paths)
+    num_templates = int(memory.shape[0])
+    rng = random.Random(seed)
+
+    exact_hashes = [template_exact_hash(memory[i]) for i in range(num_templates)]
+    uf = UnionFind(num_templates)
+    exact_duplicate_rows = []
+    near_rows_ge0999 = []
+    near_rows_ge099 = []
+
+    indices_by_class = defaultdict(list)
+    for idx, class_id in enumerate(labels_list):
+        indices_by_class[class_id].append(idx)
+
+    for class_id in sorted(indices_by_class):
+        class_indices = indices_by_class[class_id]
+        label_name = display_label(loader.idx_to_label[class_id])
+
+        by_hash = defaultdict(list)
+        for idx in class_indices:
+            by_hash[exact_hashes[idx]].append(idx)
+        for md5_value, dup_indices in by_hash.items():
+            if len(dup_indices) <= 1:
+                continue
+            first = dup_indices[0]
+            for idx in dup_indices[1:]:
+                uf.union(first, idx)
+            exact_duplicate_rows.append(
+                {
+                    "label": label_name,
+                    "class_id": class_id,
+                    "md5": md5_value,
+                    "count": len(dup_indices),
+                    "indices": " ".join(str(i) for i in dup_indices),
+                    "paths": " | ".join(paths[i] for i in dup_indices),
+                }
+            )
+
+        if len(class_indices) < 2:
+            continue
+
+        class_tensor = F.normalize(memory[class_indices], dim=-1)
+        sim = class_tensor @ class_tensor.t()
+        local_pairs = torch.nonzero(torch.triu(sim >= inspect_threshold, diagonal=1), as_tuple=False)
+        for local_i, local_j in local_pairs.tolist():
+            idx_a = class_indices[local_i]
+            idx_b = class_indices[local_j]
+            cosine = float(sim[local_i, local_j].item())
+            exact_same = exact_hashes[idx_a] == exact_hashes[idx_b]
+            row = {
+                "label": label_name,
+                "class_id": class_id,
+                "idx_a": idx_a,
+                "idx_b": idx_b,
+                "cosine": f"{cosine:.8f}",
+                "exact_hash_same": int(exact_same),
+                "md5_a": exact_hashes[idx_a],
+                "md5_b": exact_hashes[idx_b],
+                "path_a": paths[idx_a],
+                "path_b": paths[idx_b],
+            }
+            near_rows_ge099.append(row)
+            if cosine >= group_threshold:
+                uf.union(idx_a, idx_b)
+                near_rows_ge0999.append(row)
+
+    components = defaultdict(list)
+    for idx in range(num_templates):
+        components[uf.find(idx)].append(idx)
+
+    sorted_components = sorted(components.values(), key=lambda members: (labels_list[min(members)], min(members)))
+    group_id_by_index = {}
+    group_members = {}
+    group_label = {}
+    for group_num, members in enumerate(sorted_components):
+        group_id = f"g{group_num:05d}"
+        member_labels = sorted(set(labels_list[i] for i in members))
+        if len(member_labels) != 1:
+            raise RuntimeError(
+                f"Near-duplicate group {group_id} contains multiple labels: {member_labels}. "
+                "Inspect preprocessing or labels before evaluation."
+            )
+        group_members[group_id] = members
+        group_label[group_id] = member_labels[0]
+        for idx in members:
+            group_id_by_index[idx] = group_id
+
+    groups_by_class = defaultdict(list)
+    for group_id, class_id in group_label.items():
+        groups_by_class[class_id].append(group_id)
+
+    group_split = {}
+    train_indices = []
+    test_indices = []
+    for class_id in sorted(groups_by_class):
+        class_groups = groups_by_class[class_id][:]
+        rng.shuffle(class_groups)
+        if len(class_groups) <= 1:
+            test_groups = set()
+        else:
+            test_count = max(1, int(round(len(class_groups) * (1.0 - train_ratio))))
+            test_count = min(test_count, len(class_groups) - 1)
+            test_groups = set(class_groups[:test_count])
+        for group_id in class_groups:
+            split = "test" if group_id in test_groups else "train"
+            group_split[group_id] = split
+            if split == "test":
+                test_indices.extend(group_members[group_id])
+            else:
+                train_indices.extend(group_members[group_id])
+
+    train_indices = sorted(train_indices)
+    test_indices = sorted(test_indices)
+
+    split_rows = []
+    for idx in range(num_templates):
+        group_id = group_id_by_index[idx]
+        class_id = labels_list[idx]
+        split_rows.append(
+            {
+                "template_index": idx,
+                "path": paths[idx],
+                "label": display_label(loader.idx_to_label[class_id]),
+                "class_id": class_id,
+                "group_id": group_id,
+                "group_size": len(group_members[group_id]),
+                "split": group_split[group_id],
+                "md5": exact_hashes[idx],
+            }
+        )
+
+    near0999_by_group = defaultdict(int)
+    for row in near_rows_ge0999:
+        near0999_by_group[group_id_by_index[int(row["idx_a"])]] += 1
+
+    duplicate_check_rows = []
+    for group_id in sorted(group_members, key=lambda gid: int(gid[1:])):
+        members = group_members[group_id]
+        hashes = [exact_hashes[i] for i in members]
+        class_id = group_label[group_id]
+        duplicate_check_rows.append(
+            {
+                "group_id": group_id,
+                "label": display_label(loader.idx_to_label[class_id]),
+                "class_id": class_id,
+                "split": group_split[group_id],
+                "group_size": len(members),
+                "unique_md5_count": len(set(hashes)),
+                "exact_duplicate": int(len(set(hashes)) < len(hashes)),
+                "near0999_pair_count": near0999_by_group[group_id],
+                "member_indices": " ".join(str(i) for i in members),
+                "member_paths": " | ".join(paths[i] for i in members),
+            }
+        )
+
+    write_csv_rows(
+        os.path.join(output_dir, f"group_split_seed{seed}.csv"),
+        ["template_index", "path", "label", "class_id", "group_id", "group_size", "split", "md5"],
+        split_rows,
+    )
+    write_csv_rows(
+        os.path.join(output_dir, "group_duplicate_check.csv"),
+        [
+            "group_id",
+            "label",
+            "class_id",
+            "split",
+            "group_size",
+            "unique_md5_count",
+            "exact_duplicate",
+            "near0999_pair_count",
+            "member_indices",
+            "member_paths",
+        ],
+        duplicate_check_rows,
+    )
+    pair_fields = [
+        "label",
+        "class_id",
+        "idx_a",
+        "idx_b",
+        "cosine",
+        "exact_hash_same",
+        "md5_a",
+        "md5_b",
+        "path_a",
+        "path_b",
+    ]
+    write_csv_rows(os.path.join(output_dir, "near_duplicate_pairs_ge0999.csv"), pair_fields, near_rows_ge0999)
+    write_csv_rows(os.path.join(output_dir, "near_duplicate_pairs_ge099.csv"), pair_fields, near_rows_ge099)
+
+    group_ids_train = {group_id_by_index[idx] for idx in train_indices}
+    group_ids_test = {group_id_by_index[idx] for idx in test_indices}
+    overlap = group_ids_train & group_ids_test
+    if overlap:
+        examples = ", ".join(sorted(overlap)[:10])
+        raise RuntimeError(f"Group split leakage detected: {len(overlap)} groups in train and test, e.g. {examples}.")
+
+    print(
+        "Group-level split ready: "
+        f"templates={num_templates}, groups={len(group_members)}, "
+        f"train templates={len(train_indices)}, test templates={len(test_indices)}, "
+        f"exact duplicate groups={sum(int(row['exact_duplicate']) for row in duplicate_check_rows)}, "
+        f"near pairs >= {group_threshold:g}: {len(near_rows_ge0999)}, "
+        f"inspection pairs >= {inspect_threshold:g}: {len(near_rows_ge099)}."
+    )
+    print(f"Saved group split CSVs in {output_dir}.")
+    return train_indices, test_indices
+
+
+def cleanup_old_artifacts(output_dir="./results", saved_weights_dir="./saved_weights"):
+    cleanup_files = [
+        os.path.join(output_dir, "template_cache_32x64.pt"),
+        os.path.join(saved_weights_dir, "mchn_eval_memory_32x64.pt"),
+    ]
+    csv_prefixes = (
+        "robustness_",
+        "balanced_robustness_",
+        "summary_method_ranking",
+        "balanced_summary_method_ranking",
+        "topk_",
+        "confusion_",
+        "group_accuracy_",
+        "top_confusions_",
+        "ablation_",
+        "beta_ablation_",
+        "capacity_",
+        "cnn_training_log",
+    )
+    if os.path.isdir(output_dir):
+        for file_name in os.listdir(output_dir):
+            if file_name.lower().endswith(".csv") and file_name.startswith(csv_prefixes):
+                cleanup_files.append(os.path.join(output_dir, file_name))
+
+    removed = 0
+    for file_path in cleanup_files:
+        abs_path = os.path.abspath(file_path)
+        if not abs_path.startswith(os.path.abspath(os.getcwd())):
+            raise RuntimeError(f"Refusing to remove file outside project directory: {abs_path}")
+        if os.path.exists(abs_path):
+            os.remove(abs_path)
+            removed += 1
+    print(f"Cleaned stale evaluation artifacts: removed {removed} file(s).")
 
 
 def assert_disjoint_splits(train_indices, test_indices):
@@ -1880,6 +2180,19 @@ def parse_args():
     parser.add_argument("--cnn-train-samples", type=int, default=20000)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--split-mode",
+        default="group",
+        choices=["group", "index"],
+        help="Use duplicate-group held-out split by default; 'index' restores the older class-stratified random index split.",
+    )
+    parser.add_argument("--near-duplicate-threshold", type=float, default=0.999)
+    parser.add_argument("--near-duplicate-inspect-threshold", type=float, default=0.99)
+    parser.add_argument(
+        "--clean-old-artifacts",
+        action="store_true",
+        help="Remove stale template cache, saved MCHN memory, and old evaluation CSVs before loading templates.",
+    )
     parser.add_argument("--include-affine-robust", action="store_true", help="Also evaluate the slow affine-query Hopfield variant.")
     parser.add_argument("--affine-variant-level", default="light", choices=["none", "light", "medium", "full"])
     parser.add_argument("--save-confusion", action="store_true", default=True, help="Save confusion matrices for each pollution.")
@@ -1976,6 +2289,8 @@ if __name__ == "__main__":
     if args.include_affine_robust:
         print(f"Affine-robust Hopfield enabled with variant level: {args.affine_variant_level}.")
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.clean_old_artifacts:
+        cleanup_old_artifacts(args.output_dir, args.saved_weights_dir)
     visualizer = MetricVisualizer(save_dir=args.output_dir)
 
     loader = TemplateLoader(
@@ -1986,9 +2301,20 @@ if __name__ == "__main__":
     if loader.memory_matrix.shape[0] == 0:
         raise RuntimeError("Template memory is empty.")
 
-    train_indices, test_indices = build_stratified_split(loader.labels, train_ratio=args.train_ratio, seed=args.seed)
+    if args.split_mode == "group":
+        train_indices, test_indices = build_group_duplicate_split(
+            loader,
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            output_dir=args.output_dir,
+            group_threshold=args.near_duplicate_threshold,
+            inspect_threshold=args.near_duplicate_inspect_threshold,
+        )
+    else:
+        train_indices, test_indices = build_stratified_split(loader.labels, train_ratio=args.train_ratio, seed=args.seed)
+        print("Warning: using legacy index-level split; near-duplicate templates may cross train/test.")
     assert_disjoint_splits(train_indices, test_indices)
-    print(f"Held-out split: train templates={len(train_indices)}, test templates={len(test_indices)}")
+    print(f"Held-out split ({args.split_mode}): train templates={len(train_indices)}, test templates={len(test_indices)}")
     if args.debug_eval_inputs:
         save_evaluation_input_debug(
             loader,
