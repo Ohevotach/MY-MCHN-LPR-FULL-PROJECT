@@ -68,6 +68,8 @@ class MetricVisualizer:
     @staticmethod
     def _ordered_method_items(model_results):
         priority = [
+            "MCHN-SumProjection",
+            "MCHN-TopKHybrid",
             "Modern Hopfield",
             "Affine-robust Hopfield",
             "Balanced Traditional Hopfield",
@@ -82,15 +84,17 @@ class MetricVisualizer:
 
     @staticmethod
     def _method_color(name, fallback):
-        if name == "Modern Hopfield":
+        if name in {"MCHN-SumProjection", "Modern Hopfield"}:
             return "#e74c3c"
+        if name == "MCHN-TopKHybrid":
+            return "#9b59b6"
         if name == "Affine-robust Hopfield":
             return "#c0392b"
         return fallback
 
     @staticmethod
     def _method_linewidth(name):
-        return 2.8 if name == "Modern Hopfield" else 1.7
+        return 2.8 if name in {"MCHN-SumProjection", "MCHN-TopKHybrid", "Modern Hopfield"} else 1.7
 
     def plot_reconstruction_grid(self, clean_qs, polluted_qs, reconstructed_zs, labels=None, filename="mchn_reconstruction_demo.png"):
         num_samples = min(clean_qs.shape[0], 5) 
