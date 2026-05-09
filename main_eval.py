@@ -1,6 +1,7 @@
 ﻿import argparse
 import csv
 import hashlib
+import json
 import os
 import random
 from collections import defaultdict
@@ -22,8 +23,9 @@ from utils.metric_visuals import MetricVisualizer
 SEVERITIES = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8]
 POLLUTIONS = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
 CORE_POLLUTIONS = ["noise", "salt_pepper", "blur", "mask", "dirt", "fog"]
+FINAL_MCHN_NAME = "Modern Hopfield Network"
 METHOD_ORDER = [
-    "Modern Hopfield",
+    FINAL_MCHN_NAME,
     "Affine-robust Hopfield",
     "Balanced Traditional Hopfield",
     "CNN",
@@ -646,6 +648,7 @@ def cleanup_old_artifacts(output_dir="./results", saved_weights_dir="./saved_wei
         "ablation_",
         "beta_ablation_",
         "capacity_",
+        "pollution_effectiveness_summary",
         "cnn_training_log",
     )
     if os.path.isdir(output_dir):
@@ -1265,7 +1268,7 @@ def save_evaluation_input_debug(
         writer = csv.writer(f)
         writer.writerow(["method", "input_tensor", "clean_tensor_used_for_prediction", "library_or_memory_source"])
         for method, source in [
-            ("Modern Hopfield", "same polluted q from PollutedCharDataset", "no", "clean train split memory"),
+            (FINAL_MCHN_NAME, "same polluted q from PollutedCharDataset", "no", "clean train split memory"),
             ("Balanced Traditional Hopfield", "same polluted q from PollutedCharDataset", "no", "train split class prototypes"),
             ("CNN", "same polluted q from PollutedCharDataset", "no", "trained on clean train split"),
             ("Nearest Neighbor", "same polluted q from PollutedCharDataset", "no", "train split memory"),
@@ -1275,6 +1278,140 @@ def save_evaluation_input_debug(
             writer.writerow([method, "q", "no", source])
 
     print(f"Saved evaluation input debug images and stats: {debug_dir}")
+
+
+def save_pollution_effectiveness_summary(
+    loader,
+    output_dir,
+    test_indices,
+    pollution_types,
+    severities,
+    sample_count,
+    seed,
+):
+    """Summarize whether each pollution actually changes character pixels.
+
+    The output is intentionally lightweight: one CSV row per
+    pollution/severity pair with foreground/background change statistics. It is
+    meant for thesis evidence that mask/dirt/noise/fog are not only affecting
+    empty background pixels.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    fixed_indices = build_fixed_sample_sequence(test_indices, sample_count, seed=seed + 9601)
+    rows = []
+    for pollution_type in pollution_types:
+        current_severities = [0.0] if pollution_type == "none" else severities
+        for severity in current_severities:
+            dataset = PollutedCharDataset(
+                loader,
+                virtual_size=len(fixed_indices),
+                pollution_type=pollution_type,
+                severity=severity,
+                seed=seed + 9603,
+                fixed_sample_indices=fixed_indices,
+                deterministic_per_index=True,
+            )
+            stats = defaultdict(float)
+            count = 0
+            for local_idx in range(len(dataset)):
+                polluted, clean, _ = dataset[local_idx]
+                clean_img = clean.view(loader.img_size[1], loader.img_size[0]).detach().cpu()
+                polluted_img = polluted.view(loader.img_size[1], loader.img_size[0]).detach().cpu()
+                diff = (polluted_img - clean_img).abs()
+                foreground = clean_img > 0.5
+                background = ~foreground
+
+                stats["clean_mean"] += float(clean_img.mean().item())
+                stats["polluted_mean"] += float(polluted_img.mean().item())
+                stats["clean_std"] += float(clean_img.std().item())
+                stats["polluted_std"] += float(polluted_img.std().item())
+                stats["l1_diff"] += float(diff.mean().item())
+                stats["l2_diff"] += float(torch.sqrt(torch.mean((polluted_img - clean_img) ** 2)).item())
+                stats["linf_diff"] += float(diff.max().item())
+                stats["changed_fraction_gt_001"] += float((diff > 0.01).float().mean().item())
+                stats["foreground_changed_fraction_gt_001"] += (
+                    float((diff[foreground] > 0.01).float().mean().item()) if foreground.any() else 0.0
+                )
+                stats["background_changed_fraction_gt_001"] += (
+                    float((diff[background] > 0.01).float().mean().item()) if background.any() else 0.0
+                )
+                stats["foreground_l1_diff"] += float(diff[foreground].mean().item()) if foreground.any() else 0.0
+                stats["background_l1_diff"] += float(diff[background].mean().item()) if background.any() else 0.0
+                count += 1
+
+            denominator = max(1, count)
+            rows.append(
+                {
+                    "pollution": pollution_type,
+                    "severity": float(severity),
+                    "samples": count,
+                    **{key: value / denominator for key, value in stats.items()},
+                }
+            )
+
+    csv_path = os.path.join(output_dir, "pollution_effectiveness_summary.csv")
+    fieldnames = [
+        "pollution",
+        "severity",
+        "samples",
+        "clean_mean",
+        "polluted_mean",
+        "clean_std",
+        "polluted_std",
+        "l1_diff",
+        "l2_diff",
+        "linf_diff",
+        "changed_fraction_gt_001",
+        "foreground_changed_fraction_gt_001",
+        "background_changed_fraction_gt_001",
+        "foreground_l1_diff",
+        "background_l1_diff",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: f"{value:.6f}" if isinstance(value, float) else value for key, value in row.items()})
+    print(f"Saved pollution effectiveness summary CSV: {csv_path}")
+    return rows
+
+
+def save_final_experiment_config(args, output_dir, train_count=None, test_count=None):
+    config = {
+        "final_mchn_method": FINAL_MCHN_NAME,
+        "final_mchn_ablation_variant": "MCHN-TopKHybrid",
+        "final_mchn_description": "Clean train memory + top-k attention class projection + max-sim log-score fusion.",
+        "formula": {
+            "attention": "a_i = softmax(beta * sim(q, m_i))",
+            "topk_projection": "p_k(c|q) = sum_{i in TopK(q), y_i=c} a_i",
+            "maxsim_branch": "r(c|q) = softmax(max_{i:y_i=c} beta * sim(q, m_i))",
+            "fusion": "score(c|q) = (1 - lambda) * log p_k(c|q) + lambda * log r(c|q)",
+            "prediction": "y_hat = argmax_c score(c|q)",
+        },
+        "args": vars(args),
+        "split": {
+            "mode": args.split_mode,
+            "train_templates": train_count,
+            "test_templates": test_count,
+            "near_duplicate_threshold": args.near_duplicate_threshold,
+            "near_duplicate_inspect_threshold": args.near_duplicate_inspect_threshold,
+        },
+        "experiments": [
+            "group-level train/test split validation",
+            "pollution effectiveness summary",
+            "multi-pollution robustness curves",
+            "projection/fusion ablation",
+            "beta ablation",
+            "modern-vs-classic capacity experiments",
+            "attention error analysis",
+            "cropped-plate extension via scripts/evaluate_cropped_plates.py",
+        ],
+    }
+    path = os.path.join(output_dir, "final_experiment_config.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    print(f"Saved final experiment config: {path}")
+    return path
 
 
 def build_class_balanced_indices(labels, base_indices, samples_per_class, seed=2026):
@@ -1356,7 +1493,7 @@ def run_robustness_evaluation(
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
     print(
-        "Modern Hopfield method: clean train memory + top-k attention projection + max-sim fusion "
+        f"{FINAL_MCHN_NAME} method: clean train memory + top-k attention projection + max-sim fusion "
         f"(topk={mchn_topk}, maxsim_weight={mchn_maxsim_weight:.2f})."
     )
     # Classical Hopfield is kept as a fair thesis baseline. Character images are
@@ -1377,7 +1514,7 @@ def run_robustness_evaluation(
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
         }
-        methods["Modern Hopfield"] = lambda q: torch.argmax(
+        methods[FINAL_MCHN_NAME] = lambda q: torch.argmax(
             predict_final_mchn_scores(
                 hopfield_models,
                 q,
@@ -1401,7 +1538,7 @@ def run_robustness_evaluation(
 
     def make_score_methods():
         return {
-            "Modern Hopfield": lambda q: predict_final_mchn_scores(
+            FINAL_MCHN_NAME: lambda q: predict_final_mchn_scores(
                 hopfield_models,
                 q,
                 hopfield_labels,
@@ -1470,7 +1607,7 @@ def run_robustness_evaluation(
             batch_size,
             device,
             severity=SEVERITIES[-1],
-            method_names=("Modern Hopfield", "Balanced Traditional Hopfield", "CNN"),
+            method_names=(FINAL_MCHN_NAME, "Balanced Traditional Hopfield", "CNN"),
             num_workers=num_workers,
         )
     return results
@@ -1526,7 +1663,7 @@ def run_class_balanced_evaluation(
             "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
-            "Modern Hopfield": lambda q: torch.argmax(
+            FINAL_MCHN_NAME: lambda q: torch.argmax(
                 predict_final_mchn_scores(
                     hopfield_models,
                     q,
@@ -2602,7 +2739,7 @@ def save_confusion_reports(
     batch_size,
     device,
     severity,
-    method_names=("Modern Hopfield",),
+    method_names=(FINAL_MCHN_NAME,),
     num_workers=0,
 ):
     selected_methods = {name: methods[name] for name in method_names if name in methods}
@@ -2745,7 +2882,7 @@ def plot_all_pollution_summary(visualizer, all_results, prefix=""):
         filename=f"{prefix}summary_mean_accuracy_heatmap.png",
     )
     for method_name, filename in (
-        ("Modern Hopfield", "mchn_pollution_severity_curves.png"),
+        (FINAL_MCHN_NAME, "mchn_pollution_severity_curves.png"),
         ("Affine-robust Hopfield", "affine_robust_mchn_pollution_severity_curves.png"),
     ):
         if any(method_name in method_results for method_results in all_results.values()):
@@ -2868,6 +3005,8 @@ def parse_args():
     parser.add_argument("--debug-eval-pollution", default="dirt", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
     parser.add_argument("--debug-eval-severity", type=float, default=0.8)
     parser.add_argument("--debug-eval-samples", type=int, default=16)
+    parser.add_argument("--skip-pollution-effectiveness", action="store_true", help="Skip the foreground/background pollution-effectiveness summary CSV.")
+    parser.add_argument("--pollution-effectiveness-samples", type=int, default=256, help="Held-out samples per pollution/severity used for pollution-effectiveness statistics.")
     parser.add_argument("--mchn-topk", type=int, default=10, help="Top-k memory patterns used by final MCHN class projection.")
     parser.add_argument("--mchn-maxsim-weight", type=float, default=0.50, help="Log-score fusion weight for the max-sim branch in final MCHN.")
     parser.add_argument("--optimized-aug-per-class", type=int, default=16, help="Class-balanced templates per class used to build optimized MCHN augmentation memory.")
@@ -2986,6 +3125,7 @@ if __name__ == "__main__":
         print("Warning: using legacy index-level split; near-duplicate templates may cross train/test.")
     assert_disjoint_splits(train_indices, test_indices)
     print(f"Held-out split ({args.split_mode}): train templates={len(train_indices)}, test templates={len(test_indices)}")
+    save_final_experiment_config(args, args.output_dir, train_count=len(train_indices), test_count=len(test_indices))
     if args.debug_eval_inputs:
         save_evaluation_input_debug(
             loader,
@@ -3063,6 +3203,16 @@ if __name__ == "__main__":
 
     pollution_types = resolve_pollution_types(args.pollution)
     print(f"Pollutions: {', '.join(pollution_types)}")
+    if not args.skip_pollution_effectiveness:
+        save_pollution_effectiveness_summary(
+            loader,
+            args.output_dir,
+            test_indices,
+            pollution_types=pollution_types,
+            severities=SEVERITIES,
+            sample_count=args.pollution_effectiveness_samples,
+            seed=args.seed,
+        )
 
     all_results = {}
     balanced_results = {}

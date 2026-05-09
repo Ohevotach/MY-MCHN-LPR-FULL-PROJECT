@@ -1,0 +1,31 @@
+{
+  "final_mchn_method": "Modern Hopfield Network",
+  "final_mchn_ablation_variant": "MCHN-TopKHybrid",
+  "description": "Final thesis configuration: group-level train/test split, clean train memory, polluted held-out query, top-k attention class projection, and max-sim log-score fusion. The main comparison table uses the method name Modern Hopfield Network; MCHN-TopKHybrid is kept as the ablation/implementation variant name.",
+  "main_eval": {
+    "pollution": "core",
+    "severities": [0.0, 0.1, 0.2, 0.4, 0.6, 0.8],
+    "split_mode": "group",
+    "near_duplicate_threshold": 0.99,
+    "near_duplicate_inspect_threshold": 0.95,
+    "mchn_topk": 10,
+    "mchn_maxsim_weight": 0.5,
+    "pollution_effectiveness_samples": 256
+  },
+  "required_outputs": [
+    "group_split_seed2026.csv",
+    "pollution_effectiveness_summary.csv",
+    "robustness_all_results.csv",
+    "summary_method_ranking.csv",
+    "ablation_results.csv",
+    "beta_ablation_results.csv",
+    "capacity_real_template_results.csv",
+    "capacity_random_pattern_results.csv",
+    "mchn_attention_error_analysis.csv",
+    "final_experiment_config.json"
+  ],
+  "one_click_scripts": [
+    "scripts/run_final_experiments.ps1",
+    "scripts/run_final_experiments.sh"
+  ]
+}

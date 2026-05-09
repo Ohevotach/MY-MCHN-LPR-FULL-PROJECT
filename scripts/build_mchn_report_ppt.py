@@ -170,7 +170,14 @@ def add_footer(slide, n):
 
 def build_slides():
     ranking = read_csv(ROOT / "results" / "summary_method_ranking.csv")
-    mchn_rows = [r for r in ranking if r["method"] == "Modern Hopfield"]
+    final_mchn_name = "Modern Hopfield Network"
+    mchn_rows = [r for r in ranking if r["method"] == final_mchn_name]
+    if not mchn_rows:
+        final_mchn_name = "Modern Hopfield"
+        mchn_rows = [r for r in ranking if r["method"] == final_mchn_name]
+    if not mchn_rows:
+        final_mchn_name = "MCHN-TopKHybrid"
+        mchn_rows = [r for r in ranking if r["method"] == final_mchn_name]
     order = ["noise", "salt_pepper", "fog", "blur", "mask", "affine", "dirt"]
     by_pollution = {r["pollution"]: r for r in mchn_rows}
     final_avg = sum(float(by_pollution[p]["final_accuracy"]) for p in order) / len(order)
@@ -260,7 +267,10 @@ def build_slides():
     slides.append(s)
 
     s = Slide("MCHN 在不同污染下的表现", "实验结果与分析")
-    s.image(ROOT / "results" / "mchn_pollution_severity_curves.png", 0.75, 1.45, 7.0, 5.05)
+    mchn_curve = ROOT / "results" / "mchn_pollution_severity_curves.png"
+    if not mchn_curve.exists():
+        mchn_curve = ROOT / "results" / "mchn_topkhybrid_pollution_severity_curves.png"
+    s.image(mchn_curve, 0.75, 1.45, 7.0, 5.05)
     rows = [["污染", "最高强度准确率", "平均准确率"]]
     for p in order:
         r = by_pollution[p]
