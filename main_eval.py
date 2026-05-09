@@ -24,6 +24,7 @@ POLLUTIONS = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
 CORE_POLLUTIONS = ["noise", "salt_pepper", "blur", "mask", "dirt", "fog"]
 METHOD_ORDER = [
     "Modern Hopfield",
+    "Modern Hopfield-Optimized",
     "Affine-robust Hopfield",
     "Balanced Traditional Hopfield",
     "CNN",
@@ -145,6 +146,18 @@ def build_hopfield_ensemble(memory, device, beta_override=None):
     ]
 
 
+def build_optimized_hopfield_ensemble(memory, device, beta_override=None):
+    beta_override = None if beta_override is None else float(beta_override)
+    def beta(default):
+        return default if beta_override is None else beta_override
+
+    return [
+        ModernHopfieldNetwork(memory, beta=beta(10.0), metric="dot", normalize=True, feature_mode="weighted_concat").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(14.0), metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(3.0), metric="euclidean", normalize=False, feature_mode="weighted_concat").to(device),
+    ]
+
+
 def augment_hopfield_memory(memory, labels, img_h=64, img_w=32):
     if memory.numel() == 0:
         return memory, labels
@@ -165,7 +178,7 @@ def augment_hopfield_memory(memory, labels, img_h=64, img_w=32):
     return stacked.contiguous(), labels.repeat(len(variants)).contiguous()
 
 
-def build_balanced_medium_aug_memory(memory, labels, img_h=64, img_w=32, max_per_class=96, seed=2026):
+def build_balanced_medium_aug_memory(memory, labels, img_h=64, img_w=32, max_per_class=16, seed=2026):
     """Build a compact train-only augmented memory bank.
 
     All clean train templates are kept. Medium-severity geometric/noise/stroke
@@ -207,12 +220,30 @@ def build_balanced_medium_aug_memory(memory, labels, img_h=64, img_w=32, max_per
     generator.manual_seed(int(seed) + 7919)
     noisy = (base + 0.18 * torch.randn(base.shape, device=device, generator=generator)).clamp(0.0, 1.0)
     mask = torch.ones_like(base)
+    dirt = base.clone()
+    foreground_dropout = base.clone()
+    yy, xx = torch.meshgrid(
+        torch.arange(img_h, dtype=torch.float32, device=device),
+        torch.arange(img_w, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
     for i in range(mask.shape[0]):
         y = rng.randint(0, max(0, img_h - 14))
         x = rng.randint(0, max(0, img_w - 8))
         h = rng.randint(6, 14)
         w = rng.randint(4, 8)
         mask[i, :, y : min(img_h, y + h), x : min(img_w, x + w)] = 0.0
+
+        for _ in range(3):
+            cx = rng.uniform(0, img_w - 1)
+            cy = rng.uniform(0, img_h - 1)
+            radius = rng.uniform(2.0, 8.0)
+            spot = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius**2
+            dirt[i, :, spot] = rng.uniform(0.0, 0.35)
+
+        fg = foreground_dropout[i] > 0.5
+        drop = torch.rand(foreground_dropout[i].shape, dtype=foreground_dropout.dtype, device=device, generator=generator) < 0.10
+        foreground_dropout[i][fg & drop] = 0.0
     occluded = base * mask
 
     affine_variants = affine_memory_variants(base)
@@ -222,10 +253,14 @@ def build_balanced_medium_aug_memory(memory, labels, img_h=64, img_w=32, max_per
         eroded,
         noisy,
         occluded,
+        dirt,
+        foreground_dropout,
         shifted,
         *affine_variants,
     ]
     variant_labels = [
+        selected_labels,
+        selected_labels,
         selected_labels,
         selected_labels,
         selected_labels,
@@ -1150,6 +1185,7 @@ def save_evaluation_input_debug(
         writer.writerow(["method", "input_tensor", "clean_tensor_used_for_prediction", "library_or_memory_source"])
         for method, source in [
             ("Modern Hopfield", "same polluted q from PollutedCharDataset", "no", "clean train split memory"),
+            ("Modern Hopfield-Optimized", "same polluted q from PollutedCharDataset", "no", "train-only balanced augmented memory"),
             ("Balanced Traditional Hopfield", "same polluted q from PollutedCharDataset", "no", "train split class prototypes"),
             ("CNN", "same polluted q from PollutedCharDataset", "no", "trained on clean train split"),
             ("Nearest Neighbor", "same polluted q from PollutedCharDataset", "no", "train split memory"),
@@ -1227,6 +1263,8 @@ def run_robustness_evaluation(
     affine_variant_level="light",
     save_confusion=False,
     num_workers=0,
+    optimized_aug_per_class=16,
+    enable_optimized_mchn=True,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2: held-out evaluation, pollution={pollution_type}...")
@@ -1237,6 +1275,22 @@ def run_robustness_evaluation(
     num_classes = len(loader.idx_to_label)
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
+    optimized_memory = None
+    optimized_labels = None
+    optimized_models = None
+    if enable_optimized_mchn:
+        optimized_memory, optimized_labels = build_balanced_medium_aug_memory(
+            train_memory,
+            train_labels,
+            max_per_class=optimized_aug_per_class,
+            seed=seed + 6101,
+        )
+        optimized_models = build_optimized_hopfield_ensemble(optimized_memory, device)
+        print(
+            "Optimized MCHN memory: "
+            f"{optimized_memory.shape[0]} templates "
+            f"(clean={train_memory.shape[0]}, aug_per_class={optimized_aug_per_class})."
+        )
     # Classical Hopfield is kept as a fair thesis baseline. Character images are
     # sparse, so the implementation balances patterns before Hebbian storage and
     # stores one prototype per class to avoid background-dominated cross-talk.
@@ -1258,6 +1312,10 @@ def run_robustness_evaluation(
         methods["Modern Hopfield"] = lambda q: torch.argmax(
             predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
         )
+        if enable_optimized_mchn:
+            methods["Modern Hopfield-Optimized"] = lambda q: torch.argmax(
+                predict_modern_hopfield_scores(optimized_models, q, optimized_labels, num_classes), dim=-1
+            )
         methods["CNN"] = lambda q: torch.argmax(trained_cnn(q), dim=-1)
         if include_affine_robust:
             methods["Affine-robust Hopfield"] = lambda q: predict_affine_robust_hopfield(
@@ -1270,10 +1328,18 @@ def run_robustness_evaluation(
         return order_method_results(methods)
 
     def make_score_methods():
-        return {
+        score_methods = {
             "Modern Hopfield": lambda q: predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes),
             "CNN": lambda q: trained_cnn(q),
         }
+        if enable_optimized_mchn:
+            score_methods["Modern Hopfield-Optimized"] = lambda q: predict_modern_hopfield_scores(
+                optimized_models,
+                q,
+                optimized_labels,
+                num_classes,
+            )
+        return score_methods
 
     results = {name: [] for name in make_methods()}
     top3_results = {f"{name} Top-3": [] for name in make_score_methods()}
@@ -1333,7 +1399,7 @@ def run_robustness_evaluation(
             batch_size,
             device,
             severity=SEVERITIES[-1],
-            method_names=("Modern Hopfield", "Balanced Traditional Hopfield", "CNN"),
+            method_names=("Modern Hopfield", "Modern Hopfield-Optimized", "Balanced Traditional Hopfield", "CNN"),
             num_workers=num_workers,
         )
     return results
@@ -1353,6 +1419,8 @@ def run_class_balanced_evaluation(
     include_affine_robust=False,
     affine_variant_level="light",
     num_workers=0,
+    optimized_aug_per_class=16,
+    enable_optimized_mchn=True,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2c: class-balanced evaluation, pollution={pollution_type}...")
@@ -1373,6 +1441,17 @@ def run_class_balanced_evaluation(
     num_classes = len(loader.idx_to_label)
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
+    optimized_memory = None
+    optimized_labels = None
+    optimized_models = None
+    if enable_optimized_mchn:
+        optimized_memory, optimized_labels = build_balanced_medium_aug_memory(
+            train_memory,
+            train_labels,
+            max_per_class=optimized_aug_per_class,
+            seed=seed + 7101,
+        )
+        optimized_models = build_optimized_hopfield_ensemble(optimized_memory, device)
     traditional_hopfield = TraditionalHopfieldNetwork(
         prototypes,
         prototype_labels,
@@ -1392,6 +1471,10 @@ def run_class_balanced_evaluation(
             ),
             "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
         }
+        if enable_optimized_mchn:
+            methods["Modern Hopfield-Optimized"] = lambda q: torch.argmax(
+                predict_modern_hopfield_scores(optimized_models, q, optimized_labels, num_classes), dim=-1
+            )
         if include_affine_robust:
             methods["Affine-robust Hopfield"] = lambda q: predict_affine_robust_hopfield(
                 hopfield_models,
@@ -1794,12 +1877,19 @@ def save_mchn_attention_error_analysis(
     severity=0.8,
     seed=2026,
     num_workers=0,
+    optimized_aug_per_class=16,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2f: MCHN attention error analysis, pollution={pollution_type}, severity={severity}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    models = build_hopfield_ensemble(train_memory, device)
+    analysis_memory, analysis_labels = build_balanced_medium_aug_memory(
+        train_memory,
+        train_labels,
+        max_per_class=optimized_aug_per_class,
+        seed=seed + 8101,
+    )
+    models = build_optimized_hopfield_ensemble(analysis_memory, device)
     num_classes = len(loader.idx_to_label)
     fixed_eval_indices = build_fixed_sample_sequence(test_indices, samples, seed=seed + 3301)
     dataset = PollutedCharDataset(
@@ -1827,7 +1917,7 @@ def save_mchn_attention_error_analysis(
             cursor += labels.numel()
             q = q.to(device)
             labels = labels.to(device)
-            class_scores = predict_modern_hopfield_scores(models, q, train_labels, num_classes)
+            class_scores = predict_modern_hopfield_scores(models, q, analysis_labels, num_classes)
             class_probs = torch.softmax(class_scores, dim=-1)
             pred = torch.argmax(class_probs, dim=-1)
             _, _, attention_weights, sim_scores = models[0](q, return_attention=True, return_similarity=True)
@@ -1859,7 +1949,7 @@ def save_mchn_attention_error_analysis(
                             for cls, score in zip(top_class_ids[i].detach().cpu().tolist(), top_class_scores[i].detach().cpu().tolist())
                         ),
                         "top_memory_indices": " | ".join(str(idx) for idx in memory_ids),
-                        "top_memory_labels": " | ".join(display_label(loader.idx_to_label[int(train_labels[idx].item())]) for idx in memory_ids),
+                        "top_memory_labels": " | ".join(display_label(loader.idx_to_label[int(analysis_labels[idx].item())]) for idx in memory_ids),
                         "top_memory_attention": " | ".join(f"{float(v):.6f}" for v in top_attn_values[i].detach().cpu().tolist()),
                         "top_memory_similarity": " | ".join(f"{float(sim_scores[i, idx].item()):.6f}" for idx in memory_ids),
                     }
@@ -2659,6 +2749,8 @@ def parse_args():
     parser.add_argument("--debug-eval-pollution", default="dirt", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
     parser.add_argument("--debug-eval-severity", type=float, default=0.8)
     parser.add_argument("--debug-eval-samples", type=int, default=16)
+    parser.add_argument("--skip-optimized-mchn", action="store_true", help="Do not evaluate the optimized train-only augmented MCHN variant.")
+    parser.add_argument("--optimized-aug-per-class", type=int, default=16, help="Class-balanced templates per class used to build optimized MCHN augmentation memory.")
     parser.add_argument("--skip-ablation", action="store_true")
     parser.add_argument("--ablation-samples", type=int, default=1000)
     parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
@@ -2870,6 +2962,8 @@ if __name__ == "__main__":
             affine_variant_level=args.affine_variant_level,
             save_confusion=args.save_confusion,
             num_workers=args.num_workers,
+            optimized_aug_per_class=args.optimized_aug_per_class,
+            enable_optimized_mchn=not args.skip_optimized_mchn,
         )
         if not args.skip_balanced_eval:
             balanced_results[pollution_type] = run_class_balanced_evaluation(
@@ -2886,6 +2980,8 @@ if __name__ == "__main__":
                 include_affine_robust=args.include_affine_robust,
                 affine_variant_level=args.affine_variant_level,
                 num_workers=args.num_workers,
+                optimized_aug_per_class=args.optimized_aug_per_class,
+                enable_optimized_mchn=not args.skip_optimized_mchn,
             )
 
     save_results_csv(args.output_dir, all_results)
@@ -2911,6 +3007,7 @@ if __name__ == "__main__":
             severity=args.ablation_severity,
             seed=args.seed,
             num_workers=args.num_workers,
+            optimized_aug_per_class=args.optimized_aug_per_class,
         )
 
     if not args.skip_beta_ablation:
