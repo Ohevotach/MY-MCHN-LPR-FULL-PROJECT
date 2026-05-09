@@ -165,6 +165,81 @@ def augment_hopfield_memory(memory, labels, img_h=64, img_w=32):
     return stacked.contiguous(), labels.repeat(len(variants)).contiguous()
 
 
+def build_balanced_medium_aug_memory(memory, labels, img_h=64, img_w=32, max_per_class=96, seed=2026):
+    """Build a compact train-only augmented memory bank.
+
+    All clean train templates are kept. Medium-severity geometric/noise/stroke
+    variants are added from a class-balanced subset so classes with many
+    templates do not dominate the attention projection.
+    """
+    if memory.numel() == 0:
+        return memory, labels
+
+    device = memory.device
+    rng = random.Random(seed)
+    labels_cpu = labels.detach().cpu().long()
+    selected = []
+    for class_id in sorted(set(labels_cpu.tolist())):
+        class_indices = [idx for idx, value in enumerate(labels_cpu.tolist()) if value == class_id]
+        rng.shuffle(class_indices)
+        selected.extend(class_indices[: min(int(max_per_class), len(class_indices))])
+    if not selected:
+        return memory, labels
+
+    selected = torch.tensor(sorted(selected), dtype=torch.long, device=device)
+    base = memory[selected].float().view(-1, 1, img_h, img_w)
+    selected_labels = labels[selected]
+
+    blurred = F.avg_pool2d(F.pad(base, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
+    dilated = F.max_pool2d(base, kernel_size=3, stride=1, padding=1)
+    eroded = -F.max_pool2d(-base, kernel_size=3, stride=1, padding=1)
+    shifted = torch.cat(
+        [
+            torch.roll(base, shifts=1, dims=2),
+            torch.roll(base, shifts=-1, dims=2),
+            torch.roll(base, shifts=1, dims=3),
+            torch.roll(base, shifts=-1, dims=3),
+        ],
+        dim=0,
+    )
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed) + 7919)
+    noisy = (base + 0.18 * torch.randn(base.shape, device=device, generator=generator)).clamp(0.0, 1.0)
+    mask = torch.ones_like(base)
+    for i in range(mask.shape[0]):
+        y = rng.randint(0, max(0, img_h - 14))
+        x = rng.randint(0, max(0, img_w - 8))
+        h = rng.randint(6, 14)
+        w = rng.randint(4, 8)
+        mask[i, :, y : min(img_h, y + h), x : min(img_w, x + w)] = 0.0
+    occluded = base * mask
+
+    affine_variants = affine_memory_variants(base)
+    variant_tensors = [
+        blurred,
+        dilated,
+        eroded,
+        noisy,
+        occluded,
+        shifted,
+        *affine_variants,
+    ]
+    variant_labels = [
+        selected_labels,
+        selected_labels,
+        selected_labels,
+        selected_labels,
+        selected_labels,
+        selected_labels.repeat(4),
+        *([selected_labels] * len(affine_variants)),
+    ]
+
+    aug_memory = torch.cat([v.clamp(0.0, 1.0).view(v.shape[0], -1) for v in variant_tensors], dim=0)
+    aug_labels = torch.cat(variant_labels, dim=0)
+    return torch.cat([memory.float(), aug_memory], dim=0).contiguous(), torch.cat([labels, aug_labels], dim=0).contiguous()
+
+
 def affine_memory_variants(imgs):
     device = imgs.device
     dtype = imgs.dtype
@@ -454,6 +529,24 @@ def build_group_duplicate_split(
         examples = ", ".join(sorted(overlap)[:10])
         raise RuntimeError(f"Group split leakage detected: {len(overlap)} groups in train and test, e.g. {examples}.")
 
+    train_hashes = defaultdict(int)
+    test_hashes = defaultdict(int)
+    for idx in train_indices:
+        train_hashes[exact_hashes[idx]] += 1
+    for idx in test_indices:
+        test_hashes[exact_hashes[idx]] += 1
+    exact_cross_split_duplicate_pairs = sum(
+        train_hashes[md5_value] * test_hashes.get(md5_value, 0)
+        for md5_value in train_hashes
+    )
+    test_images_with_exact_train_match = sum(1 for idx in test_indices if train_hashes.get(exact_hashes[idx], 0) > 0)
+    if exact_cross_split_duplicate_pairs or test_images_with_exact_train_match:
+        raise RuntimeError(
+            "Exact duplicate leakage after group split: "
+            f"pairs={exact_cross_split_duplicate_pairs}, "
+            f"test images with exact train match={test_images_with_exact_train_match}."
+        )
+
     print(
         "Group-level split ready: "
         f"templates={num_templates}, groups={len(group_members)}, "
@@ -462,6 +555,9 @@ def build_group_duplicate_split(
         f"near pairs >= {group_threshold:g}: {len(near_rows_ge0999)}, "
         f"inspection pairs >= {inspect_threshold:g}: {len(near_rows_ge099)}."
     )
+    print("Group split validation: train/test group_id overlap = 0")
+    print(f"Group split validation: exact_cross_split_duplicate_pairs = {exact_cross_split_duplicate_pairs}")
+    print(f"Group split validation: test_images_with_exact_train_match = {test_images_with_exact_train_match}")
     print(f"Saved group split CSVs in {output_dir}.")
     return train_indices, test_indices
 
@@ -539,7 +635,7 @@ def class_max_similarity_scores(sim_scores, template_labels, beta, num_classes, 
     return torch.stack(scores, dim=-1)
 
 
-def class_attention_projection_scores(attention_weights, template_labels, num_classes, template_mask=None):
+def class_attention_projection_scores(attention_weights, template_labels, num_classes, template_mask=None, projection_mode="sum"):
     labels = template_labels.to(device=attention_weights.device, dtype=torch.long)
     if labels.dim() != 1 or labels.shape[0] != attention_weights.shape[-1]:
         raise ValueError("template_labels must have shape [num_templates].")
@@ -547,10 +643,28 @@ def class_attention_projection_scores(attention_weights, template_labels, num_cl
     label_proj = F.one_hot(labels, num_classes=int(num_classes)).to(dtype=attention_weights.dtype)
     if template_mask is not None and template_mask.dim() == 1:
         label_proj = label_proj * template_mask.to(device=attention_weights.device, dtype=attention_weights.dtype).unsqueeze(-1)
-    return torch.matmul(attention_weights, label_proj)
+    class_scores = torch.matmul(attention_weights, label_proj)
+    if projection_mode == "sum":
+        return class_scores
+
+    class_counts = label_proj.sum(dim=0).clamp_min(1.0).unsqueeze(0)
+    if projection_mode == "mean":
+        return class_scores / class_counts
+    if projection_mode == "prior_corrected":
+        corrected = class_scores / class_counts
+        return corrected / corrected.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    raise ValueError(f"Unsupported projection_mode: {projection_mode}")
 
 
-def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_mask=None, scoring_mode="class_projection"):
+def ensemble_hopfield_scores(
+    models,
+    q,
+    template_labels,
+    num_classes,
+    template_mask=None,
+    scoring_mode="class_projection",
+    projection_mode="sum",
+):
     log_prob_parts = []
     primary_sim = None
     if scoring_mode not in {"class_projection", "maxsim"}:
@@ -558,16 +672,20 @@ def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_m
 
     for model in models:
         if scoring_mode == "class_projection":
-            outputs = model(
+            retrieved, _, attention_weights, sim_scores = model(
                 q,
                 template_mask=template_mask,
-                memory_labels=template_labels,
-                num_classes=num_classes,
-                return_dict=True,
+                return_attention=True,
+                return_similarity=True,
             )
-            scores = outputs["class_scores"].clamp_min(1e-12)
+            scores = class_attention_projection_scores(
+                attention_weights,
+                template_labels,
+                num_classes,
+                template_mask=template_mask,
+                projection_mode=projection_mode,
+            ).clamp_min(1e-12)
             log_probs = torch.log(scores)
-            sim_scores = outputs["sim_scores"]
         else:
             _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
             scores = class_max_similarity_scores(
@@ -587,7 +705,15 @@ def ensemble_hopfield_scores(models, q, template_labels, num_classes, template_m
     return fused, primary_sim
 
 
-def predict_modern_hopfield_scores(models, q, template_labels, num_classes, template_mask=None, scoring_mode="class_projection"):
+def predict_modern_hopfield_scores(
+    models,
+    q,
+    template_labels,
+    num_classes,
+    template_mask=None,
+    scoring_mode="class_projection",
+    projection_mode="sum",
+):
     return ensemble_hopfield_scores(
         models,
         q,
@@ -595,6 +721,7 @@ def predict_modern_hopfield_scores(models, q, template_labels, num_classes, temp
         num_classes,
         template_mask=template_mask,
         scoring_mode=scoring_mode,
+        projection_mode=projection_mode,
     )[0]
 
 
@@ -771,6 +898,46 @@ def evaluate_methods(methods, test_loader, device):
                 correct[name] += (pred == labels).sum().item()
             total += labels.size(0)
     return {name: 100.0 * value / max(total, 1) for name, value in correct.items()}
+
+
+def evaluate_hopfield_accuracy_entropy(
+    models,
+    template_labels,
+    num_classes,
+    test_loader,
+    device,
+    scoring_mode="class_projection",
+    projection_mode="sum",
+):
+    correct = 0
+    total = 0
+    entropy_sum = 0.0
+    entropy_count = 0
+    with torch.no_grad():
+        for q, _, labels in test_loader:
+            q = q.to(device)
+            labels = labels.to(device)
+            scores = predict_modern_hopfield_scores(
+                models,
+                q,
+                template_labels,
+                num_classes,
+                scoring_mode=scoring_mode,
+                projection_mode=projection_mode,
+            )
+            pred = torch.argmax(scores, dim=-1)
+            correct += (pred == labels).sum().item()
+            total += labels.numel()
+
+            for model in models:
+                _, _, attention_weights = model(q, return_attention=True)
+                entropy = -(attention_weights.clamp_min(1e-12) * attention_weights.clamp_min(1e-12).log()).sum(dim=-1)
+                normalized = entropy / np.log(max(2, attention_weights.shape[-1]))
+                entropy_sum += float(normalized.sum().item())
+                entropy_count += int(normalized.numel())
+    accuracy = 100.0 * correct / max(total, 1)
+    mean_entropy = entropy_sum / max(entropy_count, 1)
+    return accuracy, mean_entropy
 
 
 def evaluate_topk_score_methods(score_methods, test_loader, device, topk=(1, 3)):
@@ -1257,7 +1424,7 @@ def run_ablation_evaluation(
     print(f"Task 2b: ablation study, pollution={pollution_type}, severities={SEVERITIES}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    aug_memory, aug_labels = augment_hopfield_memory(train_memory, train_labels)
+    aug_memory, aug_labels = build_balanced_medium_aug_memory(train_memory, train_labels, seed=seed + 1901)
     num_classes = len(loader.idx_to_label)
 
     feature_ablations = {
@@ -1277,9 +1444,34 @@ def run_ablation_evaluation(
             [ModernHopfieldNetwork(train_memory, beta=30.0, metric="dot", normalize=True, feature_mode="profile").to(device)],
             train_labels,
         ),
+        "MCHN-WeightedConcat": (
+            [ModernHopfieldNetwork(train_memory, beta=20.0, metric="dot", normalize=True, feature_mode="weighted_concat").to(device)],
+            train_labels,
+        ),
     }
     clean_ensemble = build_hopfield_ensemble(train_memory, device)
     aug_ensemble = build_hopfield_ensemble(aug_memory, device)
+    similarity_ablations = {
+        "MCHN-Cosine": (
+            [ModernHopfieldNetwork(aug_memory, beta=20.0, metric="dot", normalize=True, feature_mode="weighted_concat").to(device)],
+            aug_labels,
+        ),
+        "MCHN-NegEuclidean": (
+            [ModernHopfieldNetwork(aug_memory, beta=3.0, metric="euclidean", normalize=False, feature_mode="weighted_concat").to(device)],
+            aug_labels,
+        ),
+        "MCHN-NegManhattan": (
+            [ModernHopfieldNetwork(aug_memory, beta=1.0, metric="manhattan", normalize=False, feature_mode="weighted_concat").to(device)],
+            aug_labels,
+        ),
+        "MCHN-HybridCosEuclidean": (
+            [
+                ModernHopfieldNetwork(aug_memory, beta=20.0, metric="dot", normalize=True, feature_mode="weighted_concat").to(device),
+                ModernHopfieldNetwork(aug_memory, beta=3.0, metric="euclidean", normalize=False, feature_mode="weighted_concat").to(device),
+            ],
+            aug_labels,
+        ),
+    }
 
     feature_methods = {
         name: (lambda q, models=models, labels=labels: torch.argmax(
@@ -1293,19 +1485,42 @@ def run_ablation_evaluation(
             predict_modern_hopfield_scores(clean_ensemble, q, train_labels, num_classes),
             dim=-1,
         ),
-        "MCHN-Ensemble-AugMemory": lambda q: torch.argmax(
+        "MCHN-Ensemble-BalancedAugMemory": lambda q: torch.argmax(
             predict_modern_hopfield_scores(aug_ensemble, q, aug_labels, num_classes),
             dim=-1,
         ),
     }
     projection_methods = {
-        "MCHN-ClassProjection": lambda q: torch.argmax(
+        "MCHN-SumProjection": lambda q: torch.argmax(
             predict_modern_hopfield_scores(
                 aug_ensemble,
                 q,
                 aug_labels,
                 num_classes,
                 scoring_mode="class_projection",
+                projection_mode="sum",
+            ),
+            dim=-1,
+        ),
+        "MCHN-MeanClassProjection": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(
+                aug_ensemble,
+                q,
+                aug_labels,
+                num_classes,
+                scoring_mode="class_projection",
+                projection_mode="mean",
+            ),
+            dim=-1,
+        ),
+        "MCHN-PriorCorrectedProjection": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(
+                aug_ensemble,
+                q,
+                aug_labels,
+                num_classes,
+                scoring_mode="class_projection",
+                projection_mode="prior_corrected",
             ),
             dim=-1,
         ),
@@ -1320,10 +1535,18 @@ def run_ablation_evaluation(
             dim=-1,
         ),
     }
+    similarity_methods = {
+        name: (lambda q, models=models, labels=labels: torch.argmax(
+            predict_modern_hopfield_scores(models, q, labels, num_classes),
+            dim=-1,
+        ))
+        for name, (models, labels) in similarity_ablations.items()
+    }
     all_groups = {
         "feature": feature_methods,
         "memory": memory_methods,
         "projection": projection_methods,
+        "similarity": similarity_methods,
     }
     group_results = {group_name: {name: [] for name in methods} for group_name, methods in all_groups.items()}
     fixed_eval_indices = build_fixed_sample_sequence(test_indices, samples, seed=seed + 1701)
@@ -1394,6 +1617,12 @@ def run_ablation_evaluation(
         pollution_type=f"ablation_projection_{pollution_type}",
         filename="ablation_projection_curve.png",
     )
+    visualizer.plot_multi_robustness_curve(
+        SEVERITIES,
+        group_results["similarity"],
+        pollution_type=f"ablation_similarity_{pollution_type}",
+        filename="ablation_similarity_curve.png",
+    )
     visualizer.plot_final_severity_bar(
         final_scores,
         pollution_type=f"ablation_{pollution_type}",
@@ -1426,11 +1655,12 @@ def run_beta_ablation_evaluation(
     print(f"Task 2e: beta ablation, pollution={pollution_type}, severities={SEVERITIES}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
-    aug_memory, aug_labels = augment_hopfield_memory(train_memory, train_labels)
+    aug_memory, aug_labels = build_balanced_medium_aug_memory(train_memory, train_labels, seed=seed + 2903)
     num_classes = len(loader.idx_to_label)
 
     rows = []
     results = {f"beta={beta_value:g}": [] for beta_value in beta_values}
+    entropy_results = {f"beta={beta_value:g}": [] for beta_value in beta_values}
     fixed_eval_indices = build_fixed_sample_sequence(test_indices, samples, seed=seed + 2311)
 
     for current_severity in SEVERITIES:
@@ -1454,18 +1684,17 @@ def run_beta_ablation_evaluation(
         for beta_value in beta_values:
             models = build_hopfield_ensemble(aug_memory, device, beta_override=beta_value)
             method_name = f"beta={beta_value:g}"
-            scores = evaluate_methods(
-                {
-                    method_name: lambda q, models=models: torch.argmax(
-                        predict_modern_hopfield_scores(models, q, aug_labels, num_classes),
-                        dim=-1,
-                    )
-                },
+            accuracy, attention_entropy = evaluate_hopfield_accuracy_entropy(
+                models,
+                aug_labels,
+                num_classes,
                 test_loader,
                 device,
+                scoring_mode="class_projection",
+                projection_mode="sum",
             )
-            accuracy = scores[method_name]
             results[method_name].append(accuracy)
+            entropy_results[method_name].append(attention_entropy)
             rows.append(
                 {
                     "pollution": pollution_type,
@@ -1473,13 +1702,14 @@ def run_beta_ablation_evaluation(
                     "beta": beta_value,
                     "samples": len(fixed_eval_indices),
                     "accuracy": accuracy,
+                    "attention_entropy": attention_entropy,
                 }
             )
-            print(f"    beta={beta_value:g}: {accuracy:.2f}%")
+            print(f"    beta={beta_value:g}: {accuracy:.2f}%, attention_entropy={attention_entropy:.4f}")
 
     csv_path = os.path.join(visualizer.save_dir, "beta_ablation_results.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["pollution", "severity", "beta", "samples", "accuracy"])
+        writer = csv.DictWriter(f, fieldnames=["pollution", "severity", "beta", "samples", "accuracy", "attention_entropy"])
         writer.writeheader()
         for row in rows:
             writer.writerow(
@@ -1489,6 +1719,7 @@ def run_beta_ablation_evaluation(
                     "beta": f"{row['beta']:.6g}",
                     "samples": row["samples"],
                     "accuracy": f"{row['accuracy']:.4f}",
+                    "attention_entropy": f"{row['attention_entropy']:.6f}",
                 }
             )
 
@@ -1506,8 +1737,122 @@ def run_beta_ablation_evaluation(
         pollution_type=f"beta_ablation_{pollution_type}",
         filename="beta_ablation_accuracy.png",
     )
+    visualizer.plot_multi_metric_curve(
+        SEVERITIES,
+        entropy_results,
+        title=f"Attention entropy vs. {pollution_type}",
+        ylabel="Normalized attention entropy",
+        filename="beta_ablation_attention_entropy.png",
+        ylim=(0, 1.05),
+    )
     print(f"Saved beta ablation CSV: {csv_path}")
     return results
+
+
+def save_mchn_attention_error_analysis(
+    loader,
+    output_dir,
+    device,
+    train_indices,
+    test_indices,
+    samples,
+    batch_size,
+    pollution_type="mixed",
+    severity=0.8,
+    seed=2026,
+    num_workers=0,
+):
+    print("\n" + "=" * 50)
+    print(f"Task 2f: MCHN attention error analysis, pollution={pollution_type}, severity={severity}...")
+    train_memory = loader.memory_matrix[train_indices].to(device)
+    train_labels = loader.labels[train_indices].to(device)
+    models = build_hopfield_ensemble(train_memory, device)
+    num_classes = len(loader.idx_to_label)
+    fixed_eval_indices = build_fixed_sample_sequence(test_indices, samples, seed=seed + 3301)
+    dataset = PollutedCharDataset(
+        loader,
+        virtual_size=len(fixed_eval_indices),
+        pollution_type=pollution_type,
+        severity=severity,
+        seed=seed + 3307,
+        fixed_sample_indices=fixed_eval_indices,
+        deterministic_per_index=True,
+    )
+    test_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+        pin_memory=device.type == "cuda",
+    )
+
+    rows = []
+    cursor = 0
+    with torch.no_grad():
+        for q, _, labels in test_loader:
+            batch_indices = fixed_eval_indices[cursor : cursor + labels.numel()]
+            cursor += labels.numel()
+            q = q.to(device)
+            labels = labels.to(device)
+            class_scores = predict_modern_hopfield_scores(models, q, train_labels, num_classes)
+            class_probs = torch.softmax(class_scores, dim=-1)
+            pred = torch.argmax(class_probs, dim=-1)
+            _, _, attention_weights, sim_scores = models[0](q, return_attention=True, return_similarity=True)
+            entropy = -(attention_weights.clamp_min(1e-12) * attention_weights.clamp_min(1e-12).log()).sum(dim=-1)
+            entropy = entropy / np.log(max(2, attention_weights.shape[-1]))
+            top_class_scores, top_class_ids = torch.topk(class_probs, k=min(5, num_classes), dim=-1)
+            top_attn_values, top_attn_ids = torch.topk(attention_weights, k=min(5, attention_weights.shape[-1]), dim=-1)
+
+            for i in range(labels.numel()):
+                true_id = int(labels[i].item())
+                pred_id = int(pred[i].item())
+                if true_id == pred_id:
+                    continue
+                memory_ids = [int(v) for v in top_attn_ids[i].detach().cpu().tolist()]
+                rows.append(
+                    {
+                        "sample_order": len(rows),
+                        "template_index": int(batch_indices[i]),
+                        "template_path": loader.template_paths[int(batch_indices[i])],
+                        "pollution": pollution_type,
+                        "severity": f"{float(severity):.3f}",
+                        "true_label": display_label(loader.idx_to_label[true_id]),
+                        "pred_label": display_label(loader.idx_to_label[pred_id]),
+                        "pred_confidence": f"{float(class_probs[i, pred_id].item()):.6f}",
+                        "true_confidence": f"{float(class_probs[i, true_id].item()):.6f}",
+                        "attention_entropy": f"{float(entropy[i].item()):.6f}",
+                        "top_classes": " | ".join(
+                            f"{display_label(loader.idx_to_label[int(cls)])}:{float(score):.4f}"
+                            for cls, score in zip(top_class_ids[i].detach().cpu().tolist(), top_class_scores[i].detach().cpu().tolist())
+                        ),
+                        "top_memory_indices": " | ".join(str(idx) for idx in memory_ids),
+                        "top_memory_labels": " | ".join(display_label(loader.idx_to_label[int(train_labels[idx].item())]) for idx in memory_ids),
+                        "top_memory_attention": " | ".join(f"{float(v):.6f}" for v in top_attn_values[i].detach().cpu().tolist()),
+                        "top_memory_similarity": " | ".join(f"{float(sim_scores[i, idx].item()):.6f}" for idx in memory_ids),
+                    }
+                )
+
+    csv_path = os.path.join(output_dir, "mchn_attention_error_analysis.csv")
+    fieldnames = [
+        "sample_order",
+        "template_index",
+        "template_path",
+        "pollution",
+        "severity",
+        "true_label",
+        "pred_label",
+        "pred_confidence",
+        "true_confidence",
+        "attention_entropy",
+        "top_classes",
+        "top_memory_indices",
+        "top_memory_labels",
+        "top_memory_attention",
+        "top_memory_similarity",
+    ]
+    write_csv_rows(csv_path, fieldnames, rows)
+    print(f"Saved MCHN attention error analysis: {csv_path} ({len(rows)} errors)")
+    return rows
 
 
 def resolve_capacity_sizes(capacity_arg, total_patterns, feature_dim):
@@ -2286,10 +2631,14 @@ def parse_args():
     parser.add_argument("--ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
     parser.add_argument("--ablation-severity", type=float, default=0.6)
     parser.add_argument("--skip-beta-ablation", action="store_true")
-    parser.add_argument("--beta-values", default="0.1,0.5,1,2,5,10")
+    parser.add_argument("--beta-values", default="1,2,5,10,20,50")
     parser.add_argument("--beta-ablation-samples", type=int, default=1000)
     parser.add_argument("--beta-ablation-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
     parser.add_argument("--beta-ablation-severity", type=float, default=0.6)
+    parser.add_argument("--skip-attention-errors", action="store_true")
+    parser.add_argument("--attention-error-samples", type=int, default=1000)
+    parser.add_argument("--attention-error-pollution", default="mixed", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
+    parser.add_argument("--attention-error-severity", type=float, default=0.8)
     parser.add_argument("--skip-capacity", action="store_true", help="Skip the real-template capacity experiment.")
     parser.add_argument("--capacity-only", action="store_true", help="Run only the capacity experiment after loading templates.")
     parser.add_argument(
@@ -2543,6 +2892,21 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             pollution_type=args.beta_ablation_pollution,
             severity=args.beta_ablation_severity,
+            seed=args.seed,
+            num_workers=args.num_workers,
+        )
+
+    if not args.skip_attention_errors:
+        save_mchn_attention_error_analysis(
+            loader,
+            args.output_dir,
+            device,
+            train_indices=train_indices,
+            test_indices=test_indices,
+            samples=args.attention_error_samples,
+            batch_size=args.batch_size,
+            pollution_type=args.attention_error_pollution,
+            severity=args.attention_error_severity,
             seed=args.seed,
             num_workers=args.num_workers,
         )

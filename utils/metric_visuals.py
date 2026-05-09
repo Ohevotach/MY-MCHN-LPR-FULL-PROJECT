@@ -147,6 +147,32 @@ class MetricVisualizer:
         plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
         plt.close()
 
+    def plot_multi_metric_curve(self, x_values, series, title, ylabel, filename, ylim=None):
+        plt.figure(figsize=(9, 6))
+        styles = ["o-", "s--", "^--", "d--", "x--", "v--", "p--"]
+        colors = ["#e74c3c", "#2c7fb8", "#7f8c8d", "#27ae60", "#8e44ad", "#d35400", "#16a085"]
+
+        for i, (name, values) in enumerate(series.items()):
+            plt.plot(
+                x_values,
+                values,
+                styles[i % len(styles)],
+                color=colors[i % len(colors)],
+                linewidth=1.8,
+                label=name,
+            )
+
+        plt.title(title, fontsize=14)
+        plt.xlabel("Severity Ratio")
+        plt.ylabel(ylabel)
+        if ylim is not None:
+            plt.ylim(*ylim)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, filename), dpi=300)
+        plt.close()
+
     def plot_summary_heatmap(self, matrix, row_labels, col_labels, title, filename):
         data = np.asarray(matrix, dtype=float)
         fig_w = max(8, 1.1 * len(col_labels))

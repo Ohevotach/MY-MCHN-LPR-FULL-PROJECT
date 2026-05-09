@@ -52,7 +52,27 @@ class ModernHopfieldNetwork(nn.Module):
             return self._profile_feature_transform(x)
         if self.feature_mode in {"shape", "hybrid", "hybrid_shape"}:
             return self._shape_feature_transform(x)
+        if self.feature_mode in {"weighted_concat", "ensemble_concat"}:
+            return self._weighted_concat_feature_transform(x)
         raise ValueError(f"Unsupported feature_mode: {self.feature_mode}")
+
+    def _binary_feature_transform(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        threshold = mean + 0.15 * std
+        return (x > threshold).float() * 2.0 - 1.0
+
+    def _weighted_concat_feature_transform(self, x):
+        """Normalize feature branches independently, then concatenate them.
+
+        This keeps each branch from dominating only because it has a larger
+        numeric scale or dimensionality.
+        """
+        raw = F.normalize(x.float(), p=2, dim=-1)
+        binary = F.normalize(self._binary_feature_transform(x), p=2, dim=-1)
+        shape = F.normalize(self._shape_feature_transform(x), p=2, dim=-1)
+        profile = F.normalize(self._profile_feature_transform(x), p=2, dim=-1)
+        return torch.cat([0.50 * raw, 0.80 * binary, 1.20 * shape, 1.00 * profile], dim=-1)
 
     def _profile_feature_transform(self, x):
         """Stroke-profile features for real plate fonts.
