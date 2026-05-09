@@ -1251,15 +1251,16 @@ def run_ablation_evaluation(
     pollution_type="mixed",
     severity=0.6,
     seed=2026,
+    num_workers=0,
 ):
     print("\n" + "=" * 50)
-    print(f"Task 2b: ablation study, pollution={pollution_type}, severity={severity}...")
+    print(f"Task 2b: ablation study, pollution={pollution_type}, severities={SEVERITIES}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
     aug_memory, aug_labels = augment_hopfield_memory(train_memory, train_labels)
     num_classes = len(loader.idx_to_label)
 
-    ablations = {
+    feature_ablations = {
         "MCHN-Raw": (
             [ModernHopfieldNetwork(train_memory, beta=30.0, metric="dot", normalize=True, feature_mode="raw").to(device)],
             train_labels,
@@ -1276,66 +1277,131 @@ def run_ablation_evaluation(
             [ModernHopfieldNetwork(train_memory, beta=30.0, metric="dot", normalize=True, feature_mode="profile").to(device)],
             train_labels,
         ),
-        "MCHN-Ensemble-NoAug": (build_hopfield_ensemble(train_memory, device), train_labels),
-        "MCHN-Ensemble-Aug": (build_hopfield_ensemble(aug_memory, device), aug_labels),
     }
+    clean_ensemble = build_hopfield_ensemble(train_memory, device)
+    aug_ensemble = build_hopfield_ensemble(aug_memory, device)
 
-    dataset = PollutedCharDataset(
-        loader,
-        virtual_size=samples,
-        pollution_type=pollution_type,
-        severity=severity,
-        seed=seed + 17,
-        fixed_sample_indices=build_fixed_sample_sequence(test_indices, samples, seed=seed + 1701),
-        deterministic_per_index=True,
-    )
-    test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    methods = {
+    feature_methods = {
         name: (lambda q, models=models, labels=labels: torch.argmax(
             predict_modern_hopfield_scores(models, q, labels, num_classes),
             dim=-1,
         ))
-        for name, (models, labels) in ablations.items()
+        for name, (models, labels) in feature_ablations.items()
     }
-    aug_models, aug_template_labels = ablations["MCHN-Ensemble-Aug"]
-    methods["MCHN-class-projection"] = lambda q: torch.argmax(
-        predict_modern_hopfield_scores(
-            aug_models,
-            q,
-            aug_template_labels,
-            num_classes,
-            scoring_mode="class_projection",
+    memory_methods = {
+        "MCHN-Ensemble-CleanMemory": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(clean_ensemble, q, train_labels, num_classes),
+            dim=-1,
         ),
-        dim=-1,
-    )
-    methods["MCHN-maxsim"] = lambda q: torch.argmax(
-        predict_modern_hopfield_scores(
-            aug_models,
-            q,
-            aug_template_labels,
-            num_classes,
-            scoring_mode="maxsim",
+        "MCHN-Ensemble-AugMemory": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(aug_ensemble, q, aug_labels, num_classes),
+            dim=-1,
         ),
-        dim=-1,
-    )
-    scores = evaluate_methods(methods, test_loader, device)
-    for name, value in scores.items():
-        print(f"  {name}: {value:.2f}%")
+    }
+    projection_methods = {
+        "MCHN-ClassProjection": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(
+                aug_ensemble,
+                q,
+                aug_labels,
+                num_classes,
+                scoring_mode="class_projection",
+            ),
+            dim=-1,
+        ),
+        "MCHN-MaxSimilarity": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(
+                aug_ensemble,
+                q,
+                aug_labels,
+                num_classes,
+                scoring_mode="maxsim",
+            ),
+            dim=-1,
+        ),
+    }
+    all_groups = {
+        "feature": feature_methods,
+        "memory": memory_methods,
+        "projection": projection_methods,
+    }
+    group_results = {group_name: {name: [] for name in methods} for group_name, methods in all_groups.items()}
+    fixed_eval_indices = build_fixed_sample_sequence(test_indices, samples, seed=seed + 1701)
+
+    for current_severity in SEVERITIES:
+        dataset = PollutedCharDataset(
+            loader,
+            virtual_size=len(fixed_eval_indices),
+            pollution_type=pollution_type,
+            severity=current_severity,
+            seed=seed + 17,
+            fixed_sample_indices=fixed_eval_indices,
+            deterministic_per_index=True,
+        )
+        test_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=max(0, int(num_workers)),
+            pin_memory=device.type == "cuda",
+        )
+        print(f"  severity={current_severity:.1f}")
+        for group_name, methods in all_groups.items():
+            scores = evaluate_methods(methods, test_loader, device)
+            for name, value in scores.items():
+                group_results[group_name][name].append(value)
+                print(f"    {group_name}/{name}: {value:.2f}%")
 
     csv_path = os.path.join(visualizer.save_dir, "ablation_results.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["pollution", "severity", "method", "accuracy"])
-        for name, value in scores.items():
-            writer.writerow([pollution_type, severity, name, f"{value:.4f}"])
+        writer = csv.DictWriter(f, fieldnames=["group", "pollution", "severity", "method", "accuracy"])
+        writer.writeheader()
+        for group_name, method_results in group_results.items():
+            for method_name, values in method_results.items():
+                for current_severity, accuracy in zip(SEVERITIES, values):
+                    writer.writerow(
+                        {
+                            "group": group_name,
+                            "pollution": pollution_type,
+                            "severity": f"{current_severity:.1f}",
+                            "method": method_name,
+                            "accuracy": f"{accuracy:.4f}",
+                        }
+                    )
+
+    final_index = min(range(len(SEVERITIES)), key=lambda idx: abs(SEVERITIES[idx] - float(severity)))
+    final_severity = SEVERITIES[final_index]
+    final_scores = {}
+    for method_results in group_results.values():
+        for method_name, values in method_results.items():
+            final_scores[method_name] = values[final_index]
+
+    visualizer.plot_multi_robustness_curve(
+        SEVERITIES,
+        group_results["feature"],
+        pollution_type=f"ablation_feature_{pollution_type}",
+        filename="ablation_feature_curve.png",
+    )
+    visualizer.plot_multi_robustness_curve(
+        SEVERITIES,
+        group_results["memory"],
+        pollution_type=f"ablation_memory_{pollution_type}",
+        filename="ablation_memory_curve.png",
+    )
+    visualizer.plot_multi_robustness_curve(
+        SEVERITIES,
+        group_results["projection"],
+        pollution_type=f"ablation_projection_{pollution_type}",
+        filename="ablation_projection_curve.png",
+    )
     visualizer.plot_final_severity_bar(
-        scores,
+        final_scores,
         pollution_type=f"ablation_{pollution_type}",
-        severity=severity,
+        severity=final_severity,
         filename="ablation_final_bar.png",
     )
     print(f"Saved ablation CSV: {csv_path}")
-    return scores
+    return group_results
 
 
 def parse_float_list(value):
@@ -1357,56 +1423,59 @@ def run_beta_ablation_evaluation(
     num_workers=0,
 ):
     print("\n" + "=" * 50)
-    print(f"Task 2e: beta ablation, pollution={pollution_type}, severity={severity}...")
+    print(f"Task 2e: beta ablation, pollution={pollution_type}, severities={SEVERITIES}...")
     train_memory = loader.memory_matrix[train_indices].to(device)
     train_labels = loader.labels[train_indices].to(device)
     aug_memory, aug_labels = augment_hopfield_memory(train_memory, train_labels)
     num_classes = len(loader.idx_to_label)
 
-    dataset = PollutedCharDataset(
-        loader,
-        virtual_size=samples,
-        pollution_type=pollution_type,
-        severity=severity,
-        seed=seed + 2309,
-        fixed_sample_indices=build_fixed_sample_sequence(test_indices, samples, seed=seed + 2311),
-        deterministic_per_index=True,
-    )
-    test_loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=max(0, int(num_workers)),
-        pin_memory=device.type == "cuda",
-    )
-
     rows = []
-    results = {}
-    for beta_value in beta_values:
-        models = build_hopfield_ensemble(aug_memory, device, beta_override=beta_value)
-        method_name = f"beta={beta_value:g}"
-        scores = evaluate_methods(
-            {
-                method_name: lambda q, models=models: torch.argmax(
-                    predict_modern_hopfield_scores(models, q, aug_labels, num_classes),
-                    dim=-1,
-                )
-            },
-            test_loader,
-            device,
+    results = {f"beta={beta_value:g}": [] for beta_value in beta_values}
+    fixed_eval_indices = build_fixed_sample_sequence(test_indices, samples, seed=seed + 2311)
+
+    for current_severity in SEVERITIES:
+        dataset = PollutedCharDataset(
+            loader,
+            virtual_size=len(fixed_eval_indices),
+            pollution_type=pollution_type,
+            severity=current_severity,
+            seed=seed + 2309,
+            fixed_sample_indices=fixed_eval_indices,
+            deterministic_per_index=True,
         )
-        accuracy = scores[method_name]
-        results[method_name] = accuracy
-        rows.append(
-            {
-                "pollution": pollution_type,
-                "severity": severity,
-                "beta": beta_value,
-                "samples": samples,
-                "accuracy": accuracy,
-            }
+        test_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=max(0, int(num_workers)),
+            pin_memory=device.type == "cuda",
         )
-        print(f"  beta={beta_value:g}: {accuracy:.2f}%")
+        print(f"  severity={current_severity:.1f}")
+        for beta_value in beta_values:
+            models = build_hopfield_ensemble(aug_memory, device, beta_override=beta_value)
+            method_name = f"beta={beta_value:g}"
+            scores = evaluate_methods(
+                {
+                    method_name: lambda q, models=models: torch.argmax(
+                        predict_modern_hopfield_scores(models, q, aug_labels, num_classes),
+                        dim=-1,
+                    )
+                },
+                test_loader,
+                device,
+            )
+            accuracy = scores[method_name]
+            results[method_name].append(accuracy)
+            rows.append(
+                {
+                    "pollution": pollution_type,
+                    "severity": current_severity,
+                    "beta": beta_value,
+                    "samples": len(fixed_eval_indices),
+                    "accuracy": accuracy,
+                }
+            )
+            print(f"    beta={beta_value:g}: {accuracy:.2f}%")
 
     csv_path = os.path.join(visualizer.save_dir, "beta_ablation_results.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -1423,10 +1492,18 @@ def run_beta_ablation_evaluation(
                 }
             )
 
+    final_index = min(range(len(SEVERITIES)), key=lambda idx: abs(SEVERITIES[idx] - float(severity)))
+    final_scores = {name: values[final_index] for name, values in results.items()}
     visualizer.plot_final_severity_bar(
+        final_scores,
+        pollution_type=f"beta_ablation_{pollution_type}",
+        severity=SEVERITIES[final_index],
+        filename="beta_ablation_final_bar.png",
+    )
+    visualizer.plot_multi_robustness_curve(
+        SEVERITIES,
         results,
         pollution_type=f"beta_ablation_{pollution_type}",
-        severity=severity,
         filename="beta_ablation_accuracy.png",
     )
     print(f"Saved beta ablation CSV: {csv_path}")
@@ -2451,6 +2528,7 @@ if __name__ == "__main__":
             pollution_type=args.ablation_pollution,
             severity=args.ablation_severity,
             seed=args.seed,
+            num_workers=args.num_workers,
         )
 
     if not args.skip_beta_ablation:
