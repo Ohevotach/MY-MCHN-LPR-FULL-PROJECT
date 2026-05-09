@@ -23,8 +23,7 @@ SEVERITIES = [0.0, 0.1, 0.2, 0.4, 0.6, 0.8]
 POLLUTIONS = ["mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine"]
 CORE_POLLUTIONS = ["noise", "salt_pepper", "blur", "mask", "dirt", "fog"]
 METHOD_ORDER = [
-    "MCHN-SumProjection",
-    "MCHN-TopKHybrid",
+    "Modern Hopfield",
     "Affine-robust Hopfield",
     "Balanced Traditional Hopfield",
     "CNN",
@@ -136,15 +135,12 @@ def build_hopfield_ensemble(memory, device, beta_override=None):
     def beta(default):
         return default if beta_override is None else beta_override
 
-    # Selected from the latest ablation: clean-memory ensemble + sum class
-    # projection was stronger than augmented/weighted variants. Dot-product
-    # branches use beta=20; the Euclidean branch keeps its own smaller scale.
     return [
-        ModernHopfieldNetwork(memory, beta=beta(20.0), metric="dot", normalize=True, feature_mode="binary").to(device),
-        ModernHopfieldNetwork(memory, beta=beta(20.0), metric="dot", normalize=True, feature_mode="centered").to(device),
-        ModernHopfieldNetwork(memory, beta=beta(20.0), metric="dot", normalize=True, feature_mode="binary_centered").to(device),
-        ModernHopfieldNetwork(memory, beta=beta(20.0), metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
-        ModernHopfieldNetwork(memory, beta=beta(20.0), metric="dot", normalize=True, feature_mode="profile").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(28.0), metric="dot", normalize=True, feature_mode="binary").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(32.0), metric="dot", normalize=True, feature_mode="centered").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(30.0), metric="dot", normalize=True, feature_mode="binary_centered").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(26.0), metric="dot", normalize=True, feature_mode="hybrid_shape").to(device),
+        ModernHopfieldNetwork(memory, beta=beta(30.0), metric="dot", normalize=True, feature_mode="profile").to(device),
         ModernHopfieldNetwork(memory, beta=beta(2.5), metric="euclidean", normalize=False, feature_mode="profile").to(device),
     ]
 
@@ -1269,8 +1265,7 @@ def save_evaluation_input_debug(
         writer = csv.writer(f)
         writer.writerow(["method", "input_tensor", "clean_tensor_used_for_prediction", "library_or_memory_source"])
         for method, source in [
-            ("MCHN-SumProjection", "same polluted q from PollutedCharDataset", "no", "clean train split memory"),
-            ("MCHN-TopKHybrid", "same polluted q from PollutedCharDataset", "no", "clean train split memory"),
+            ("Modern Hopfield", "same polluted q from PollutedCharDataset", "no", "clean train split memory"),
             ("Balanced Traditional Hopfield", "same polluted q from PollutedCharDataset", "no", "train split class prototypes"),
             ("CNN", "same polluted q from PollutedCharDataset", "no", "trained on clean train split"),
             ("Nearest Neighbor", "same polluted q from PollutedCharDataset", "no", "train split memory"),
@@ -1361,8 +1356,7 @@ def run_robustness_evaluation(
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
     print(
-        "MCHN comparison methods: SumProjection is standard class projection; "
-        "TopKHybrid uses top-k attention projection + max-sim fusion "
+        "Modern Hopfield method: clean train memory + top-k attention projection + max-sim fusion "
         f"(topk={mchn_topk}, maxsim_weight={mchn_maxsim_weight:.2f})."
     )
     # Classical Hopfield is kept as a fair thesis baseline. Character images are
@@ -1383,11 +1377,7 @@ def run_robustness_evaluation(
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
         }
-        methods["MCHN-SumProjection"] = lambda q: torch.argmax(
-            predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes),
-            dim=-1,
-        )
-        methods["MCHN-TopKHybrid"] = lambda q: torch.argmax(
+        methods["Modern Hopfield"] = lambda q: torch.argmax(
             predict_final_mchn_scores(
                 hopfield_models,
                 q,
@@ -1411,8 +1401,7 @@ def run_robustness_evaluation(
 
     def make_score_methods():
         return {
-            "MCHN-SumProjection": lambda q: predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes),
-            "MCHN-TopKHybrid": lambda q: predict_final_mchn_scores(
+            "Modern Hopfield": lambda q: predict_final_mchn_scores(
                 hopfield_models,
                 q,
                 hopfield_labels,
@@ -1481,7 +1470,7 @@ def run_robustness_evaluation(
             batch_size,
             device,
             severity=SEVERITIES[-1],
-            method_names=("MCHN-SumProjection", "MCHN-TopKHybrid", "Balanced Traditional Hopfield", "CNN"),
+            method_names=("Modern Hopfield", "Balanced Traditional Hopfield", "CNN"),
             num_workers=num_workers,
         )
     return results
@@ -1537,10 +1526,7 @@ def run_class_balanced_evaluation(
             "Nearest Neighbor": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="cosine"),
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
-            "MCHN-SumProjection": lambda q: torch.argmax(
-                predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
-            ),
-            "MCHN-TopKHybrid": lambda q: torch.argmax(
+            "Modern Hopfield": lambda q: torch.argmax(
                 predict_final_mchn_scores(
                     hopfield_models,
                     q,
@@ -2616,7 +2602,7 @@ def save_confusion_reports(
     batch_size,
     device,
     severity,
-    method_names=("MCHN-SumProjection",),
+    method_names=("Modern Hopfield",),
     num_workers=0,
 ):
     selected_methods = {name: methods[name] for name in method_names if name in methods}
@@ -2759,8 +2745,7 @@ def plot_all_pollution_summary(visualizer, all_results, prefix=""):
         filename=f"{prefix}summary_mean_accuracy_heatmap.png",
     )
     for method_name, filename in (
-        ("MCHN-SumProjection", "mchn_sum_projection_pollution_severity_curves.png"),
-        ("MCHN-TopKHybrid", "mchn_topk_hybrid_pollution_severity_curves.png"),
+        ("Modern Hopfield", "mchn_pollution_severity_curves.png"),
         ("Affine-robust Hopfield", "affine_robust_mchn_pollution_severity_curves.png"),
     ):
         if any(method_name in method_results for method_results in all_results.values()):

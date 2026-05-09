@@ -68,8 +68,6 @@ class MetricVisualizer:
     @staticmethod
     def _ordered_method_items(model_results):
         priority = [
-            "MCHN-SumProjection",
-            "MCHN-TopKHybrid",
             "Modern Hopfield",
             "Affine-robust Hopfield",
             "Balanced Traditional Hopfield",
