@@ -846,7 +846,15 @@ def predict_modern_hopfield_scores(
     )[0]
 
 
-def predict_final_mchn_scores(models, q, template_labels, num_classes, template_mask=None):
+def predict_final_mchn_scores(
+    models,
+    q,
+    template_labels,
+    num_classes,
+    template_mask=None,
+    topk=10,
+    maxsim_weight=0.50,
+):
     return predict_modern_hopfield_scores(
         models,
         q,
@@ -854,8 +862,8 @@ def predict_final_mchn_scores(models, q, template_labels, num_classes, template_
         num_classes,
         template_mask=template_mask,
         scoring_mode="hybrid_topk_maxsim",
-        topk=8,
-        maxsim_weight=0.35,
+        topk=topk,
+        maxsim_weight=maxsim_weight,
     )
 
 
@@ -1328,6 +1336,8 @@ def run_robustness_evaluation(
     affine_variant_level="light",
     save_confusion=False,
     num_workers=0,
+    mchn_topk=10,
+    mchn_maxsim_weight=0.50,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2: held-out evaluation, pollution={pollution_type}...")
@@ -1338,7 +1348,10 @@ def run_robustness_evaluation(
     num_classes = len(loader.idx_to_label)
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
-    print("Modern Hopfield comparison method: clean train memory + top-k attention projection + max-sim fusion.")
+    print(
+        "Modern Hopfield comparison method: clean train memory + top-k attention projection + max-sim fusion "
+        f"(topk={mchn_topk}, maxsim_weight={mchn_maxsim_weight:.2f})."
+    )
     # Classical Hopfield is kept as a fair thesis baseline. Character images are
     # sparse, so the implementation balances patterns before Hebbian storage and
     # stores one prototype per class to avoid background-dominated cross-talk.
@@ -1358,7 +1371,15 @@ def run_robustness_evaluation(
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
         }
         methods["Modern Hopfield"] = lambda q: torch.argmax(
-            predict_final_mchn_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
+            predict_final_mchn_scores(
+                hopfield_models,
+                q,
+                hopfield_labels,
+                num_classes,
+                topk=mchn_topk,
+                maxsim_weight=mchn_maxsim_weight,
+            ),
+            dim=-1,
         )
         methods["CNN"] = lambda q: torch.argmax(trained_cnn(q), dim=-1)
         if include_affine_robust:
@@ -1373,7 +1394,14 @@ def run_robustness_evaluation(
 
     def make_score_methods():
         return {
-            "Modern Hopfield": lambda q: predict_final_mchn_scores(hopfield_models, q, hopfield_labels, num_classes),
+            "Modern Hopfield": lambda q: predict_final_mchn_scores(
+                hopfield_models,
+                q,
+                hopfield_labels,
+                num_classes,
+                topk=mchn_topk,
+                maxsim_weight=mchn_maxsim_weight,
+            ),
             "CNN": lambda q: trained_cnn(q),
         }
 
@@ -1455,6 +1483,8 @@ def run_class_balanced_evaluation(
     include_affine_robust=False,
     affine_variant_level="light",
     num_workers=0,
+    mchn_topk=10,
+    mchn_maxsim_weight=0.50,
 ):
     print("\n" + "=" * 50)
     print(f"Task 2c: class-balanced evaluation, pollution={pollution_type}...")
@@ -1490,7 +1520,15 @@ def run_class_balanced_evaluation(
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
             "Modern Hopfield": lambda q: torch.argmax(
-                predict_final_mchn_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
+                predict_final_mchn_scores(
+                    hopfield_models,
+                    q,
+                    hopfield_labels,
+                    num_classes,
+                    topk=mchn_topk,
+                    maxsim_weight=mchn_maxsim_weight,
+                ),
+                dim=-1,
             ),
             "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
         }
@@ -1684,6 +1722,42 @@ def run_ablation_evaluation(
                 scoring_mode="hybrid_topk_maxsim",
                 topk=8,
                 maxsim_weight=0.35,
+            ),
+            dim=-1,
+        ),
+        "MCHN-TopKHybrid-k10-w50": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(
+                clean_ensemble,
+                q,
+                train_labels,
+                num_classes,
+                scoring_mode="hybrid_topk_maxsim",
+                topk=10,
+                maxsim_weight=0.50,
+            ),
+            dim=-1,
+        ),
+        "MCHN-TopKHybrid-k16-w50": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(
+                clean_ensemble,
+                q,
+                train_labels,
+                num_classes,
+                scoring_mode="hybrid_topk_maxsim",
+                topk=16,
+                maxsim_weight=0.50,
+            ),
+            dim=-1,
+        ),
+        "MCHN-TopKHybrid-k10-w65": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(
+                clean_ensemble,
+                q,
+                train_labels,
+                num_classes,
+                scoring_mode="hybrid_topk_maxsim",
+                topk=10,
+                maxsim_weight=0.65,
             ),
             dim=-1,
         ),
@@ -2787,6 +2861,8 @@ def parse_args():
     parser.add_argument("--debug-eval-pollution", default="dirt", choices=["mixed", "mask", "noise", "salt_pepper", "blur", "fog", "dirt", "affine", "none"])
     parser.add_argument("--debug-eval-severity", type=float, default=0.8)
     parser.add_argument("--debug-eval-samples", type=int, default=16)
+    parser.add_argument("--mchn-topk", type=int, default=10, help="Top-k memory patterns used by final MCHN class projection.")
+    parser.add_argument("--mchn-maxsim-weight", type=float, default=0.50, help="Log-score fusion weight for the max-sim branch in final MCHN.")
     parser.add_argument("--optimized-aug-per-class", type=int, default=16, help="Class-balanced templates per class used to build optimized MCHN augmentation memory.")
     parser.add_argument("--skip-ablation", action="store_true")
     parser.add_argument("--ablation-samples", type=int, default=1000)
@@ -2999,6 +3075,8 @@ if __name__ == "__main__":
             affine_variant_level=args.affine_variant_level,
             save_confusion=args.save_confusion,
             num_workers=args.num_workers,
+            mchn_topk=args.mchn_topk,
+            mchn_maxsim_weight=args.mchn_maxsim_weight,
         )
         if not args.skip_balanced_eval:
             balanced_results[pollution_type] = run_class_balanced_evaluation(
@@ -3015,6 +3093,8 @@ if __name__ == "__main__":
                 include_affine_robust=args.include_affine_robust,
                 affine_variant_level=args.affine_variant_level,
                 num_workers=args.num_workers,
+                mchn_topk=args.mchn_topk,
+                mchn_maxsim_weight=args.mchn_maxsim_weight,
             )
 
     save_results_csv(args.output_dir, all_results)
