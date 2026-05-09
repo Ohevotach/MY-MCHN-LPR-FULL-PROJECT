@@ -726,6 +726,27 @@ def class_attention_projection_scores(attention_weights, template_labels, num_cl
     raise ValueError(f"Unsupported projection_mode: {projection_mode}")
 
 
+def topk_attention_projection_scores(sim_scores, template_labels, beta, num_classes, topk=8, template_mask=None):
+    labels = template_labels.to(device=sim_scores.device, dtype=torch.long)
+    if labels.dim() != 1 or labels.shape[0] != sim_scores.shape[-1]:
+        raise ValueError("template_labels must have shape [num_templates].")
+
+    masked_sim = sim_scores
+    if template_mask is not None:
+        mask = template_mask.to(device=sim_scores.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        masked_sim = masked_sim.masked_fill(~mask, -1e9)
+
+    k = max(1, min(int(topk), masked_sim.shape[-1]))
+    values, indices = torch.topk(masked_sim, k=k, dim=-1)
+    weights = torch.softmax(float(beta) * values, dim=-1)
+    class_ids = labels[indices]
+    class_scores = sim_scores.new_zeros((sim_scores.shape[0], int(num_classes)))
+    class_scores.scatter_add_(dim=1, index=class_ids, src=weights)
+    return class_scores
+
+
 def ensemble_hopfield_scores(
     models,
     q,
@@ -734,10 +755,12 @@ def ensemble_hopfield_scores(
     template_mask=None,
     scoring_mode="class_projection",
     projection_mode="sum",
+    topk=8,
+    maxsim_weight=0.35,
 ):
     log_prob_parts = []
     primary_sim = None
-    if scoring_mode not in {"class_projection", "maxsim"}:
+    if scoring_mode not in {"class_projection", "maxsim", "topk_projection", "hybrid_topk_maxsim"}:
         raise ValueError(f"Unsupported Hopfield scoring mode: {scoring_mode}")
 
     for model in models:
@@ -756,7 +779,7 @@ def ensemble_hopfield_scores(
                 projection_mode=projection_mode,
             ).clamp_min(1e-12)
             log_probs = torch.log(scores)
-        else:
+        elif scoring_mode == "maxsim":
             _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
             scores = class_max_similarity_scores(
                 sim_scores,
@@ -766,6 +789,30 @@ def ensemble_hopfield_scores(
                 template_mask=template_mask,
             )
             log_probs = torch.log_softmax(scores, dim=-1)
+        else:
+            _, _, sim_scores = model(q, template_mask=template_mask, return_similarity=True)
+            topk_scores = topk_attention_projection_scores(
+                sim_scores,
+                template_labels,
+                beta=model.beta,
+                num_classes=num_classes,
+                topk=topk,
+                template_mask=template_mask,
+            ).clamp_min(1e-12)
+            topk_log_probs = torch.log(topk_scores)
+            if scoring_mode == "topk_projection":
+                log_probs = topk_log_probs
+            else:
+                maxsim_scores = class_max_similarity_scores(
+                    sim_scores,
+                    template_labels,
+                    beta=model.beta,
+                    num_classes=num_classes,
+                    template_mask=template_mask,
+                )
+                maxsim_log_probs = torch.log_softmax(maxsim_scores, dim=-1)
+                weight = float(maxsim_weight)
+                log_probs = (1.0 - weight) * topk_log_probs + weight * maxsim_log_probs
         log_prob_parts.append(log_probs)
         if primary_sim is None:
             primary_sim = sim_scores
@@ -783,6 +830,8 @@ def predict_modern_hopfield_scores(
     template_mask=None,
     scoring_mode="class_projection",
     projection_mode="sum",
+    topk=8,
+    maxsim_weight=0.35,
 ):
     return ensemble_hopfield_scores(
         models,
@@ -792,7 +841,22 @@ def predict_modern_hopfield_scores(
         template_mask=template_mask,
         scoring_mode=scoring_mode,
         projection_mode=projection_mode,
+        topk=topk,
+        maxsim_weight=maxsim_weight,
     )[0]
+
+
+def predict_final_mchn_scores(models, q, template_labels, num_classes, template_mask=None):
+    return predict_modern_hopfield_scores(
+        models,
+        q,
+        template_labels,
+        num_classes,
+        template_mask=template_mask,
+        scoring_mode="hybrid_topk_maxsim",
+        topk=8,
+        maxsim_weight=0.35,
+    )
 
 
 def predict_nearest_neighbor(q, train_memory, train_labels, metric):
@@ -1274,7 +1338,7 @@ def run_robustness_evaluation(
     num_classes = len(loader.idx_to_label)
 
     hopfield_models = build_hopfield_ensemble(hopfield_memory, device)
-    print("Modern Hopfield comparison method: clean train memory + sum class projection + ablation-selected beta=20.")
+    print("Modern Hopfield comparison method: clean train memory + top-k attention projection + max-sim fusion.")
     # Classical Hopfield is kept as a fair thesis baseline. Character images are
     # sparse, so the implementation balances patterns before Hebbian storage and
     # stores one prototype per class to avoid background-dominated cross-talk.
@@ -1294,7 +1358,7 @@ def run_robustness_evaluation(
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
         }
         methods["Modern Hopfield"] = lambda q: torch.argmax(
-            predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
+            predict_final_mchn_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
         )
         methods["CNN"] = lambda q: torch.argmax(trained_cnn(q), dim=-1)
         if include_affine_robust:
@@ -1309,7 +1373,7 @@ def run_robustness_evaluation(
 
     def make_score_methods():
         return {
-            "Modern Hopfield": lambda q: predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes),
+            "Modern Hopfield": lambda q: predict_final_mchn_scores(hopfield_models, q, hopfield_labels, num_classes),
             "CNN": lambda q: trained_cnn(q),
         }
 
@@ -1426,7 +1490,7 @@ def run_class_balanced_evaluation(
             "Euclidean NN": lambda q: predict_nearest_neighbor(q, train_memory, train_labels, metric="euclidean"),
             "Class Prototype": lambda q: predict_prototype(q, prototypes, prototype_labels),
             "Modern Hopfield": lambda q: torch.argmax(
-                predict_modern_hopfield_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
+                predict_final_mchn_scores(hopfield_models, q, hopfield_labels, num_classes), dim=-1
             ),
             "CNN": lambda q: torch.argmax(trained_cnn(q), dim=-1),
         }
@@ -1608,6 +1672,18 @@ def run_ablation_evaluation(
                 aug_labels,
                 num_classes,
                 scoring_mode="maxsim",
+            ),
+            dim=-1,
+        ),
+        "MCHN-TopKHybrid": lambda q: torch.argmax(
+            predict_modern_hopfield_scores(
+                clean_ensemble,
+                q,
+                train_labels,
+                num_classes,
+                scoring_mode="hybrid_topk_maxsim",
+                topk=8,
+                maxsim_weight=0.35,
             ),
             dim=-1,
         ),
@@ -1879,7 +1955,7 @@ def save_mchn_attention_error_analysis(
             cursor += labels.numel()
             q = q.to(device)
             labels = labels.to(device)
-            class_scores = predict_modern_hopfield_scores(models, q, analysis_labels, num_classes)
+            class_scores = predict_final_mchn_scores(models, q, analysis_labels, num_classes)
             class_probs = torch.softmax(class_scores, dim=-1)
             pred = torch.argmax(class_probs, dim=-1)
             _, _, attention_weights, sim_scores = models[0](q, return_attention=True, return_similarity=True)
