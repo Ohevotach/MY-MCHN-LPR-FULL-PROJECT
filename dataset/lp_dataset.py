@@ -351,8 +351,13 @@ class PollutedCharDataset(Dataset):
             max_w = max(2, int(self.img_w * (0.10 + 0.35 * severity)))
             h = rng.randint(2, max_h)
             w = rng.randint(2, max_w)
-            y = rng.randint(0, max(0, self.img_h - h))
-            x = rng.randint(0, max(0, self.img_w - w))
+            if rng.random() < 0.75:
+                cy, cx = self._sample_foreground_center(img, rng)
+                y = min(max(0, int(cy - h // 2)), max(0, self.img_h - h))
+                x = min(max(0, int(cx - w // 2)), max(0, self.img_w - w))
+            else:
+                y = rng.randint(0, max(0, self.img_h - h))
+                x = rng.randint(0, max(0, self.img_w - w))
             out[:, y : y + h, x : x + w] = 0.0 if rng.random() < 0.7 else 1.0
         return out
 
@@ -360,18 +365,36 @@ class PollutedCharDataset(Dataset):
         rng = rng or self.rng
         out = img.clone()
         yy, xx = torch.meshgrid(
-            torch.arange(self.img_h, dtype=torch.float32),
-            torch.arange(self.img_w, dtype=torch.float32),
+            torch.arange(self.img_h, dtype=torch.float32, device=img.device),
+            torch.arange(self.img_w, dtype=torch.float32, device=img.device),
             indexing="ij",
         )
-        spot_count = max(1, int(round(5 * severity)))
+        spot_count = max(1, int(round(7 * severity)))
         for _ in range(spot_count):
-            cx = rng.uniform(0, self.img_w - 1)
-            cy = rng.uniform(0, self.img_h - 1)
-            radius = rng.uniform(2, 4 + 10 * severity)
+            if rng.random() < 0.75:
+                cy, cx = self._sample_foreground_center(img, rng)
+                cx = float(cx) + rng.uniform(-3, 3)
+                cy = float(cy) + rng.uniform(-3, 3)
+            else:
+                cx = rng.uniform(0, self.img_w - 1)
+                cy = rng.uniform(0, self.img_h - 1)
+            radius = rng.uniform(2, 5 + 12 * severity)
             mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius**2
             out[:, mask] = rng.uniform(0.0, 0.35)
+
+        if severity >= 0.5:
+            foreground = out > 0.5
+            drop_prob = 0.06 + 0.12 * severity
+            rnd = torch.rand(out.shape, dtype=out.dtype, device=out.device)
+            out[foreground & (rnd < drop_prob)] = 0.0
         return out
+
+    def _sample_foreground_center(self, img, rng):
+        foreground = torch.nonzero(img[0] > 0.5, as_tuple=False)
+        if foreground.numel() == 0:
+            return rng.randint(0, self.img_h - 1), rng.randint(0, self.img_w - 1)
+        row = foreground[rng.randrange(int(foreground.shape[0]))]
+        return int(row[0].item()), int(row[1].item())
 
 
 def build_class_memory(template_loader, reduce="mean"):
@@ -462,23 +485,45 @@ class CharPolluter:
             max_w = max(2, int(self.img_w * (0.10 + 0.35 * severity)))
             h = self.rng.randint(2, max_h)
             w = self.rng.randint(2, max_w)
-            y = self.rng.randint(0, max(0, self.img_h - h))
-            x = self.rng.randint(0, max(0, self.img_w - w))
+            if self.rng.random() < 0.75:
+                cy, cx = self._sample_foreground_center(img)
+                y = min(max(0, int(cy - h // 2)), max(0, self.img_h - h))
+                x = min(max(0, int(cx - w // 2)), max(0, self.img_w - w))
+            else:
+                y = self.rng.randint(0, max(0, self.img_h - h))
+                x = self.rng.randint(0, max(0, self.img_w - w))
             out[:, y : y + h, x : x + w] = 0.0 if self.rng.random() < 0.7 else 1.0
         return out
 
     def _random_dirt(self, img, severity):
         out = img.clone()
         yy, xx = torch.meshgrid(
-            torch.arange(self.img_h, dtype=torch.float32),
-            torch.arange(self.img_w, dtype=torch.float32),
+            torch.arange(self.img_h, dtype=torch.float32, device=img.device),
+            torch.arange(self.img_w, dtype=torch.float32, device=img.device),
             indexing="ij",
         )
-        spot_count = max(1, int(round(5 * severity)))
+        spot_count = max(1, int(round(7 * severity)))
         for _ in range(spot_count):
-            cx = self.rng.uniform(0, self.img_w - 1)
-            cy = self.rng.uniform(0, self.img_h - 1)
-            radius = self.rng.uniform(2, 4 + 10 * severity)
+            if self.rng.random() < 0.75:
+                cy, cx = self._sample_foreground_center(img)
+                cx = float(cx) + self.rng.uniform(-3, 3)
+                cy = float(cy) + self.rng.uniform(-3, 3)
+            else:
+                cx = self.rng.uniform(0, self.img_w - 1)
+                cy = self.rng.uniform(0, self.img_h - 1)
+            radius = self.rng.uniform(2, 5 + 12 * severity)
             mask = ((xx - cx) ** 2 + (yy - cy) ** 2) <= radius**2
             out[:, mask] = self.rng.uniform(0.0, 0.35)
+        if severity >= 0.5:
+            foreground = out > 0.5
+            drop_prob = 0.06 + 0.12 * severity
+            rnd = torch.rand(out.shape, dtype=out.dtype, device=out.device)
+            out[foreground & (rnd < drop_prob)] = 0.0
         return out
+
+    def _sample_foreground_center(self, img):
+        foreground = torch.nonzero(img[0] > 0.5, as_tuple=False)
+        if foreground.numel() == 0:
+            return self.rng.randint(0, self.img_h - 1), self.rng.randint(0, self.img_w - 1)
+        row = foreground[self.rng.randrange(int(foreground.shape[0]))]
+        return int(row[0].item()), int(row[1].item())

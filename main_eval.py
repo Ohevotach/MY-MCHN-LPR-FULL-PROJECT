@@ -1207,6 +1207,8 @@ def save_evaluation_input_debug(
         cv2.imwrite(os.path.join(debug_dir, f"{stem}_clean.png"), clean_u8)
         cv2.imwrite(os.path.join(debug_dir, f"{stem}_polluted.png"), polluted_u8)
         cv2.imwrite(os.path.join(debug_dir, f"{stem}_diff.png"), diff_u8)
+        foreground = clean_img > 0.5
+        background = ~foreground
 
         rows.append(
             {
@@ -1223,6 +1225,10 @@ def save_evaluation_input_debug(
                 "l2_diff": float(torch.sqrt(torch.mean((polluted_img - clean_img) ** 2)).item()),
                 "linf_diff": float(diff.max().item()),
                 "changed_fraction_gt_001": float((diff > 0.01).float().mean().item()),
+                "foreground_changed_fraction_gt_001": float((diff[foreground] > 0.01).float().mean().item()) if foreground.any() else 0.0,
+                "background_changed_fraction_gt_001": float((diff[background] > 0.01).float().mean().item()) if background.any() else 0.0,
+                "foreground_l1_diff": float(diff[foreground].mean().item()) if foreground.any() else 0.0,
+                "background_l1_diff": float(diff[background].mean().item()) if background.any() else 0.0,
             }
         )
 
@@ -1242,6 +1248,10 @@ def save_evaluation_input_debug(
             "l2_diff",
             "linf_diff",
             "changed_fraction_gt_001",
+            "foreground_changed_fraction_gt_001",
+            "background_changed_fraction_gt_001",
+            "foreground_l1_diff",
+            "background_l1_diff",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -2843,8 +2853,8 @@ def parse_args():
         choices=["group", "index"],
         help="Use duplicate-group held-out split by default; 'index' restores the older class-stratified random index split.",
     )
-    parser.add_argument("--near-duplicate-threshold", type=float, default=0.999)
-    parser.add_argument("--near-duplicate-inspect-threshold", type=float, default=0.99)
+    parser.add_argument("--near-duplicate-threshold", type=float, default=0.99)
+    parser.add_argument("--near-duplicate-inspect-threshold", type=float, default=0.95)
     parser.add_argument(
         "--clean-old-artifacts",
         action="store_true",
